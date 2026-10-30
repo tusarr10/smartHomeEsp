@@ -30,7 +30,7 @@ offline_task = None
 async def lifespan(app: FastAPI):
     global offline_task
     logger.info("=" * 65)
-    logger.info(f" 🏠 {settings.PROJECT_NAME} v{settings.VERSION}")
+    logger.info(f" [*] {settings.PROJECT_NAME} v{settings.VERSION}")
     logger.info("=" * 65)
 
     # 1. Initialize Database Engine & Schema

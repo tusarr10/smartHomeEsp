@@ -7,3 +7,12 @@
 *.elf
 *.o
 .vscode/
+__pycache__/
+*.pyc
+data/
+*.db
+venv/
+node_modules/
+dist/
+backups/*.sql
+

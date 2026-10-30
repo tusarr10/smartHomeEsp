@@ -363,6 +363,12 @@ async def handle_http_client(reader: asyncio.StreamReader, writer: asyncio.Strea
 
 
 # ============================================================================
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 # SERVER MAIN RUNNER
 # ============================================================================
 async def main():
@@ -371,7 +377,7 @@ async def main():
     http_port = int(config.get("http_port", 8080))
 
     print("=" * 65)
-    print(" ⚡ smartHomeEsp CENTRAL FLEET SERVER v1.6.0")
+    print(" [SmartHome] CENTRAL FLEET SERVER v1.6.0")
     print("=" * 65)
     print(f" [TCP Telemetry]  Listening on {host}:{tcp_port}")
     print(f" [HTTP Dashboard] http://localhost:{http_port} (Listening on {host}:{http_port})")
