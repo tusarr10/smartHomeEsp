@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SmartHome Central Management Platform</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <!-- SIDEBAR NAVIGATION (14 MAIN SECTIONS) -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <div class="brand-icon">⚡</div>
+      <div>
+        <div class="brand-title">SmartHome</div>
+        <div class="brand-sub">Central Management Platform</div>
+      </div>
+    </div>
+
+    <ul class="nav-list">
+      <li class="nav-item active" data-view="overview">
+        <span class="nav-icon">📊</span>
+        <span>Overview</span>
+      </li>
+      <li class="nav-item" data-view="nodes">
+        <span class="nav-icon">🖧</span>
+        <span>Nodes</span>
+      </li>
+      <li class="nav-item" data-view="relays">
+        <span class="nav-icon">🔌</span>
+        <span>GPIO / Relays</span>
+      </li>
+      <li class="nav-item" data-view="sensors">
+        <span class="nav-icon">🌡️</span>
+        <span>Sensors</span>
+      </li>
+      <li class="nav-item" data-view="automation">
+        <span class="nav-icon">⚙️</span>
+        <span>Automation</span>
+      </li>
+      <li class="nav-item" data-view="firmware">
+        <span class="nav-icon">📦</span>
+        <span>Firmware / OTA</span>
+      </li>
+      <li class="nav-item" data-view="telemetry">
+        <span class="nav-icon">📡</span>
+        <span>Telemetry</span>
+      </li>
+      <li class="nav-item" data-view="events">
+        <span class="nav-icon">🕒</span>
+        <span>Events</span>
+      </li>
+      <li class="nav-item" data-view="notifications">
+        <span class="nav-icon">🔔</span>
+        <span>Notifications</span>
+      </li>
+      <li class="nav-item" data-view="network">
+        <span class="nav-icon">🌐</span>
+        <span>Network</span>
+      </li>
+      <li class="nav-item" data-view="users">
+        <span class="nav-icon">👥</span>
+        <span>Users</span>
+      </li>
+      <li class="nav-item" data-view="database">
+        <span class="nav-icon">🗄️</span>
+        <span>Database</span>
+      </li>
+      <li class="nav-item" data-view="settings">
+        <span class="nav-icon">🛠️</span>
+        <span>Settings</span>
+      </li>
+      <li class="nav-item" data-view="logs">
+        <span class="nav-icon">📜</span>
+        <span>System Logs</span>
+      </li>
+    </ul>
+  </aside>
+
+  <!-- MAIN WRAPPER -->
+  <div class="main-wrapper">
+    <header class="topbar">
+      <div class="topbar-left">
+        <h1 class="view-title" id="view-title">Overview</h1>
+        <span id="ws-badge" class="status-badge badge-sync">
+          <span class="pulse-dot"></span> Connecting...
+        </span>
+      </div>
+
+      <div class="topbar-right">
+        <span style="font-size: 13px; color: var(--text-secondary);">Windows Central Server v1.6.0</span>
+      </div>
+    </header>
+
+    <main class="content-area" id="content-area">
+      <!-- Dynamic View Injected Here -->
+    </main>
+  </div>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>
