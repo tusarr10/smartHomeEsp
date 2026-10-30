@@ -46,23 +46,22 @@ An enterprise-ready, reliable, and responsive IoT smart home relay controller po
 
 ```
 smartHomeEsp/
-├── app2/
-│   ├── data/                 # LittleFS filesystem assets
-│   │   ├── index.html        # Responsive Single Page Application UI
-│   │   ├── style.css         # Modern Dark Theme Stylesheet
-│   │   └── app.js            # Dashboard logic & API handlers
-│   ├── src/
-│   │   ├── main.cpp          # System bootstrap & main loop
-│   │   ├── config.h          # Global configuration & pins
-│   │   ├── receiver_client.h # Central Receiver Telemetry Client
-│   │   ├── receiver_client.cpp
-│   │   ├── gpio_manager.h    # Relay state management & LittleFS persistence
-│   │   ├── gpio_manager.cpp
-│   │   ├── wifi_manager.h    # Wi-Fi DHCP/Static management
-│   │   ├── wifi_manager.cpp
-│   │   ├── web_server.h      # REST API & WebSockets
-│   │   └── web_server.cpp
-│   └── platformio.ini        # PlatformIO build configuration
+├── app2/                     # NodeMCU ESP8266 Firmware (PlatformIO)
+│   ├── data/                 # LittleFS filesystem assets (Web Dashboard)
+│   ├── src/                  # C++ Core: GPIO Persistence, NTP IST, Central Telemetry
+│   └── platformio.ini        # Build & upload configuration
+├── central_server/           # SmartHome Central Management Platform (Windows Server)
+│   ├── backend/              # FastAPI Application (REST, WebSockets, SQLAlchemy 2.0)
+│   │   ├── app/              # Models, Services, Protocols (TCP 2000 & MQTT), APIs
+│   │   └── requirements.txt  # Python backend dependencies
+│   ├── frontend/             # Modern React Dashboard (14 Navigation Sections)
+│   │   ├── dist/             # Production zero-setup SPA bundle
+│   │   └── src/              # React developer source components
+│   ├── database/             # PostgreSQL DDL schema & automated weekly backup scripts
+│   ├── mosquitto/            # Mosquitto MQTT broker configuration
+│   ├── scripts/              # Windows installation, start, stop, and simulation tools
+│   ├── server.py             # Lightweight pure-Python standalone server (Ports 8080 & 2000)
+│   └── run.bat               # Interactive 1-click Windows launcher
 └── README.md
 ```
 
