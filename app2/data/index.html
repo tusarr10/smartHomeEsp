@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SmartHome Controller</title>
+  <link rel="stylesheet" href="style.css?v=1.6.0">
+</head>
+<body class="dark-theme">
+  <!-- Login Overlay -->
+  <div id="login-modal" class="modal-overlay hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2 id="login-title">🔐 SmartHome Login</h2>
+        <button type="button" class="modal-close" onclick="app.closeModal('login-modal')">&times;</button>
+      </div>
+      <form id="login-form">
+        <div class="form-group">
+          <label for="login-username">Username</label>
+          <input type="text" id="login-username" required value="admin" autocomplete="username">
+        </div>
+        <div class="form-group">
+          <label for="login-password">Password</label>
+          <input type="password" id="login-password" required placeholder="Default: admin" autocomplete="current-password">
+          <small class="hint-text">Default password is <code>admin</code></small>
+        </div>
+        <div id="login-error" class="error-msg hidden"></div>
+        <button type="submit" class="btn btn-primary btn-block">Log In</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Main Container -->
+  <div class="app-layout">
+    <!-- Top Navigation -->
+    <header class="top-nav">
+      <div class="nav-brand">
+        <span class="brand-icon">⚡</span>
+        <span id="header-device-name" class="brand-title">SmartHome Controller</span>
+      </div>
+      <div class="nav-status">
+        <span id="wifi-badge" class="badge badge-warning">Wi-Fi: Connecting...</span>
+        <button id="theme-toggle-btn" class="btn-icon" title="Toggle Theme">🌓</button>
+        <button id="logout-btn" class="btn-icon" title="Logout">🚪</button>
+      </div>
+    </header>
+
+    <!-- App Body -->
+    <div class="app-body">
+      <!-- Navigation Tabs Sidebar -->
+      <nav class="nav-sidebar">
+        <button class="nav-tab active" data-tab="tab-overview">📊 Overview</button>
+        <button class="nav-tab" data-tab="tab-wifi">📶 Wi-Fi Setup</button>
+        <button class="nav-tab" data-tab="tab-gpio">🖲️ GPIO / Relays</button>
+        <button class="nav-tab" data-tab="tab-automation">⏱️ Automation</button>
+        <button class="nav-tab" data-tab="tab-settings">⚙️ Settings</button>
+        <button class="nav-tab" data-tab="tab-ota">🛠️ Firmware (OTA)</button>
+        <button class="nav-tab" data-tab="tab-sysinfo">ℹ️ System Info</button>
+        <button class="nav-tab" data-tab="tab-users">👤 Account</button>
+        <button class="nav-tab" data-tab="tab-logs">📜 Logs</button>
+      </nav>
+
+      <!-- Main Content Area -->
+      <main class="content-area">
+        
+        <!-- 1. OVERVIEW TAB -->
+        <section id="tab-overview" class="tab-pane active">
+          <div class="section-header">
+            <h2>System Overview</h2>
+            <button class="btn btn-sm btn-secondary" onclick="app.refreshAll()">🔄 Refresh</button>
+          </div>
+
+          <!-- Quick Stat Cards -->
+          <div class="stats-grid">
+            <div class="stat-card">
+              <div class="stat-label">Device Status</div>
+              <div class="stat-value text-success" id="stat-status">Online</div>
+              <div class="stat-sub" id="stat-mode">Mode: AP + Router</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Network IP</div>
+              <div class="stat-value" id="stat-ip">0.0.0.0</div>
+              <div class="stat-sub" id="stat-ssid">SSID: -</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">System Uptime</div>
+              <div class="stat-value" id="stat-uptime">0h 0m</div>
+              <div class="stat-sub" id="stat-time">Time: -</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Free Heap Memory</div>
+              <div class="stat-value" id="stat-heap">0 KB</div>
+              <div class="stat-sub" id="stat-flash">Flash: -</div>
+            </div>
+          </div>
+
+          <!-- Quick GPIO Control -->
+          <div class="card">
+            <div class="card-header">
+              <h3>Quick Control</h3>
+            </div>
+            <div id="overview-gpio-grid" class="gpio-grid">
+              <!-- Dynamically populated -->
+              <p class="placeholder-text">Loading GPIO channels...</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- 2. WI-FI CONFIGURATION TAB -->
+        <section id="tab-wifi" class="tab-pane">
+          <div class="section-header">
+            <h2>Wi-Fi Management</h2>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3>Operating Mode</h3>
+            </div>
+            <div class="mode-selector">
+              <label class="radio-label">
+                <input type="radio" name="wifi-mode" value="0">
+                <span><strong>AP Only</strong> (Access Point only)</span>
+              </label>
+              <label class="radio-label">
+                <input type="radio" name="wifi-mode" value="1">
+                <span><strong>Router Only</strong> (Connect to Home Router)</span>
+              </label>
+              <label class="radio-label">
+                <input type="radio" name="wifi-mode" value="2" checked>
+                <span><strong>AP + Router</strong> (Default: Hotspot & Router)</span>
+              </label>
+            </div>
+            <button id="save-wifi-mode-btn" class="btn btn-primary">Apply Mode</button>
+          </div>
+
+          <!-- Network Scanner -->
+          <div class="card">
+            <div class="card-header">
+              <h3>Nearby Networks</h3>
+              <button id="scan-wifi-btn" class="btn btn-sm btn-secondary">🔍 Scan Networks</button>
+            </div>
+            <div id="wifi-scan-status" class="scan-status-text">Click 'Scan Networks' to find available Wi-Fi.</div>
+            <div class="table-responsive">
+              <table id="wifi-scan-table" class="data-table hidden">
+                <thead>
+                  <tr>
+                    <th>SSID</th>
+                    <th>Signal</th>
+                    <th>Security</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody id="wifi-scan-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Connect & IP Configuration Form -->
+          <div class="card">
+            <div class="card-header">
+              <h3>Connect to Network & IP Configuration</h3>
+            </div>
+            <form id="wifi-connect-form">
+              <div class="form-group">
+                <label for="wifi-ssid">Network SSID</label>
+                <input type="text" id="wifi-ssid" required placeholder="Select from scan or enter hidden SSID">
+              </div>
+              <div class="form-group">
+                <label for="wifi-pass">Wi-Fi Password</label>
+                <div class="input-with-toggle">
+                  <input type="password" id="wifi-pass" placeholder="Enter password (leave blank for open networks)">
+                  <button type="button" class="btn-toggle-pass" onclick="app.togglePassVisibility('wifi-pass')">👁️</button>
+                </div>
+              </div>
+
+              <!-- IP Mode Configuration (DHCP vs Static IP) -->
+              <div class="form-group">
+                <label>IP Assignment Mode</label>
+                <div class="mode-selector">
+                  <label class="radio-label">
+                    <input type="radio" name="ip-mode" value="dhcp" id="ip-mode-dhcp" checked onchange="app.handleIpModeChange('dhcp')">
+                    <span><strong>DHCP Client (Automatic IP)</strong> &bull; Recommended for home routers</span>
+                  </label>
+                  <label class="radio-label">
+                    <input type="radio" name="ip-mode" value="static" id="ip-mode-static" onchange="app.handleIpModeChange('static')">
+                    <span><strong>Static IP (Manual Configuration)</strong> &bull; Fixed IP, Gateway & DNS</span>
+                  </label>
+                </div>
+              </div>
+
+              <!-- Static IP Fields (Hidden when DHCP is selected) -->
+              <div id="static-ip-fields" class="hidden">
+                <div class="form-group">
+                  <label for="wifi-static-ip">Static IP Address</label>
+                  <input type="text" id="wifi-static-ip" placeholder="e.g. 192.168.1.105">
+                </div>
+                <div class="form-group">
+                  <label for="wifi-gateway">Router Gateway IP</label>
+                  <input type="text" id="wifi-gateway" placeholder="e.g. 192.168.1.1">
+                </div>
+                <div class="form-group">
+                  <label for="wifi-subnet">Subnet Mask</label>
+                  <input type="text" id="wifi-subnet" value="255.255.255.0" placeholder="255.255.255.0">
+                </div>
+                <div class="form-group">
+                  <label for="wifi-dns1">Primary DNS Server</label>
+                  <input type="text" id="wifi-dns1" value="8.8.8.8" placeholder="8.8.8.8 (Google DNS)">
+                </div>
+                <div class="form-group">
+                  <label for="wifi-dns2">Secondary DNS Server</label>
+                  <input type="text" id="wifi-dns2" value="1.1.1.1" placeholder="1.1.1.1 (Cloudflare DNS)">
+                </div>
+              </div>
+
+              <div class="action-buttons">
+                <button type="submit" id="btn-connect-wifi" class="btn btn-primary">Connect & Save</button>
+                <button type="button" id="btn-save-ip-only" class="btn btn-secondary" onclick="app.saveIpConfigOnly()">💾 Apply IP Settings Only</button>
+                <button type="button" id="btn-reset-wifi" class="btn btn-danger float-right">Reset Wi-Fi Credentials</button>
+              </div>
+            </form>
+          </div>
+        </section>
+
+        <!-- 3. GPIO & RELAY MANAGEMENT TAB -->
+        <section id="tab-gpio" class="tab-pane">
+          <div class="section-header">
+            <h2>GPIO & Relay Management</h2>
+            <button id="open-add-gpio-btn" class="btn btn-primary">➕ Add GPIO Output</button>
+          </div>
+
+          <div id="gpio-cards-container" class="gpio-grid">
+            <!-- Dynamically populated -->
+          </div>
+        </section>
+
+        <!-- 4. AUTOMATION RULES TAB -->
+        <section id="tab-automation" class="tab-pane">
+          <div class="section-header">
+            <h2>Automation Rules</h2>
+            <button id="open-add-rule-btn" class="btn btn-primary">➕ Add Rule</button>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3>Configured Rules</h3>
+            </div>
+            <div id="rules-container">
+              <!-- Dynamically populated -->
+            </div>
+          </div>
+        </section>
+
+        <!-- 5. SETTINGS TAB -->
+        <section id="tab-settings" class="tab-pane">
+          <div class="section-header">
+            <h2>Device Settings</h2>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3>General Configuration</h3>
+            </div>
+            <form id="settings-form">
+              <div class="form-group">
+                <label for="settings-device-name">Device Name</label>
+                <input type="text" id="settings-device-name" required placeholder="SmartHome-NodeMCU">
+              </div>
+              <div class="form-group">
+                <label for="settings-ap-ssid">Setup AP Hotspot Name (SSID)</label>
+                <input type="text" id="settings-ap-ssid" required placeholder="SmartHome-Setup">
+              </div>
+              <div class="form-group">
+                <label for="settings-ap-pass">Setup AP Password (min 8 chars, blank = open)</label>
+                <input type="password" id="settings-ap-pass" placeholder="Optional security">
+              </div>
+              <div class="form-group">
+                <label for="settings-tz">Timezone Offset (Hours from UTC)</label>
+                <select id="settings-tz">
+                  <option value="-43200">UTC -12</option>
+                  <option value="-36000">UTC -10 (Hawaii)</option>
+                  <option value="-28800">UTC -8 (PST)</option>
+                  <option value="-25200">UTC -7 (MST)</option>
+                  <option value="-21600">UTC -6 (CST)</option>
+                  <option value="-18000">UTC -5 (EST)</option>
+                  <option value="0">UTC +0 (London/GMT)</option>
+                  <option value="3600">UTC +1 (CET - Paris, Berlin, Prague)</option>
+                  <option value="7200">UTC +2 (EET)</option>
+                  <option value="19800" selected>UTC +5:30 (India - IST)</option>
+                  <option value="28800">UTC +8 (China, Singapore)</option>
+                  <option value="32400">UTC +9 (Tokyo)</option>
+                  <option value="36000">UTC +10 (Sydney)</option>
+                </select>
+              </div>
+              <div class="action-buttons">
+                <button type="submit" class="btn btn-primary">Save Settings</button>
+                <button type="button" class="btn btn-secondary" onclick="app.syncNtp()">🕒 Sync NTP Time Now</button>
+              </div>
+            </form>
+          </div>
+
+          <!-- Central Receiver & Multi-Node Server Card -->
+          <div class="card">
+            <div class="card-header">
+              <h3>📡 Central Receiver / Multi-Node Telemetry Server</h3>
+              <span id="receiver-status-badge" class="badge badge-secondary">Disabled</span>
+            </div>
+            <p>Stream live telemetry, heartbeats, and relay state events to a central collector/server (e.g. Node-RED, Python backend, Home Assistant, or raw TCP socket on port 2000) managing multiple nodes.</p>
+
+            <form id="receiver-form">
+              <div class="form-group checkbox-group">
+                <label>
+                  <input type="checkbox" id="recv-enabled" onchange="app.handleReceiverToggle(this.checked)">
+                  <span><strong>Enable Central Receiver Server Sync</strong></span>
+                </label>
+              </div>
+
+              <div id="receiver-settings-group">
+                <div class="form-group">
+                  <label for="recv-node-id">Unique Node Identifier (ID)</label>
+                  <div style="display: flex; gap: 8px;">
+                    <input type="text" id="recv-node-id" required placeholder="e.g. NODE-BCDD-C223-386C" style="flex: 1;">
+                    <button type="button" class="btn btn-sm btn-secondary" onclick="app.generateNodeId()" title="Set default Node ID from MAC address">🔄 Auto MAC</button>
+                  </div>
+                  <small class="hint-text">Unique node key sent with every packet so the central server can distinguish this node from other nodes.</small>
+                </div>
+
+                <div class="form-group">
+                  <label for="recv-node-name">Node Display Name</label>
+                  <input type="text" id="recv-node-name" placeholder="e.g. Living Room NodeMCU">
+                </div>
+
+                <div class="form-group">
+                  <label>Transmission Protocol</label>
+                  <div class="mode-selector">
+                    <label class="radio-label">
+                      <input type="radio" name="recv-proto" value="0" id="recv-proto-http" checked onchange="app.handleReceiverProtoChange(0)">
+                      <span><strong>HTTP / REST POST (JSON)</strong> &bull; Standard web collector</span>
+                    </label>
+                    <label class="radio-label">
+                      <input type="radio" name="recv-proto" value="1" id="recv-proto-tcp" onchange="app.handleReceiverProtoChange(1)">
+                      <span><strong>Raw TCP Socket Stream</strong> &bull; High-speed multi-node TCP listener (e.g. Port 2000)</span>
+                    </label>
+                  </div>
+                </div>
+
+                <div style="display: flex; gap: 12px;">
+                  <div class="form-group" style="flex: 2;">
+                    <label for="recv-server-host">Receiver Server Host / IP Address</label>
+                    <input type="text" id="recv-server-host" required placeholder="e.g. 192.168.1.10">
+                  </div>
+                  <div class="form-group" style="flex: 1;">
+                    <label for="recv-server-port">Port Number</label>
+                    <input type="number" id="recv-server-port" min="1" max="65535" value="2000" placeholder="2000">
+                  </div>
+                </div>
+
+                <div class="form-group" id="recv-http-path-group">
+                  <label for="recv-http-path">HTTP Telemetry Endpoint Path</label>
+                  <input type="text" id="recv-http-path" value="/api/node/telemetry" placeholder="/api/node/telemetry">
+                </div>
+
+                <div class="form-group">
+                  <label for="recv-auth-token">Server Authentication Token / API Key (Optional)</label>
+                  <input type="password" id="recv-auth-token" placeholder="Optional Bearer token or secret">
+                </div>
+
+                <div style="display: flex; gap: 12px; align-items: flex-end;">
+                  <div class="form-group" style="flex: 1;">
+                    <label for="recv-interval">Heartbeat Telemetry Interval</label>
+                    <select id="recv-interval">
+                      <option value="5">Every 5 Seconds (High frequency)</option>
+                      <option value="10" selected>Every 10 Seconds (Standard)</option>
+                      <option value="30">Every 30 Seconds</option>
+                      <option value="60">Every 1 Minute</option>
+                      <option value="120">Every 2 Minutes</option>
+                      <option value="300">Every 5 Minutes</option>
+                    </select>
+                  </div>
+                  <div class="form-group checkbox-group" style="flex: 1; margin-bottom: 12px;">
+                    <label>
+                      <input type="checkbox" id="recv-state-change" checked>
+                      <span>Instant push when any GPIO relay changes</span>
+                    </label>
+                  </div>
+                </div>
+
+                <!-- Live Status & Telemetry Diagnostics -->
+                <div class="card" style="margin-top: 15px; background: rgba(0,0,0,0.2); border: 1px dashed var(--border-color);">
+                  <div class="card-header" style="padding: 8px 12px;">
+                    <h4>📊 Live Telemetry Diagnostics</h4>
+                  </div>
+                  <div style="padding: 8px 12px; font-size: 0.85rem; line-height: 1.8;">
+                    <div>Destination Endpoint: <code id="recv-diag-target">-</code></div>
+                    <div>Last Sync Status: <strong id="recv-diag-status">-</strong></div>
+                    <div>Last Sync Time: <span id="recv-diag-time">-</span></div>
+                    <div>Telemetry Packets: <span class="text-success" id="recv-diag-sent">0</span> sent &bull; <span class="text-danger" id="recv-diag-failed">0</span> failed</div>
+                    <div>Last Central Server Response: <code id="recv-diag-response">-</code></div>
+                  </div>
+                </div>
+
+                <div class="action-buttons" style="margin-top: 15px;">
+                  <button type="submit" class="btn btn-primary">💾 Save Server Settings</button>
+                  <button type="button" id="btn-test-receiver" class="btn btn-secondary" onclick="app.testReceiverConnection()">⚡ Test Connection Now</button>
+                  <button type="button" id="btn-push-receiver" class="btn btn-secondary" onclick="app.pushTelemetryNow()">📤 Push Telemetry Now</button>
+                </div>
+              </div>
+            </form>
+          </div>
+
+          <!-- Maintenance Actions -->
+          <div class="card danger-border">
+            <div class="card-header">
+              <h3 class="text-danger">Maintenance Actions</h3>
+            </div>
+            <p>Perform hardware reboot or restore firmware factory defaults.</p>
+            <div class="action-buttons">
+              <button id="btn-reboot" class="btn btn-warning">🔁 Reboot Controller</button>
+              <button id="btn-factory-reset" class="btn btn-danger">⚠️ Factory Reset</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- 6. OTA FIRMWARE UPDATE TAB -->
+        <section id="tab-ota" class="tab-pane">
+          <div class="section-header">
+            <h2>OTA Firmware Update</h2>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3>Upload Firmware Binary (.bin)</h3>
+            </div>
+            <p>Select a compiled firmware binary file (<code>firmware.bin</code>) built for ESP8266 NodeMCU.</p>
+            
+            <form id="ota-form">
+              <div class="form-group">
+                <input type="file" id="ota-file-input" accept=".bin" required>
+              </div>
+              <div id="ota-progress-container" class="progress-container hidden">
+                <div id="ota-progress-bar" class="progress-bar">0%</div>
+              </div>
+              <div id="ota-status-msg" class="ota-msg"></div>
+              <button type="submit" id="ota-submit-btn" class="btn btn-primary">Flash Firmware</button>
+            </form>
+          </div>
+        </section>
+
+        <!-- 7. SYSTEM INFO TAB -->
+        <section id="tab-sysinfo" class="tab-pane">
+          <div class="section-header">
+            <h2>Hardware & System Diagnostics</h2>
+            <button class="btn btn-sm btn-secondary" onclick="app.loadStatus()">🔄 Refresh Diagnostics</button>
+          </div>
+
+          <!-- Quick Diagnostics Summary Grid -->
+          <div class="stats-grid">
+            <div class="stat-card">
+              <div class="stat-label">System Uptime</div>
+              <div class="stat-value" id="diag-uptime">-</div>
+              <div class="stat-sub" id="diag-uptime-raw">Raw: 0s</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Boot Counter</div>
+              <div class="stat-value text-primary" id="diag-boot-count">-</div>
+              <div class="stat-sub">Device Restarts</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Free Heap (RAM)</div>
+              <div class="stat-value text-success" id="diag-heap-cur">-</div>
+              <div class="stat-sub" id="diag-heap-min">Min: -</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">LittleFS Storage</div>
+              <div class="stat-value" id="diag-fs-summary">-</div>
+              <div class="stat-sub" id="diag-fs-free-sub">Free: -</div>
+            </div>
+          </div>
+
+          <!-- 1. Reset & Boot Diagnostics -->
+          <div class="card">
+            <div class="card-header">
+              <h3>⚡ Reset & Boot Diagnostics</h3>
+            </div>
+            <div class="table-responsive">
+              <table class="data-table">
+                <tbody>
+                  <tr><th style="width: 35%;">Metric</th><th>Diagnostic Value</th></tr>
+                  <tr><td>ESP.getResetReason()</td><td><strong id="diag-reset-reason" class="text-primary">-</strong></td></tr>
+                  <tr><td>Reset Cause Breakdown</td><td><span id="diag-reset-details" class="badge badge-warning">-</span></td></tr>
+                  <tr><td>Raw Reset Info</td><td><code id="diag-reset-raw" class="hint-text">-</code></td></tr>
+                  <tr><td>Device Restart Counter</td><td><strong id="diag-restarts">-</strong> restarts recorded in LittleFS</td></tr>
+                  <tr><td>System Uptime</td><td><span id="diag-uptime-full">-</span></td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 2. Memory Diagnostics -->
+          <div class="card">
+            <div class="card-header">
+              <h3>🧠 RAM & Heap Memory Diagnostics</h3>
+            </div>
+            <div class="table-responsive">
+              <table class="data-table">
+                <tbody>
+                  <tr><th style="width: 35%;">Metric</th><th>Diagnostic Value</th></tr>
+                  <tr><td>Current Free Heap</td><td><strong id="diag-free-heap" class="text-success">-</strong></td></tr>
+                  <tr><td>Minimum Free Heap Recorded</td><td><strong id="diag-min-free-heap" class="text-warning">-</strong> <span class="hint-text">(Lowest heap recorded since boot)</span></td></tr>
+                  <tr><td>Max Allocatable Block</td><td><span id="diag-max-block">-</span></td></tr>
+                  <tr><td>Heap Fragmentation</td><td><span id="diag-heap-frag">-</span></td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 3. LittleFS Storage Diagnostics -->
+          <div class="card">
+            <div class="card-header">
+              <h3>💾 Flash & LittleFS Storage</h3>
+            </div>
+            <div class="table-responsive">
+              <table class="data-table">
+                <tbody>
+                  <tr><th style="width: 35%;">Metric</th><th>Diagnostic Value</th></tr>
+                  <tr><td>Physical Flash Chip Size</td><td><strong id="diag-flash-real">-</strong></td></tr>
+                  <tr><td>Flash Bus Speed & SPI Mode</td><td><span id="diag-flash-speed-mode">-</span></td></tr>
+                  <tr><td>Flash Chip Manufacturer ID</td><td><code id="diag-flash-id">-</code></td></tr>
+                  <tr><td>Program Firmware Size</td><td><span id="diag-sketch-size">-</span></td></tr>
+                  <tr><td>Available OTA Update Space</td><td><span id="diag-sketch-free">-</span></td></tr>
+                  <tr><td>LittleFS Total Storage</td><td><strong id="diag-fs-total">-</strong></td></tr>
+                  <tr><td>LittleFS Used Storage</td><td><strong id="diag-fs-used" class="text-warning">-</strong></td></tr>
+                  <tr><td>LittleFS Available Storage</td><td><strong id="diag-fs-free" class="text-success">-</strong></td></tr>
+                  <tr><td>LittleFS Utilization</td><td><span id="diag-fs-percent">-</span></td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 4. Wi-Fi & Networking Diagnostics -->
+          <div class="card">
+            <div class="card-header">
+              <h3>📶 Wi-Fi & Network Diagnostics</h3>
+            </div>
+            <div class="table-responsive">
+              <table class="data-table">
+                <tbody>
+                  <tr><th style="width: 35%;">Metric</th><th>Diagnostic Value</th></tr>
+                  <tr><td>Wi-Fi Operating Mode</td><td><span id="diag-wifi-mode">-</span></td></tr>
+                  <tr><td>Connected SSID</td><td><strong id="diag-wifi-ssid">-</strong></td></tr>
+                  <tr><td>Wi-Fi Signal Strength (RSSI)</td><td><span id="diag-wifi-rssi">-</span></td></tr>
+                  <tr><td>Wi-Fi Connection Uptime</td><td><strong id="diag-wifi-uptime" class="text-success">-</strong></td></tr>
+                  <tr><td>IP Assignment Mode</td><td><strong id="diag-ip-mode">-</strong></td></tr>
+                  <tr><td>Station IP Address</td><td><code id="diag-sta-ip">-</code></td></tr>
+                  <tr><td>Router Gateway IP</td><td><code id="diag-gateway">-</code></td></tr>
+                  <tr><td>Subnet Mask</td><td><code id="diag-subnet">-</code></td></tr>
+                  <tr><td>DNS Servers</td><td><span id="diag-dns">-</span></td></tr>
+                  <tr><td>Access Point SSID & IP</td><td><span id="diag-ap-info">-</span></td></tr>
+                  <tr><td>Hardware MAC Address</td><td><code id="diag-mac">-</code></td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 5. Microcontroller Hardware & Firmware -->
+          <div class="card">
+            <div class="card-header">
+              <h3>⚙️ Microcontroller & Software Platform</h3>
+            </div>
+            <div class="table-responsive">
+              <table class="data-table">
+                <tbody>
+                  <tr><th style="width: 35%;">Metric</th><th>Diagnostic Value</th></tr>
+                  <tr><td>Device Hostname / Name</td><td><strong id="diag-dev-name">-</strong></td></tr>
+                  <tr><td>Target Microcontroller</td><td>ESP8266 (ESP-12E/F) NodeMCU</td></tr>
+                  <tr><td>Firmware Version</td><td><span id="diag-fw-ver" class="badge badge-success">-</span></td></tr>
+                  <tr><td>Arduino Core Version</td><td><span id="diag-core-ver">-</span></td></tr>
+                  <tr><td>Espressif Non-OS SDK</td><td><span id="diag-sdk-ver">-</span></td></tr>
+                  <tr><td>CPU Clock Frequency</td><td><span id="diag-cpu-freq">-</span></td></tr>
+                  <tr><td>Current NTP Time</td><td><strong id="diag-ntp-time" class="text-success">-</strong> <button type="button" class="btn btn-sm btn-secondary" onclick="app.syncNtp()" style="margin-left: 10px; padding: 2px 8px; font-size: 0.75rem;">🔄 Sync Now</button></td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- 8. USER MANAGEMENT TAB -->
+        <section id="tab-users" class="tab-pane">
+          <div class="section-header">
+            <h2>Account & Security</h2>
+          </div>
+          <div class="card">
+            <div class="card-header">
+              <h3>Change Administrator Password</h3>
+            </div>
+            <form id="change-pass-form">
+              <div class="form-group">
+                <label for="curr-pass">Current Password</label>
+                <input type="password" id="curr-pass" required placeholder="Current password">
+              </div>
+              <div class="form-group">
+                <label for="new-pass">New Password (min 4 characters)</label>
+                <input type="password" id="new-pass" required placeholder="New password">
+              </div>
+              <div class="form-group">
+                <label for="confirm-pass">Confirm New Password</label>
+                <input type="password" id="confirm-pass" required placeholder="Repeat new password">
+              </div>
+              <button type="submit" class="btn btn-primary">Update Password</button>
+            </form>
+          </div>
+        </section>
+
+        <!-- 9. LOGS TAB -->
+        <section id="tab-logs" class="tab-pane">
+          <div class="section-header">
+            <h2>Diagnostics & System Logs</h2>
+            <button id="refresh-logs-btn" class="btn btn-sm btn-secondary">🔄 Refresh Logs</button>
+          </div>
+          <div class="card log-card">
+            <pre id="log-terminal" class="log-terminal">Loading system logs...</pre>
+          </div>
+        </section>
+
+      </main>
+    </div>
+  </div>
+
+  <!-- Modal: Add / Edit GPIO -->
+  <div id="gpio-modal" class="modal-overlay hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="gpio-modal-title">Configure GPIO Channel</h3>
+        <button class="modal-close" onclick="app.closeModal('gpio-modal')">&times;</button>
+      </div>
+      <form id="gpio-form">
+        <input type="hidden" id="gpio-edit-id" value="">
+        <div class="form-group" id="gpio-pin-group">
+          <label for="gpio-pin-select">Select Hardware Pin</label>
+          <select id="gpio-pin-select" required>
+            <option value="5">D1 (GPIO 5) - Safe I2C SCL (Recommended)</option>
+            <option value="4">D2 (GPIO 4) - Safe I2C SDA (Recommended)</option>
+            <option value="14">D5 (GPIO 14) - Safe SPI SCLK</option>
+            <option value="12">D6 (GPIO 12) - Safe SPI MISO</option>
+            <option value="13">D7 (GPIO 13) - Safe SPI MOSI</option>
+            <option value="16">D0 (GPIO 16) - WAKE Pin (HIGH at boot)</option>
+            <option value="0">D3 (GPIO 0) - Boot Sensitive (Flash button)</option>
+            <option value="2">D4 (GPIO 2) - Boot Sensitive (Onboard LED)</option>
+            <option value="15">D8 (GPIO 15) - Boot Sensitive (Must be LOW at boot)</option>
+          </select>
+          <small id="gpio-pin-warning" class="hint-text text-warning"></small>
+        </div>
+        <div class="form-group">
+          <label for="gpio-name-input">Display Name</label>
+          <input type="text" id="gpio-name-input" required placeholder="Main Light">
+        </div>
+        <div class="form-group">
+          <label for="gpio-room-input">Room</label>
+          <input type="text" id="gpio-room-input" required placeholder="Living Room">
+        </div>
+        <div class="form-group">
+          <label for="gpio-func-select">Function Type</label>
+          <select id="gpio-func-select">
+            <option value="Light">Light</option>
+            <option value="Fan">Fan</option>
+            <option value="Relay">Relay</option>
+            <option value="Pump">Water Pump</option>
+            <option value="Switch">Switch</option>
+          </select>
+        </div>
+        <div class="form-group checkbox-group">
+          <label>
+            <input type="checkbox" id="gpio-active-low" checked>
+            <span>Active-Low Relay (Standard for optical relay modules)</span>
+          </label>
+        </div>
+        <div class="form-group">
+          <label for="gpio-init-mode">Power-On Behaviour</label>
+          <select id="gpio-init-mode">
+            <option value="0" selected>Restore Last State (Default)</option>
+            <option value="1">Always OFF</option>
+            <option value="2">Always ON</option>
+          </select>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" onclick="app.closeModal('gpio-modal')">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save Channel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: Add Rule -->
+  <div id="rule-modal" class="modal-overlay hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>Create Automation Rule</h3>
+        <button class="modal-close" onclick="app.closeModal('rule-modal')">&times;</button>
+      </div>
+      <form id="rule-form">
+        <div class="form-group">
+          <label for="rule-name-input">Rule Name</label>
+          <input type="text" id="rule-name-input" required placeholder="Auto-off Light">
+        </div>
+        <div class="form-group">
+          <label for="rule-type-select">Rule Type</label>
+          <select id="rule-type-select">
+            <option value="0">Timer / Auto-Off (Turn OFF after delay)</option>
+            <option value="1">Interlock / Follow (Trigger based on another GPIO)</option>
+            <option value="2">Daily Schedule (Trigger at specific time)</option>
+          </select>
+        </div>
+
+        <!-- Target GPIO -->
+        <div class="form-group">
+          <label for="rule-target-select">Target GPIO Channel</label>
+          <select id="rule-target-select" required></select>
+        </div>
+
+        <!-- Timer Rule Fields -->
+        <div id="rule-timer-fields">
+          <div class="form-group">
+            <label for="rule-seconds-input">Auto-off Duration (Seconds)</label>
+            <input type="number" id="rule-seconds-input" min="1" max="86400" value="300">
+            <small class="hint-text">e.g. 300 seconds = 5 minutes, 600 = 10 minutes</small>
+          </div>
+        </div>
+
+        <!-- Interlock Rule Fields -->
+        <div id="rule-interlock-fields" class="hidden">
+          <div class="form-group">
+            <label for="rule-source-select">When Source GPIO:</label>
+            <select id="rule-source-select"></select>
+          </div>
+          <div class="form-group">
+            <label for="rule-cond-state">Changes to state:</label>
+            <select id="rule-cond-state">
+              <option value="1">Turns ON</option>
+              <option value="0">Turns OFF</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="rule-target-action">Set Target GPIO to:</label>
+            <select id="rule-target-action">
+              <option value="1">Turn ON</option>
+              <option value="0">Turn OFF</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- Schedule Rule Fields -->
+        <div id="rule-schedule-fields" class="hidden">
+          <div class="form-group">
+            <label for="rule-time-input">Daily Trigger Time (HH:MM 24h)</label>
+            <input type="time" id="rule-time-input" value="18:30">
+          </div>
+          <div class="form-group">
+            <label for="rule-sched-action">Action:</label>
+            <select id="rule-sched-action">
+              <option value="1">Turn ON</option>
+              <option value="0">Turn OFF</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" onclick="app.closeModal('rule-modal')">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save Rule</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="app.js?v=1.6.0"></script>
+</body>
+</html>

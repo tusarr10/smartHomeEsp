@@ -1,0 +1,9 @@
+/.pio_core
+/cookies.txt
+/main
+.pio/
+**/.pio/
+*.bin
+*.elf
+*.o
+.vscode/
