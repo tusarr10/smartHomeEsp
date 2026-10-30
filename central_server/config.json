@@ -2,7 +2,7 @@
   "bind_host": "0.0.0.0",
   "http_port": 8080,
   "tcp_port": 2000,
-  "offline_timeout_sec": 30,
+  "offline_timeout_sec": 60,
   "auth_token": "",
   "direct_http_timeout_sec": 2.0,
   "history_retention_days": 7

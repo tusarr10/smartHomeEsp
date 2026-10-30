@@ -18,7 +18,7 @@ let fleetData = {
 // --- INITIALIZATION ---
 document.addEventListener("DOMContentLoaded", () => {
   setupNavigation();
-  initWebSocket();
+  initRealtimeSync();
   loadCurrentView();
   setInterval(refreshActiveMetrics, 10000);
 });
@@ -60,34 +60,61 @@ function loadCurrentView() {
   }
 }
 
-// --- WEBSOCKET REALTIME ENGINE ---
-function initWebSocket() {
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const wsUrl = `${protocol}//${window.location.host}${API_BASE}/ws`;
-  
-  ws = new WebSocket(wsUrl);
+// --- REALTIME SYNC ENGINE (SSE with WebSocket Fallback) ---
+function initRealtimeSync() {
+  try {
+    const sse = new EventSource(`${API_BASE}/events`);
+    sse.onopen = () => {
+      updateWsStatus(true);
+    };
+    sse.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        handleLiveEvent(msg.type || "telemetry_update", msg.data || msg);
+      } catch (e) {}
+    };
+    sse.addEventListener("node_status", (e) => {
+      try { handleLiveEvent("node_status", JSON.parse(e.data)); } catch (err) {}
+    });
+    sse.addEventListener("telemetry", (e) => {
+      try { handleLiveEvent("telemetry_update", JSON.parse(e.data)); } catch (err) {}
+    });
+    sse.addEventListener("command_executed", (e) => {
+      try { handleLiveEvent("relay_state_confirmed", JSON.parse(e.data)); } catch (err) {}
+    });
+    sse.onerror = () => {
+      tryWebSocketFallback();
+    };
+    return;
+  } catch (e) {
+    tryWebSocketFallback();
+  }
+}
 
-  ws.onopen = () => {
-    updateWsStatus(true);
-  };
-
-  ws.onmessage = (event) => {
-    try {
-      const msg = JSON.parse(event.data);
-      handleLiveEvent(msg.type, msg.data);
-    } catch (e) {
-      console.error("WS Parse Error:", e);
-    }
-  };
-
-  ws.onclose = () => {
+function tryWebSocketFallback() {
+  try {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrl = `${protocol}//${window.location.host}${API_BASE}/ws`;
+    ws = new WebSocket(wsUrl);
+    ws.onopen = () => updateWsStatus(true);
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        handleLiveEvent(msg.type, msg.data);
+      } catch (e) {}
+    };
+    ws.onclose = () => {
+      updateWsStatus(false);
+      setTimeout(initRealtimeSync, 5000);
+    };
+    ws.onerror = () => {
+      updateWsStatus(false);
+      setTimeout(initRealtimeSync, 5000);
+    };
+  } catch (e) {
     updateWsStatus(false);
-    setTimeout(initWebSocket, 4000);
-  };
-
-  ws.onerror = () => {
-    updateWsStatus(false);
-  };
+    setTimeout(initRealtimeSync, 5000);
+  }
 }
 
 function updateWsStatus(connected) {
@@ -173,31 +200,41 @@ async function loadNodes() {
         <button class="btn btn-primary" onclick="showAddNodeModal()">+ Add Node</button>
       </div>
       <div class="cards-grid">
-        ${nodes.map(n => `
+        ${nodes.map(n => {
+          const name = n.name || n.node_name || n.node_id;
+          const isOnline = !!n.is_online;
+          const status = isOnline ? 'Online' : 'Offline';
+          const ip = n.ip_address || n.ip || 'N/A';
+          const hw = n.hardware_type || 'ESP8266';
+          const fw = n.firmware_version || '1.6.0';
+          const rssi = n.rssi !== undefined ? n.rssi : 0;
+          const uptime = n.uptime_sec || 0;
+          const heap = n.free_heap || 0;
+          return `
           <div class="node-card">
             <div class="card-header">
               <div>
-                <div class="card-title">${n.name}</div>
+                <div class="card-title">${name}</div>
                 <div class="card-meta">ID: <code>${n.node_id}</code></div>
               </div>
-              <span class="status-badge ${n.is_online ? 'badge-online' : 'badge-offline'}">
-                <span class="pulse-dot"></span> ${n.status}
+              <span class="status-badge ${isOnline ? 'badge-online' : 'badge-offline'}">
+                <span class="pulse-dot"></span> ${status}
               </span>
             </div>
             <div style="font-size: 13px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
-              <div><strong>HW:</strong> ${n.hardware_type}</div>
-              <div><strong>FW:</strong> v${n.firmware_version}</div>
-              <div><strong>IP:</strong> <a href="http://${n.ip_address}" target="_blank" style="color: var(--accent-blue);">${n.ip_address || 'N/A'}</a></div>
-              <div><strong>RSSI:</strong> ${n.rssi} dBm</div>
-              <div><strong>Uptime:</strong> ${Math.floor(n.uptime_sec / 3600)}h ${Math.floor((n.uptime_sec % 3600) / 60)}m</div>
-              <div><strong>Free Heap:</strong> ${(n.free_heap / 1024).toFixed(1)} KB</div>
+              <div><strong>HW:</strong> ${hw}</div>
+              <div><strong>FW:</strong> v${fw}</div>
+              <div><strong>IP:</strong> <a href="http://${ip}" target="_blank" style="color: var(--accent-blue);">${ip}</a></div>
+              <div><strong>RSSI:</strong> ${rssi} dBm</div>
+              <div><strong>Uptime:</strong> ${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m</div>
+              <div><strong>Free Heap:</strong> ${(heap / 1024).toFixed(1)} KB</div>
             </div>
             <div style="border-top: 1px solid var(--border-color); padding-top: 12px; display: flex; gap: 8px;">
               <button class="btn btn-secondary" onclick="restartNode('${n.node_id}')">🔄 Reboot</button>
               <button class="btn btn-danger" onclick="deleteNode('${n.node_id}')">🗑️ Delete</button>
             </div>
           </div>
-        `).join("")}
+        `;}).join("")}
       </div>
     `;
   } catch (e) {
