@@ -19,7 +19,7 @@ from database import FleetDatabase
 from node_manager import NodeManager
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR = os.path.join(SCRIPT_DIR, "static")
+STATIC_DIR = os.path.join(SCRIPT_DIR, "frontend", "dist") if os.path.isdir(os.path.join(SCRIPT_DIR, "frontend", "dist")) else os.path.join(SCRIPT_DIR, "static")
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 
 def load_config() -> Dict[str, Any]:
@@ -241,34 +241,172 @@ async def handle_http_client(reader: asyncio.StreamReader, writer: asyncio.Strea
         # ROUTE DISPATCHER
         # --------------------------------------------------------------------
 
+        # Normalize /api/v1 -> /api
+        norm_path = path
+        if norm_path.startswith("/api/v1"):
+            norm_path = "/api" + norm_path[len("/api/v1"):]
+
         # Web Dashboard Static UI
         if method == "GET" and (path == "/" or path == "/index.html"):
             await serve_static_file(writer, os.path.join(STATIC_DIR, "index.html"))
             return
 
-        if method == "GET" and path.startswith("/static/"):
-            rel_path = path[len("/static/"):].lstrip("/")
-            full_path = os.path.abspath(os.path.join(STATIC_DIR, rel_path))
-            if full_path.startswith(STATIC_DIR) and os.path.isfile(full_path):
+        if method == "GET" and (path.startswith("/assets/") or path.startswith("/static/")):
+            rel_path = path.lstrip("/").split("/", 1)[-1]
+            full_path = os.path.abspath(os.path.join(STATIC_DIR, "assets", rel_path))
+            if not os.path.isfile(full_path):
+                full_path = os.path.abspath(os.path.join(STATIC_DIR, rel_path))
+            if os.path.isfile(full_path):
                 await serve_static_file(writer, full_path)
             else:
-                await send_response(writer, 404, "text/plain", b"Not found")
+                await send_response(writer, 404, "text/plain", b"File not found")
             return
 
         # Server-Sent Events (SSE) Stream
-        if method == "GET" and path == "/api/events":
+        if method == "GET" and (norm_path == "/api/events" or norm_path == "/api/ws"):
             await handle_sse_stream(writer)
             return
 
-        # REST API: Nodes Fleet List
-        if method == "GET" and path == "/api/nodes":
+        # REST API: System Overview Stats
+        if method == "GET" and norm_path == "/api/system/overview":
+            stats = node_mgr.get_fleet_stats()
+            resp = {
+                "nodes": {
+                    "total": stats.get("totalNodes", 0),
+                    "online": stats.get("onlineNodes", 0),
+                    "offline": stats.get("offlineNodes", 0)
+                },
+                "relays": {
+                    "total": stats.get("totalChannels", 0),
+                    "on": stats.get("activeChannels", 0),
+                    "off": stats.get("totalChannels", 0) - stats.get("activeChannels", 0)
+                },
+                "sensors": {
+                    "total": 0
+                },
+                "alerts": {
+                    "unread": 0
+                },
+                "protocols": {
+                    "tcp_server": {
+                        "running": True,
+                        "port": int(config.get("tcp_port", 2000))
+                    },
+                    "mqtt_broker": {
+                        "connected": False,
+                        "broker": "127.0.0.1:1883"
+                    }
+                },
+                "server": {
+                    "version": "1.6.0",
+                    "uptime_sec": stats.get("serverUptimeSec", 0),
+                    "platform": "Windows SmartHome Central Platform"
+                }
+            }
+            await send_json(writer, resp)
+            return
+
+        # REST API: Aggregated Relays across all nodes
+        if method == "GET" and norm_path == "/api/relays":
             nodes = db.get_nodes()
-            await send_json(writer, {"nodes": nodes, "stats": node_mgr.get_fleet_stats()})
+            all_relays = []
+            for n in nodes:
+                nid = n.get("node_id")
+                nname = n.get("node_name", nid)
+                is_online = bool(n.get("is_online"))
+                for ch in n.get("channels", []):
+                    all_relays.append({
+                        "id": ch.get("id"),
+                        "node_id": nid,
+                        "node_name": nname,
+                        "node_online": is_online,
+                        "channel_id": ch.get("id"),
+                        "pin": ch.get("pin", 0),
+                        "name": ch.get("name", f"Relay {ch.get('id')}"),
+                        "room": ch.get("room", "General"),
+                        "function": ch.get("function", "Relay"),
+                        "active_low": bool(ch.get("activeLow", True)),
+                        "current_state": bool(ch.get("state", False)),
+                        "requested_state": bool(ch.get("state", False)),
+                        "is_syncing": False
+                    })
+            await send_json(writer, all_relays)
+            return
+
+        # REST API: Relay Command
+        if method == "POST" and norm_path.startswith("/api/relays/") and "/command" in norm_path:
+            parts = norm_path.split("/")
+            # /api/relays/{node_id}/{channel_id}/command
+            nid = parts[3]
+            chid = int(parts[4])
+            cmd = dict(body_json)
+            cmd["id"] = chid
+            cmd["gpioId"] = chid
+            res = await node_mgr.send_or_queue_command(nid, cmd)
+            await send_json(writer, res)
+            return
+
+        # REST API: Broadcast Relays
+        if method == "POST" and norm_path == "/api/relays/broadcast":
+            res = await node_mgr.broadcast_command(body_json)
+            await send_json(writer, res)
+            return
+
+        # REST API: Sensors placeholder
+        if method == "GET" and norm_path == "/api/sensors":
+            await send_json(writer, [])
+            return
+
+        # REST API: Automations placeholder
+        if method == "GET" and norm_path == "/api/automations":
+            await send_json(writer, [])
+            return
+
+        # REST API: Firmware placeholder
+        if method == "GET" and norm_path == "/api/firmware":
+            await send_json(writer, [])
+            return
+
+        # REST API: System Events
+        if method == "GET" and norm_path == "/api/system/events":
+            logs = db.get_audit_logs(limit=50)
+            events = []
+            for l in logs:
+                events.append({
+                    "id": l.get("id"),
+                    "timestamp": l.get("timestamp_str"),
+                    "node_id": l.get("node_id"),
+                    "category": l.get("category", "SYSTEM"),
+                    "severity": "WARNING" if "FAIL" in l.get("category", "") or "OFFLINE" in l.get("category", "") else "INFO",
+                    "description": l.get("message")
+                })
+            await send_json(writer, events)
+            return
+
+        # REST API: System Notifications
+        if method == "GET" and norm_path == "/api/system/notifications":
+            await send_json(writer, [])
+            return
+
+        if method == "POST" and norm_path == "/api/system/notifications/mark-read":
+            await send_json(writer, {"success": True})
+            return
+
+        # REST API: System Logs
+        if method == "GET" and norm_path == "/api/system/logs":
+            logs = db.get_audit_logs(limit=100)
+            await send_json(writer, logs)
+            return
+
+        # REST API: Nodes Fleet List
+        if method == "GET" and norm_path == "/api/nodes":
+            nodes = db.get_nodes()
+            await send_json(writer, nodes)
             return
 
         # REST API: Specific Node Detail
-        if method == "GET" and path.startswith("/api/nodes/"):
-            nid = path.split("/")[3]
+        if method == "GET" and norm_path.startswith("/api/nodes/"):
+            nid = norm_path.split("/")[3]
             node = db.get_node(nid)
             if node:
                 history = db.get_telemetry_history(nid, limit=20)
@@ -278,15 +416,15 @@ async def handle_http_client(reader: asyncio.StreamReader, writer: asyncio.Strea
             return
 
         # REST API: Dispatch Command to Node
-        if method == "POST" and "/command" in path and path.startswith("/api/nodes/"):
-            nid = path.split("/")[3]
+        if method == "POST" and "/command" in norm_path and norm_path.startswith("/api/nodes/"):
+            nid = norm_path.split("/")[3]
             res = await node_mgr.send_or_queue_command(nid, body_json)
             await send_json(writer, res)
             return
 
         # REST API: Rename Node
-        if method == "POST" and "/rename" in path and path.startswith("/api/nodes/"):
-            nid = path.split("/")[3]
+        if method == "POST" and "/rename" in norm_path and norm_path.startswith("/api/nodes/"):
+            nid = norm_path.split("/")[3]
             new_name = body_json.get("name", "").strip()
             if new_name and db.rename_node(nid, new_name):
                 await node_mgr.broadcast_sse("node_renamed", {"nodeId": nid, "name": new_name})
@@ -296,8 +434,8 @@ async def handle_http_client(reader: asyncio.StreamReader, writer: asyncio.Strea
             return
 
         # REST API: Delete Node
-        if method == "DELETE" and path.startswith("/api/nodes/"):
-            nid = path.split("/")[3]
+        if method == "DELETE" and norm_path.startswith("/api/nodes/"):
+            nid = norm_path.split("/")[3]
             if db.delete_node(nid):
                 await node_mgr.broadcast_sse("node_deleted", {"nodeId": nid})
                 await send_json(writer, {"success": True, "nodeId": nid})
@@ -306,13 +444,13 @@ async def handle_http_client(reader: asyncio.StreamReader, writer: asyncio.Strea
             return
 
         # REST API: Broadcast Command to All Nodes
-        if method == "POST" and path == "/api/broadcast/command":
+        if method == "POST" and norm_path == "/api/broadcast/command":
             res = await node_mgr.broadcast_command(body_json)
             await send_json(writer, res)
             return
 
         # REST API: HTTP Telemetry Ingestion (Alternative to TCP for HTTP-configured nodes)
-        if method == "POST" and path == "/api/telemetry":
+        if method == "POST" and norm_path == "/api/telemetry":
             peer = writer.get_extra_info("peername")
             if peer and (not body_json.get("ip") or body_json.get("ip") == "0.0.0.0"):
                 body_json["ip"] = peer[0]
@@ -324,7 +462,7 @@ async def handle_http_client(reader: asyncio.StreamReader, writer: asyncio.Strea
             return
 
         # REST API: Fleet Summary Stats
-        if method == "GET" and path == "/api/stats":
+        if method == "GET" and norm_path == "/api/stats":
             await send_json(writer, node_mgr.get_fleet_stats())
             return
 
