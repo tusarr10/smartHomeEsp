@@ -1,0 +1,198 @@
+[
+  {
+    "endpoint": "/api",
+    "url": "http://192.168.1.105/api",
+    "method": "GET",
+    "exists": false,
+    "http_status": 404,
+    "auth_required": false,
+    "response_format": "N/A",
+    "memory_fields_exposed": [],
+    "notes": "Endpoint not implemented (404)"
+  },
+  {
+    "endpoint": "/api/all",
+    "url": "http://192.168.1.105/api/all",
+    "method": "GET",
+    "exists": true,
+    "http_status": 200,
+    "auth_required": false,
+    "response_format": "JSON",
+    "memory_fields_exposed": [],
+    "notes": "Active API"
+  },
+  {
+    "endpoint": "/api/status",
+    "url": "http://192.168.1.105/api/status",
+    "method": "GET",
+    "exists": true,
+    "http_status": 200,
+    "auth_required": false,
+    "response_format": "JSON",
+    "memory_fields_exposed": [
+      "freeHeap",
+      "minFreeHeap",
+      "maxFreeBlock",
+      "heapFragPercent",
+      "uptimeSec",
+      "rssi"
+    ],
+    "notes": "Diagnostic API"
+  },
+  {
+    "endpoint": "/api/system",
+    "url": "http://192.168.1.105/api/system",
+    "method": "GET",
+    "exists": false,
+    "http_status": 404,
+    "auth_required": false,
+    "response_format": "N/A",
+    "memory_fields_exposed": [],
+    "notes": "Endpoint not implemented (404)"
+  },
+  {
+    "endpoint": "/api/info",
+    "url": "http://192.168.1.105/api/info",
+    "method": "GET",
+    "exists": false,
+    "http_status": 404,
+    "auth_required": false,
+    "response_format": "N/A",
+    "memory_fields_exposed": [],
+    "notes": "Endpoint not implemented (404)"
+  },
+  {
+    "endpoint": "/api/diagnostics",
+    "url": "http://192.168.1.105/api/diagnostics",
+    "method": "GET",
+    "exists": false,
+    "http_status": 404,
+    "auth_required": false,
+    "response_format": "N/A",
+    "memory_fields_exposed": [],
+    "notes": "Endpoint not implemented (404)"
+  },
+  {
+    "endpoint": "/api/health",
+    "url": "http://192.168.1.105/api/health",
+    "method": "GET",
+    "exists": false,
+    "http_status": 404,
+    "auth_required": false,
+    "response_format": "N/A",
+    "memory_fields_exposed": [],
+    "notes": "Endpoint not implemented (404)"
+  },
+  {
+    "endpoint": "/api/heap",
+    "url": "http://192.168.1.105/api/heap",
+    "method": "GET",
+    "exists": false,
+    "http_status": 404,
+    "auth_required": false,
+    "response_format": "N/A",
+    "memory_fields_exposed": [],
+    "notes": "Endpoint not implemented (404)"
+  },
+  {
+    "endpoint": "/api/memory",
+    "url": "http://192.168.1.105/api/memory",
+    "method": "GET",
+    "exists": false,
+    "http_status": 404,
+    "auth_required": false,
+    "response_format": "N/A",
+    "memory_fields_exposed": [],
+    "notes": "Endpoint not implemented (404)"
+  },
+  {
+    "endpoint": "/api/telemetry",
+    "url": "http://192.168.1.105/api/telemetry",
+    "method": "GET",
+    "exists": false,
+    "http_status": 404,
+    "auth_required": false,
+    "response_format": "N/A",
+    "memory_fields_exposed": [],
+    "notes": "Endpoint not implemented (404)"
+  },
+  {
+    "endpoint": "/api/settings",
+    "url": "http://192.168.1.105/api/settings",
+    "method": "GET",
+    "exists": true,
+    "http_status": 200,
+    "auth_required": false,
+    "response_format": "JSON",
+    "memory_fields_exposed": [],
+    "notes": "Active API"
+  },
+  {
+    "endpoint": "/api/logs",
+    "url": "http://192.168.1.105/api/logs",
+    "method": "GET",
+    "exists": true,
+    "http_status": 200,
+    "auth_required": false,
+    "response_format": "JSON",
+    "memory_fields_exposed": [],
+    "notes": "Active API"
+  },
+  {
+    "endpoint": "/api/gpio",
+    "url": "http://192.168.1.105/api/gpio",
+    "method": "GET",
+    "exists": true,
+    "http_status": 200,
+    "auth_required": false,
+    "response_format": "JSON",
+    "memory_fields_exposed": [],
+    "notes": "Active API"
+  },
+  {
+    "endpoint": "/api/wifi/status",
+    "url": "http://192.168.1.105/api/wifi/status",
+    "method": "GET",
+    "exists": true,
+    "http_status": 200,
+    "auth_required": false,
+    "response_format": "JSON",
+    "memory_fields_exposed": [
+      "rssi"
+    ],
+    "notes": "Diagnostic API"
+  },
+  {
+    "endpoint": "/api/receiver",
+    "url": "http://192.168.1.105/api/receiver",
+    "method": "GET",
+    "exists": true,
+    "http_status": 200,
+    "auth_required": false,
+    "response_format": "JSON",
+    "memory_fields_exposed": [],
+    "notes": "Active API"
+  },
+  {
+    "endpoint": "/api/automation",
+    "url": "http://192.168.1.105/api/automation",
+    "method": "GET",
+    "exists": true,
+    "http_status": 200,
+    "auth_required": false,
+    "response_format": "JSON",
+    "memory_fields_exposed": [],
+    "notes": "Active API"
+  },
+  {
+    "endpoint": "/index.html",
+    "url": "http://192.168.1.105/index.html",
+    "method": "GET",
+    "exists": true,
+    "http_status": 200,
+    "auth_required": false,
+    "response_format": "HTML",
+    "memory_fields_exposed": [],
+    "notes": "Primary Web UI"
+  }
+]

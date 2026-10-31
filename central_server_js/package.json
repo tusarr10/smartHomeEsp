@@ -1,0 +1,27 @@
+{
+  "name": "smarthome-central-server-js",
+  "version": "1.6.0",
+  "description": "SmartHome Multi-Node Central Fleet Server in JavaScript (Node.js) with TCP Telemetry, REST API, WebSockets, and Live Dashboard",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "multer": "^2.5.0",
+    "ws": "^8.18.0"
+  },
+  "keywords": [
+    "smarthome",
+    "esp8266",
+    "iot",
+    "fleet-management",
+    "tcp-server",
+    "websockets"
+  ],
+  "author": "SmartHome Team",
+  "license": "MIT"
+}

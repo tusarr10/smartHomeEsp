@@ -1,0 +1,12 @@
+{
+  "bind_host": "0.0.0.0",
+  "http_port": 9100,
+  "tcp_port": 2000,
+  "offline_timeout_sec": 30,
+  "auth_token": "",
+  "direct_http_timeout_ms": 2500,
+  "node_auth": {
+    "username": "admin",
+    "password": "admin"
+  }
+}

@@ -1,0 +1,6 @@
+cycle,timestamp,duration_ms,server_duration_ms,success,heap_before,heap_after,heap_delta_bytes,max_block_bytes,fragmentation_pct,response_text,error
+1,2026-10-31T14:19:25.861114,689.56,665,True,25192,25112,80,21232,15.45,OK (No response payload),
+2,2026-10-31T14:19:30.232508,1017.52,999,True,25224,25256,-32,21232,15.93,OK (No response payload),
+3,2026-10-31T14:19:36.024282,744.84,695,True,25336,25432,-96,21232,16.51,"{""status"":""ok"",""epoch"":1793436575}",
+4,2026-10-31T14:19:41.137499,1766.77,1742,True,25208,25336,-128,21232,16.2,OK (No response payload),
+5,2026-10-31T14:19:46.888602,2162.5,2120,True,25320,24792,528,21232,14.36,OK (No response payload),

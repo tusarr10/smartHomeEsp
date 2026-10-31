@@ -1,0 +1,17 @@
+{
+  "configured_protocol": "Raw TCP Socket (Stream)",
+  "protocol_id": 1,
+  "target_server": "192.168.1.10:2000",
+  "report_interval_sec": 10,
+  "send_on_state_change": true,
+  "packets_sent": 175,
+  "packets_failed": 8,
+  "last_sync_status": "OK (Code 200)",
+  "last_sync_timestamp": "2026-10-31 13:43:37 (IST)",
+  "firmware_json_doc_size_bytes": 2048,
+  "payload_generation_method": "ArduinoJson v6 DynamicJsonDocument(2048) on stack",
+  "socket_lifecycle": "Connected per telemetry packet, drained, and closed immediately (No persistent connection leak)",
+  "socket_timeout_ms": 3500,
+  "debounce_ms": 600,
+  "memory_risk": "Low (Stack allocation released upon pushTelemetry() exit)"
+}
