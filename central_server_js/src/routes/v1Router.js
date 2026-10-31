@@ -7,6 +7,8 @@ const multer = require('multer');
 
 function createV1Router(nodeManager, db) {
   const router = express.Router();
+  const OtaService = require('../otaService');
+  const otaService = new OtaService(db, nodeManager);
 
   // Configure Multer for Firmware Uploads
   const firmwareDir = path.join(__dirname, '..', '..', 'data', 'firmware');
@@ -172,6 +174,40 @@ function createV1Router(nodeManager, db) {
     res.json(relays);
   });
 
+  // Reconcile and synchronize pins directly with all online nodes
+  router.post('/relays/sync', async (req, res) => {
+    try {
+      const results = await nodeManager.syncAllOnlineNodesPins();
+      const updatedRelays = db.getRelays();
+      res.json({
+        success: true,
+        message: 'Synchronized hardware GPIO pins with nodes',
+        totalRelays: updatedRelays.length,
+        results,
+        relays: updatedRelays
+      });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // Synchronize pins for a specific node
+  router.post('/nodes/:nodeId/sync-pins', async (req, res) => {
+    try {
+      const result = await nodeManager.syncNodePins(req.params.nodeId);
+      const updatedRelays = db.getRelays({ node_id: req.params.nodeId });
+      res.json({
+        success: true,
+        message: `Synchronized ${result.count} pins from node ${req.params.nodeId}`,
+        nodeId: req.params.nodeId,
+        count: result.count,
+        relays: updatedRelays
+      });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
   router.post('/relays/:nodeId/:channelId/command', async (req, res) => {
     const { nodeId, channelId } = req.params;
     const action = req.body.action || 'setState';
@@ -239,7 +275,7 @@ function createV1Router(nodeManager, db) {
     res.json({ success: ok });
   });
 
-  // === FIRMWARE & OTA ===
+  // === FIRMWARE & LONG-TERM SUPPORT (LTS) OTA ===
   router.get('/firmware', (req, res) => {
     const list = db.getFirmwareList();
     res.json(list);
@@ -252,53 +288,159 @@ function createV1Router(nodeManager, db) {
 
     try {
       const fileBuffer = fs.readFileSync(req.file.path);
-      const hash = crypto.createHash('md5').update(fileBuffer).digest('hex');
+      const hashMd5 = crypto.createHash('md5').update(fileBuffer).digest('hex');
+      const hashSha256 = crypto.createHash('sha256').update(fileBuffer).digest('hex');
       const version = req.body.version || '1.6.0';
       const hardware = req.body.hardware_type || 'ESP8266';
+      const releaseChannel = req.body.release_channel || 'LTS';
+      const notes = req.body.notes || '';
 
       const id = db.addFirmwareRecord({
         filename: req.file.originalname,
         version,
         hardware_type: hardware,
+        release_channel: releaseChannel,
+        notes,
         file_size_bytes: req.file.size,
-        checksum_md5: hash,
+        checksum_md5: hashMd5,
+        checksum_sha256: hashSha256,
         file_path: req.file.path
       });
 
-      db.logAudit('FIRMWARE_UPLOAD', 'System', `Uploaded firmware '${req.file.originalname}' v${version} (${req.file.size} bytes)`);
+      db.logAudit('FIRMWARE_UPLOAD', 'System', `Uploaded firmware '${req.file.originalname}' v${version} [${releaseChannel}] (${req.file.size} bytes)`);
 
       res.json({
         success: true,
         id,
         filename: req.file.originalname,
         version,
-        checksum: hash,
-        message: 'Firmware uploaded and registered in catalog'
+        release_channel: releaseChannel,
+        checksum_md5: hashMd5,
+        checksum_sha256: hashSha256,
+        message: 'Firmware uploaded and registered in LTS catalog'
       });
     } catch (err) {
       res.status(500).json({ success: false, error: err.message });
     }
   });
 
-  // Flash OTA to Node
+  router.delete('/firmware/:id', (req, res) => {
+    const id = Number(req.params.id);
+    const fw = db.getFirmware(id);
+    if (!fw) return res.status(404).json({ success: false, error: 'Firmware not found' });
+
+    try {
+      if (fs.existsSync(fw.file_path)) {
+        fs.unlinkSync(fw.file_path);
+      }
+    } catch {}
+
+    db.deleteFirmware(id);
+    db.logAudit('FIRMWARE_DELETED', 'System', `Deleted firmware '${fw.filename}' v${fw.version}`);
+    res.json({ success: true, message: 'Firmware removed from catalog' });
+  });
+
+  // 1. Fetch live diagnostic data from node before OTA
+  router.get('/ota/node-diagnostics/:nodeId', async (req, res) => {
+    try {
+      const diag = await otaService.fetchNodeDiagnostics(req.params.nodeId);
+      res.json(diag);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // 2. Pre-Check & Version Compatibility Validation
+  router.post('/ota/pre-check', async (req, res) => {
+    const { nodeId, firmwareId } = req.body;
+    if (!nodeId || !firmwareId) {
+      return res.status(400).json({ success: false, error: 'nodeId and firmwareId are required' });
+    }
+    try {
+      const result = await otaService.preCheckOta(nodeId, firmwareId);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // 3. Create Node Configuration & State Backup
+  router.post('/ota/backup/:nodeId', async (req, res) => {
+    try {
+      const backupType = req.body.backupType || 'MANUAL';
+      const result = await otaService.backupNode(req.params.nodeId, backupType);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // List all backups
+  router.get('/ota/backups', (req, res) => {
+    const list = db.getNodeBackups(req.query.nodeId);
+    res.json(list);
+  });
+
+  // Download backup JSON file
+  router.get('/ota/backups/:id/download', (req, res) => {
+    const b = db.getNodeBackup(req.params.id);
+    if (!b || !fs.existsSync(b.backup_path)) {
+      return res.status(404).json({ success: false, error: 'Backup archive file not found' });
+    }
+    res.download(b.backup_path, path.basename(b.backup_path));
+  });
+
+  // Delete backup
+  router.delete('/ota/backups/:id', (req, res) => {
+    const b = db.getNodeBackup(req.params.id);
+    if (!b) return res.status(404).json({ success: false, error: 'Backup not found' });
+    try {
+      if (fs.existsSync(b.backup_path)) fs.unlinkSync(b.backup_path);
+    } catch {}
+    db.deleteNodeBackup(b.id);
+    res.json({ success: true, message: 'Backup deleted' });
+  });
+
+  // Restore node configuration from backup
+  router.post('/ota/backups/:id/restore/:nodeId', async (req, res) => {
+    try {
+      const result = await otaService.restoreNodeConfig(req.params.nodeId, req.params.id);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // 4. Managed End-to-End OTA Deployment Pipeline
+  router.post('/ota/deploy', async (req, res) => {
+    const { nodeId, firmwareId, options } = req.body;
+    if (!nodeId || !firmwareId) {
+      return res.status(400).json({ success: false, error: 'nodeId and firmwareId are required' });
+    }
+    try {
+      const result = await otaService.deployOta(nodeId, firmwareId, options || {});
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // 5. OTA Deployment History Log
+  router.get('/ota/history', (req, res) => {
+    const limit = Number(req.query.limit) || 50;
+    const history = db.getOtaHistory(limit);
+    res.json(history);
+  });
+
+  // Legacy Flash Route adapter
   router.post('/firmware/:id/flash/:nodeId', async (req, res) => {
     const { id, nodeId } = req.params;
-    const fwList = db.getFirmwareList();
-    const fw = fwList.find(f => f.id === Number(id));
-    const node = db.getNode(nodeId);
-
-    if (!fw || !fs.existsSync(fw.file_path)) {
-      return res.status(404).json({ success: false, error: 'Firmware binary file not found on server' });
+    try {
+      const result = await otaService.deployOta(nodeId, id, { autoBackup: true, postVerify: true });
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
     }
-    if (!node || !node.ip) {
-      return res.status(404).json({ success: false, error: 'Target node is not online or has no IP' });
-    }
-
-    db.logAudit('OTA_FLASH_START', nodeId, `Initiated OTA firmware update to ${node.name} (${node.ip}) with ${fw.filename}`);
-    res.json({
-      success: true,
-      message: `OTA firmware flash initiated for node ${node.name} (${node.ip}) using ${fw.filename}`
-    });
   });
 
   // === TELEMETRY STREAM & HISTORY ===
@@ -315,18 +457,54 @@ function createV1Router(nodeManager, db) {
   });
 
   router.get('/system/notifications', (req, res) => {
-    res.json(db.getNotifications());
+    const limit = Number(req.query.limit) || 60;
+    res.json(db.getNotifications(limit));
+  });
+
+  router.get('/system/notifications/unread-count', (req, res) => {
+    res.json({ unreadCount: db.getUnreadNotificationCount() });
   });
 
   router.post('/system/notifications/mark-read', (req, res) => {
     db.markNotificationsRead();
-    res.json({ success: true });
+    res.json({ success: true, message: 'All notifications marked as read' });
+  });
+
+  router.delete('/system/notifications/:id', (req, res) => {
+    db.deleteNotification(req.params.id);
+    res.json({ success: true, message: 'Notification removed' });
+  });
+
+  router.delete('/system/notifications', (req, res) => {
+    db.clearAllNotifications();
+    res.json({ success: true, message: 'All notifications cleared' });
   });
 
   router.get('/system/logs', (req, res) => {
     const limit = Number(req.query.limit) || 100;
-    const logs = db.getAuditLogs(limit);
+    const category = req.query.category || null;
+    const logs = db.getAuditLogs(limit, category);
     res.json(logs);
+  });
+
+  // === HEALTH & PIN STATUS AUTO-SYNC POLLER ===
+  router.get('/system/poll-settings', (req, res) => {
+    res.json(nodeManager.getPollSettings());
+  });
+
+  router.post('/system/poll-settings', async (req, res) => {
+    const { intervalSec, enabled } = req.body;
+    const settings = await nodeManager.setPollInterval(intervalSec, enabled);
+    res.json({ success: true, settings });
+  });
+
+  router.post('/system/poll-now', async (req, res) => {
+    await nodeManager.pollAllNodesStatusAndPins();
+    res.json({
+      success: true,
+      message: 'Active pin and status polling cycle executed across fleet',
+      settings: nodeManager.getPollSettings()
+    });
   });
 
   return router;

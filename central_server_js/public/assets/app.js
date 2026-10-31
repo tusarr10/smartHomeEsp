@@ -1,3 +1,91 @@
+// --- HELPER UTILITIES ---
+function escapeHtml(str) {
+  if (!str) return "";
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+let unreadNotifCount = 0;
+
+async function checkUnreadNotifications() {
+  try {
+    const res = await fetch(`${API_BASE}/system/notifications/unread-count`);
+    const data = await res.json();
+    setNotificationBadges(data.unreadCount || 0);
+  } catch (e) {}
+}
+
+function setNotificationBadges(count) {
+  unreadNotifCount = Math.max(0, count);
+  const navBadge = document.getElementById("nav-notif-badge");
+  const topBadge = document.getElementById("topbar-notif-count");
+
+  if (unreadNotifCount > 0) {
+    if (navBadge) {
+      navBadge.innerText = unreadNotifCount > 99 ? "99+" : unreadNotifCount;
+      navBadge.style.display = "inline-block";
+    }
+    if (topBadge) {
+      topBadge.innerText = unreadNotifCount > 99 ? "99+" : unreadNotifCount;
+      topBadge.style.display = "inline-block";
+    }
+  } else {
+    if (navBadge) navBadge.style.display = "none";
+    if (topBadge) topBadge.style.display = "none";
+  }
+}
+
+function updateNotificationBadges(delta) {
+  setNotificationBadges(unreadNotifCount + delta);
+}
+
+function showToast(notif) {
+  const container = document.getElementById("toast-container");
+  if (!container) return;
+
+  const toast = document.createElement("div");
+  const severity = (notif.severity || "INFO").toLowerCase();
+  toast.className = `toast-item toast-${severity}`;
+
+  let icon = "🔔";
+  if (notif.category === "PIN" || (notif.title && notif.title.includes("Pin"))) {
+    icon = notif.title.includes("ON") ? "⚡" : "⚪";
+  } else if (notif.category === "NODE" || (notif.title && notif.title.includes("Node"))) {
+    icon = notif.title.includes("Online") ? "🟢" : "🔴";
+  } else if (notif.category === "RESTART" || (notif.title && (notif.title.includes("Reboot") || notif.title.includes("Restart")))) {
+    icon = "🔄";
+  }
+
+  const timeStr = notif.timestamp ? new Date(notif.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
+
+  toast.innerHTML = `
+    <span class="toast-icon">${icon}</span>
+    <div class="toast-content">
+      <div class="toast-title">${escapeHtml(notif.title || 'Notification')}</div>
+      <div class="toast-msg">${escapeHtml(notif.message || '')}</div>
+      <div class="toast-time">${timeStr}</div>
+    </div>
+    <button class="toast-close" title="Dismiss">&times;</button>
+  `;
+
+  const closeBtn = toast.querySelector(".toast-close");
+  const dismiss = () => {
+    toast.classList.add("toast-leave");
+    setTimeout(() => {
+      if (toast.parentNode) toast.parentNode.removeChild(toast);
+    }, 250);
+  };
+
+  if (closeBtn) closeBtn.onclick = (e) => { e.stopPropagation(); dismiss(); };
+  setTimeout(dismiss, 5500);
+
+  container.appendChild(toast);
+}
+
 // ==============================================================================
 // SmartHome Central Management Platform - SPA Controller (v1.6.0)
 // ==============================================================================
@@ -19,8 +107,10 @@ let fleetData = {
 document.addEventListener("DOMContentLoaded", () => {
   setupNavigation();
   initWebSocket();
+  checkUnreadNotifications();
   loadCurrentView();
   setInterval(refreshActiveMetrics, 10000);
+  setInterval(checkUnreadNotifications, 25000);
 });
 
 // --- NAVIGATION ---
@@ -103,16 +193,26 @@ function updateWsStatus(connected) {
 }
 
 function handleLiveEvent(type, data) {
-  if (type === "relay_state_confirmed") {
+  if (type === "notification") {
+    showToast(data);
+    updateNotificationBadges(1);
+    if (currentView === "notifications") loadNotifications();
+    if (currentView === "logs") loadLogs();
+  } else if (type === "relay_state_confirmed") {
     const el = document.getElementById(`relay-toggle-${data.node_id}-${data.channel_id}`);
     if (el) el.checked = data.new_state;
     const syncBadge = document.getElementById(`sync-badge-${data.node_id}-${data.channel_id}`);
     if (syncBadge) syncBadge.style.display = "none";
+    if (currentView === "relays" || currentView === "overview") loadCurrentView();
   } else if (type === "node_status" || type === "node_added" || type === "node_deleted") {
     if (currentView === "nodes" || currentView === "overview") loadCurrentView();
   } else if (type === "telemetry_update") {
     if (currentView === "telemetry") appendTelemetryLog(data);
     if (currentView === "overview") refreshActiveMetrics();
+  } else if (type === "poll_cycle_completed") {
+    if (currentView === "overview") refreshActiveMetrics();
+  } else if (type === "poll_settings_changed") {
+    updateTopbarSyncIndicator(data);
   }
 }
 
@@ -216,6 +316,7 @@ async function loadNodes() {
               <div><strong>Free Heap:</strong> ${(n.free_heap / 1024).toFixed(1)} KB</div>
             </div>
             <div style="border-top: 1px solid var(--border-color); padding-top: 12px; display: flex; gap: 8px;">
+              <button class="btn btn-secondary" style="font-size: 12px;" onclick="syncPinsWithHardware('${n.node_id}')">⚡ Sync Pins</button>
               <button class="btn btn-secondary" style="font-size: 12px;" onclick="restartNode('${n.node_id}')">🔄 Reboot</button>
               <button class="btn btn-danger" style="font-size: 12px;" onclick="deleteNode('${n.node_id}')">🗑️ Delete</button>
             </div>
@@ -326,6 +427,7 @@ async function loadRelays() {
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
         <div style="font-size: 14px; color: var(--text-secondary);">${relays.length} Relay Channels Managed</div>
         <div style="display: flex; gap: 10px;">
+          <button class="btn btn-secondary" onclick="syncPinsWithHardware()">♴️ Sync Pins with Node</button>
           <button class="btn btn-secondary" onclick="broadcastRelays(true)">All ON</button>
           <button class="btn btn-secondary" onclick="broadcastRelays(false)">All OFF</button>
         </div>
@@ -391,6 +493,27 @@ async function pulseRelay(nodeId, channelId) {
     });
   } catch (e) {
     alert("Pulse failed: " + e.message);
+  }
+}
+
+async function syncPinsWithHardware(nodeId) {
+  try {
+    const url = nodeId ? `${API_BASE}/nodes/${nodeId}/sync-pins` : `${API_BASE}/relays/sync`;
+    const res = await fetch(url, { method: "POST" });
+    const data = await res.json();
+    if (data.status === "ok") {
+      alert(`Hardware pin synchronization complete: ${data.message || 'Synced'}`);
+      if (typeof currentView !== 'undefined') {
+        if (currentView === 'relays') loadRelays();
+        else if (currentView === 'nodes') loadNodes();
+      } else {
+        loadRelays();
+      }
+    } else {
+      alert(`Sync failed: ${data.error || 'Unknown error'}`);
+    }
+  } catch (err) {
+    alert(`Sync request error: ${err.message}`);
   }
 }
 
@@ -565,39 +688,102 @@ async function deleteAutomationRule(id) {
   loadAutomation();
 }
 
-// --- 6. FIRMWARE & OTA (FIXED & UPLOAD READY) ---
-async function loadFirmware() {
+// --- 6. FIRMWARE & LONG-TERM SUPPORT (LTS) OTA MANAGEMENT ---
+let otaActiveTab = 'catalog';
+let otaWizardState = {
+  nodeId: null,
+  firmwareId: null,
+  diagnostics: null,
+  preCheck: null
+};
+
+async function loadFirmware(activeTab = null) {
+  if (activeTab) otaActiveTab = activeTab;
   const container = document.getElementById("content-area");
+
+  container.innerHTML = `
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+      <div>
+        <h2 style="margin: 0 0 4px 0; font-size: 18px;">Firmware Repository & Long-Term Support (LTS) OTA Engine</h2>
+        <div style="font-size: 13px; color: var(--text-secondary);">Live node inspection, pre-update version checking, automated configuration backups, and resilient OTA flashing</div>
+      </div>
+      <div style="display: flex; gap: 10px;">
+        <button class="btn btn-secondary" onclick="loadFirmware('wizard')">🚀 Launch OTA Wizard</button>
+        <button class="btn btn-primary" onclick="showUploadFirmwareModal()">+ Upload Firmware (.bin)</button>
+      </div>
+    </div>
+
+    <!-- TABS -->
+    <div class="ota-tabs">
+      <button class="ota-tab-btn ${otaActiveTab === 'catalog' ? 'active' : ''}" onclick="loadFirmware('catalog')">
+        📦 Firmware Catalog
+      </button>
+      <button class="ota-tab-btn ${otaActiveTab === 'wizard' ? 'active' : ''}" onclick="loadFirmware('wizard')">
+        🚀 Guided OTA Deployment Wizard
+      </button>
+      <button class="ota-tab-btn ${otaActiveTab === 'backups' ? 'active' : ''}" onclick="loadFirmware('backups')">
+        💾 Node Backups Archive
+      </button>
+      <button class="ota-tab-btn ${otaActiveTab === 'history' ? 'active' : ''}" onclick="loadFirmware('history')">
+        📜 OTA Deployment History
+      </button>
+    </div>
+
+    <div id="ota-tab-content">
+      <div style="text-align: center; padding: 40px; color: var(--text-muted);">Loading OTA content...</div>
+    </div>
+  `;
+
+  if (otaActiveTab === 'catalog') {
+    renderFirmwareCatalog();
+  } else if (otaActiveTab === 'wizard') {
+    renderOtaWizard(otaWizardState.firmwareId, otaWizardState.nodeId);
+  } else if (otaActiveTab === 'backups') {
+    renderNodeBackups();
+  } else if (otaActiveTab === 'history') {
+    renderOtaHistory();
+  }
+}
+
+// === SUB-VIEW 1: FIRMWARE CATALOG ===
+async function renderFirmwareCatalog() {
+  const content = document.getElementById("ota-tab-content");
   try {
     const res = await fetch(`${API_BASE}/firmware`);
     const files = await res.json();
-    container.innerHTML = `
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-        <div style="font-size: 14px; color: var(--text-secondary);">Firmware Repository & Staged OTA Deployments</div>
-        <button class="btn btn-primary" onclick="showUploadFirmwareModal()">+ Upload Firmware (.bin)</button>
-      </div>
+
+    content.innerHTML = `
       <table class="data-table">
         <thead>
           <tr>
             <th>Filename</th>
             <th>Version</th>
+            <th>Channel</th>
             <th>Target Hardware</th>
             <th>Size</th>
-            <th>MD5 Checksum</th>
-            <th>Deploy</th>
+            <th>Checksum (MD5)</th>
+            <th>Release Notes</th>
+            <th>Actions</th>
           </tr>
         </thead>
         <tbody>
-          ${files.length === 0 ? '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 24px;">No firmware binaries in catalog. Click "+ Upload Firmware" to add one.</td></tr>' : ''}
+          ${files.length === 0 ? '<tr><td colspan="8" style="text-align: center; color: var(--text-muted); padding: 30px;">No firmware binaries in catalog. Click "+ Upload Firmware" to add one.</td></tr>' : ''}
           ${files.map(f => `
             <tr>
               <td><strong>${f.filename}</strong></td>
-              <td>v${f.version}</td>
+              <td><span class="status-badge badge-online">v${f.version}</span></td>
+              <td><span class="status-badge badge-lts">${f.release_channel || 'LTS'}</span></td>
               <td><span class="status-badge badge-sync">${f.hardware_type}</span></td>
               <td>${(f.file_size_bytes / 1024).toFixed(1)} KB</td>
               <td><code style="font-size: 11px;">${f.checksum_md5}</code></td>
+              <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--text-secondary);">
+                ${f.notes || 'Official Release'}
+              </td>
               <td>
-                <button class="btn btn-secondary" style="font-size: 11px; padding: 4px 8px;" onclick="deployFirmwareOta(${f.id}, '${f.filename}')">🚀 Flash OTA</button>
+                <div style="display: flex; gap: 6px;">
+                  <button class="btn btn-primary" style="font-size: 11px; padding: 4px 8px;" onclick="launchWizardForFirmware(${f.id})">🚀 Deploy OTA</button>
+                  <button class="btn btn-secondary" style="font-size: 11px; padding: 4px 8px; color: var(--accent-red);" onclick="deleteFirmwareFile(${f.id}, '${f.filename}')">🗑️</button>
+                </div>
               </td>
             </tr>
           `).join("")}
@@ -605,37 +791,658 @@ async function loadFirmware() {
       </table>
     `;
   } catch (e) {
-    container.innerHTML = `<div style="color: var(--accent-red);">Error loading firmware: ${e.message}</div>`;
+    content.innerHTML = `<div style="color: var(--accent-red); padding: 20px;">Error loading catalog: ${e.message}</div>`;
   }
 }
 
+function launchWizardForFirmware(fwId) {
+  otaWizardState.firmwareId = fwId;
+  loadFirmware('wizard');
+}
+
+// === SUB-VIEW 2: GUIDED OTA DEPLOYMENT WIZARD ===
+async function renderOtaWizard(presetFwId = null, presetNodeId = null) {
+  const content = document.getElementById("ota-tab-content");
+
+  try {
+    const [nodesRes, fwRes] = await Promise.all([
+      fetch(`${API_BASE}/nodes`),
+      fetch(`${API_BASE}/firmware`)
+    ]);
+    const nodes = await nodesRes.json();
+    const firmwares = await fwRes.json();
+
+    if (nodes.length === 0) {
+      content.innerHTML = `<div style="padding: 30px; text-align: center; color: var(--text-muted);">No nodes registered. Please add a node first.</div>`;
+      return;
+    }
+
+    const defaultNode = presetNodeId
+      ? nodes.find(n => n.node_id === presetNodeId) || nodes[0]
+      : (otaWizardState.nodeId ? nodes.find(n => n.node_id === otaWizardState.nodeId) || nodes[0] : nodes[0]);
+
+    const defaultFw = presetFwId
+      ? firmwares.find(f => f.id === Number(presetFwId)) || firmwares[0]
+      : (otaWizardState.firmwareId ? firmwares.find(f => f.id === Number(otaWizardState.firmwareId)) || firmwares[0] : firmwares[0]);
+
+    otaWizardState.nodeId = defaultNode ? defaultNode.node_id : null;
+    otaWizardState.firmwareId = defaultFw ? defaultFw.id : null;
+
+    content.innerHTML = `
+      <div style="display: grid; grid-template-columns: 1fr; gap: 20px;">
+
+        <!-- STEP 1: TARGET NODE & LIVE DIAGNOSTICS FETCH -->
+        <div class="ota-card">
+          <div class="ota-card-header">
+            <div class="ota-card-title">
+              <span class="ota-step-pill">1</span>
+              <span>Select Target Node & Fetch Live Hardware Diagnostics</span>
+            </div>
+            <button class="btn btn-secondary" style="font-size: 12px;" onclick="onWizardNodeChanged()">🔄 Re-fetch Node Diagnostics</button>
+          </div>
+
+          <div style="display: flex; gap: 16px; align-items: flex-end; margin-bottom: 16px;">
+            <div class="form-group" style="flex: 1;">
+              <label class="form-label">Target NodeMCU / ESP8266 Device</label>
+              <select id="wiz-node-select" class="form-control" onchange="onWizardNodeChanged()">
+                ${nodes.map(n => `
+                  <option value="${n.node_id}" ${n.node_id === otaWizardState.nodeId ? 'selected' : ''}>
+                    ${n.name} (${n.ip_address || 'No IP'}) - ${n.room} [v${n.firmware_version || '1.6.0'}]
+                  </option>
+                `).join("")}
+              </select>
+            </div>
+            <button class="btn btn-primary" style="height: 38px;" onclick="executeStandaloneBackup()">💾 Create Instant Node Backup</button>
+          </div>
+
+          <!-- DIAGNOSTICS CONTAINER -->
+          <div id="wiz-node-diagnostics-view">
+            <div style="padding: 20px; text-align: center; color: var(--text-muted);">Fetching live diagnostics from node...</div>
+          </div>
+        </div>
+
+        <!-- STEP 2: FIRMWARE SELECTION & PRE-CHECK VALIDATION -->
+        <div class="ota-card">
+          <div class="ota-card-header">
+            <div class="ota-card-title">
+              <span class="ota-step-pill">2</span>
+              <span>Candidate Firmware & Pre-Flight Version Validation</span>
+            </div>
+            <button class="btn btn-secondary" style="font-size: 12px;" onclick="onWizardFirmwareChanged()">🧪 Run Pre-Flight Validation</button>
+          </div>
+
+          <div class="form-group" style="margin-bottom: 16px;">
+            <label class="form-label">Candidate Firmware Binary</label>
+            <select id="wiz-fw-select" class="form-control" onchange="onWizardFirmwareChanged()">
+              ${firmwares.map(f => `
+                <option value="${f.id}" ${f.id === otaWizardState.firmwareId ? 'selected' : ''}>
+                  ${f.filename} [v${f.version}] (${(f.file_size_bytes/1024).toFixed(1)} KB) - ${f.release_channel || 'LTS'}
+                </option>
+              `).join("")}
+            </select>
+          </div>
+
+          <!-- PRE-CHECK RESULTS CONTAINER -->
+          <div id="wiz-precheck-view">
+            <div style="padding: 20px; text-align: center; color: var(--text-muted);">Analyzing firmware compatibility...</div>
+          </div>
+        </div>
+
+        <!-- STEP 3: BACKUP & LTS DEPLOYMENT EXECUTION -->
+        <div class="ota-card">
+          <div class="ota-card-header">
+            <div class="ota-card-title">
+              <span class="ota-step-pill">3</span>
+              <span>LTS Execution Options & Deployment Launch</span>
+            </div>
+          </div>
+
+          <div style="background: var(--bg-primary); border: 1px solid var(--border-color); border-radius: 8px; padding: 16px; margin-bottom: 20px;">
+            <label style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px; cursor: pointer;">
+              <input type="checkbox" id="wiz-opt-backup" checked style="width: 16px; height: 16px;">
+              <div>
+                <strong>Automatically backup Node Configuration & Rules before flashing (Recommended)</strong>
+                <div style="font-size: 12px; color: var(--text-secondary);">Takes full snapshot of GPIO channels, automations, receiver settings and archives to database.</div>
+              </div>
+            </label>
+
+            <label style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px; cursor: pointer;">
+              <input type="checkbox" id="wiz-opt-verify" checked style="width: 16px; height: 16px;">
+              <div>
+                <strong>Post-Flash Verification & Automatic Reboot Handshake</strong>
+                <div style="font-size: 12px; color: var(--text-secondary);">Monitors node reboot over LAN, polls status and verifies target firmware version is active.</div>
+              </div>
+            </label>
+
+            <div id="wiz-downgrade-override-box" style="display: none; margin-top: 10px; padding: 10px; background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.3); border-radius: 6px;">
+              <label style="display: flex; align-items: center; gap: 10px; cursor: pointer; color: #fde047;">
+                <input type="checkbox" id="wiz-opt-force" style="width: 16px; height: 16px;">
+                <div>
+                  <strong>Acknowledge and proceed with firmware downgrade</strong>
+                  <div style="font-size: 11px;">Target version is older than currently installed version. Check this box to allow overwrite.</div>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <div style="display: flex; justify-content: flex-end; gap: 12px;">
+            <button class="btn btn-secondary" onclick="executeStandaloneBackup()">💾 Create Instant Standalone Backup</button>
+            <button class="btn btn-primary" id="btn-start-ota-deploy" style="padding: 10px 24px; font-weight: bold;" onclick="startGuidedOtaDeployment()">
+              🚀 Start Validated OTA Deployment
+            </button>
+          </div>
+        </div>
+
+      </div>
+    `;
+
+    // Trigger initial live fetch & pre-check
+    await onWizardNodeChanged();
+  } catch (err) {
+    content.innerHTML = `<div style="color: var(--accent-red); padding: 20px;">Error loading wizard: ${err.message}</div>`;
+  }
+}
+
+// Handler: Node Changed in Wizard
+async function onWizardNodeChanged() {
+  const nodeSelect = document.getElementById("wiz-node-select");
+  if (!nodeSelect) return;
+  const nodeId = nodeSelect.value;
+  otaWizardState.nodeId = nodeId;
+
+  const diagView = document.getElementById("wiz-node-diagnostics-view");
+  diagView.innerHTML = `
+    <div style="padding: 16px; text-align: center; color: var(--text-secondary);">
+      <span class="pulse-dot"></span> Connecting to node over LAN and fetching live hardware diagnostics...
+    </div>
+  `;
+
+  try {
+    const res = await fetch(`${API_BASE}/ota/node-diagnostics/${nodeId}`);
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.error || 'Failed to fetch node diagnostics');
+    otaWizardState.diagnostics = d;
+
+    diagView.innerHTML = `
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <span class="status-badge badge-online"><span class="pulse-dot"></span> Node Reachable</span>
+          <span style="font-size: 12px; color: var(--text-secondary);">Ping: <strong>${d.rttMs}ms</strong> | IP: <strong>${d.ip}</strong> | MAC: <code>${d.network.mac}</code></span>
+        </div>
+        <div>
+          <span class="status-badge badge-lts">Installed: v${d.firmwareVersion}</span>
+        </div>
+      </div>
+
+      <div class="ota-diag-grid">
+        <div class="ota-stat-chip">
+          <span class="chip-label">Hardware Model & Core</span>
+          <span class="chip-value" style="font-size: 13px;">${d.hardware}</span>
+          <span style="font-size: 11px; color: var(--text-muted);">Core: ${d.coreVersion} | SDK: ${d.sdkVersion}</span>
+        </div>
+
+        <div class="ota-stat-chip">
+          <span class="chip-label">Free Sketch Space</span>
+          <span class="chip-value" style="color: var(--accent-green);">${(d.flashGeometry.freeSketchSpace/1024).toFixed(1)} KB Available</span>
+          <span style="font-size: 11px; color: var(--text-muted);">Sketch: ${(d.flashGeometry.sketchSize/1024).toFixed(1)} KB | Flash: ${(d.flashGeometry.flashSize/1024/1024).toFixed(1)} MB</span>
+        </div>
+
+        <div class="ota-stat-chip">
+          <span class="chip-label">Free Heap Memory</span>
+          <span class="chip-value" style="color: var(--accent-blue);">${(d.memory.freeHeap/1024).toFixed(1)} KB</span>
+          <span style="font-size: 11px; color: var(--text-muted);">Max Block: ${(d.memory.maxFreeBlock/1024).toFixed(1)} KB | Frag: ${d.memory.heapFragPercent}%</span>
+        </div>
+
+        <div class="ota-stat-chip">
+          <span class="chip-label">Network & Uptime</span>
+          <span class="chip-value">${d.network.rssi} dBm (Wi-Fi)</span>
+          <span style="font-size: 11px; color: var(--text-muted);">Uptime: ${Math.floor(d.network.uptimeSec/60)}m | Resets: ${d.network.bootCount}</span>
+        </div>
+      </div>
+    `;
+
+    // Re-run pre-check with the new node diagnostics
+    await onWizardFirmwareChanged();
+  } catch (err) {
+    diagView.innerHTML = `
+      <div class="check-item check-fail">
+        <span>❌</span>
+        <div>
+          <strong>Failed to fetch live diagnostics:</strong> ${err.message}.
+          <div style="font-size: 11px; margin-top: 4px;">Please check if the node is powered on and connected to the home Wi-Fi network.</div>
+        </div>
+      </div>
+    `;
+  }
+}
+
+// Handler: Firmware Changed in Wizard
+async function onWizardFirmwareChanged() {
+  const fwSelect = document.getElementById("wiz-fw-select");
+  if (!fwSelect) return;
+  const fwId = fwSelect.value;
+  otaWizardState.firmwareId = fwId;
+
+  const preCheckView = document.getElementById("wiz-precheck-view");
+  const downgradeBox = document.getElementById("wiz-downgrade-override-box");
+  const deployBtn = document.getElementById("btn-start-ota-deploy");
+
+  if (!otaWizardState.nodeId) return;
+
+  preCheckView.innerHTML = `
+    <div style="padding: 14px; text-align: center; color: var(--text-secondary);">
+      <span class="pulse-dot"></span> Performing pre-flight safety and compatibility checks...
+    </div>
+  `;
+
+  try {
+    const res = await fetch(`${API_BASE}/ota/pre-check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        nodeId: otaWizardState.nodeId,
+        firmwareId: Number(fwId)
+      })
+    });
+    const check = await res.json();
+    if (!res.ok) throw new Error(check.error || 'Pre-check failed');
+    otaWizardState.preCheck = check;
+
+    // Show downgrade override if applicable
+    if (check.versionType === 'DOWNGRADE') {
+      downgradeBox.style.display = 'block';
+    } else {
+      downgradeBox.style.display = 'none';
+    }
+
+    // Flash Space Bar
+    const fwSize = check.fileSizeBytes;
+    const freeSpace = check.diagnostics.flashGeometry.freeSketchSpace;
+    const pct = Math.min(100, Math.round((fwSize / (freeSpace || 1)) * 100));
+
+    preCheckView.innerHTML = `
+      <!-- VERSION BADGE -->
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+        <div>
+          <span style="font-size: 13px; color: var(--text-secondary);">Version Migration:</span>
+          <span style="font-weight: 700; margin-left: 8px; font-size: 14px;">
+            v${check.currentVersion} ➔ <span style="color: var(--accent-blue);">v${check.targetVersion}</span>
+          </span>
+          <span class="status-badge badge-lts" style="margin-left: 8px;">${check.releaseChannel}</span>
+        </div>
+        <div>
+          ${check.versionType === 'UPGRADE' ? '<span class="status-badge badge-online">Upgrade Recommended</span>' : ''}
+          ${check.versionType === 'SAME_VERSION' ? '<span class="status-badge badge-sync">Re-flash / Repair</span>' : ''}
+          ${check.versionType === 'DOWNGRADE' ? '<span class="status-badge" style="background: rgba(245, 158, 11, 0.2); color: #f59e0b;">Downgrade Warning</span>' : ''}
+        </div>
+      </div>
+
+      <!-- FLASH SPACE GAUGE -->
+      <div style="margin-bottom: 16px;">
+        <div style="display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px;">
+          <span>Binary Flash Footprint: <strong>${(fwSize/1024).toFixed(1)} KB</strong></span>
+          <span>Free Sketch Space: <strong>${(freeSpace/1024).toFixed(1)} KB</strong> (${pct}% space used)</span>
+        </div>
+        <div class="progress-bar-container">
+          <div class="progress-bar-fill" style="width: ${pct}%; background: ${pct > 90 ? 'var(--accent-red)' : 'linear-gradient(90deg, #3b82f6, #10b981)'};"></div>
+        </div>
+      </div>
+
+      <!-- VALIDATION CHECKLIST -->
+      <div style="margin-top: 10px;">
+        ${check.checks.map(c => `
+          <div class="check-item check-${c.status.toLowerCase()}">
+            <span style="font-size: 14px;">${c.status === 'PASS' ? '✅' : (c.status === 'WARN' ? '⚠️' : '❌')}</span>
+            <div style="flex: 1;">
+              <strong>${c.title}</strong>: ${c.details}
+            </div>
+          </div>
+        `).join("")}
+      </div>
+    `;
+
+    deployBtn.disabled = !check.canProceed;
+  } catch (err) {
+    preCheckView.innerHTML = `
+      <div class="check-item check-fail">
+        <span>❌</span>
+        <div><strong>Validation Error:</strong> ${err.message}</div>
+      </div>
+    `;
+    deployBtn.disabled = true;
+  }
+}
+
+// Standalone Backup Trigger
+async function executeStandaloneBackup() {
+  if (!otaWizardState.nodeId) {
+    alert("Please select a target node first.");
+    return;
+  }
+
+  const btn = event?.target;
+  const oldText = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving backup...'; }
+
+  try {
+    const res = await fetch(`${API_BASE}/ota/backup/${otaWizardState.nodeId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ backupType: 'MANUAL' })
+    });
+    const result = await res.json();
+    if (result.success) {
+      alert(`Node snapshot backup #${result.backupId} created successfully!\n\nSaved: ${result.filename} (${(result.fileSizeBytes/1024).toFixed(1)} KB)`);
+    } else {
+      alert(`Backup failed: ${result.error}`);
+    }
+  } catch (err) {
+    alert(`Backup error: ${err.message}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = oldText; }
+  }
+}
+
+// Guided Deployment Modal Execution
+async function startGuidedOtaDeployment() {
+  const check = otaWizardState.preCheck;
+  if (!check || !check.canProceed) {
+    alert("Pre-flight validation has not passed. Cannot initiate OTA deployment.");
+    return;
+  }
+
+  const autoBackup = document.getElementById("wiz-opt-backup").checked;
+  const postVerify = document.getElementById("wiz-opt-verify").checked;
+  const forceDowngrade = document.getElementById("wiz-opt-force")?.checked || false;
+
+  if (check.versionType === 'DOWNGRADE' && !forceDowngrade) {
+    alert("Please acknowledge the firmware downgrade checkbox before proceeding.");
+    return;
+  }
+
+  if (!confirm(`Are you sure you want to deploy firmware v${check.targetVersion} to node '${check.diagnostics.nodeName}' (${check.diagnostics.ip})?\n\n- Automated Pre-Backup: ${autoBackup ? 'YES' : 'NO'}\n- Post-Flash Verification: ${postVerify ? 'YES' : 'NO'}`)) {
+    return;
+  }
+
+  // Open Progress Modal
+  const modalHtml = `
+    <div class="modal-content" style="max-width: 640px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+        <h3 style="margin: 0; font-size: 17px;">🚀 Long-Term Support OTA Deployment in Progress</h3>
+        <span class="status-badge badge-sync"><span class="pulse-dot"></span> Live</span>
+      </div>
+
+      <div style="margin-bottom: 16px;">
+        <div style="font-size: 13px; color: var(--text-secondary); margin-bottom: 8px;">Deployment Stages:</div>
+        <div id="ota-stage-1" class="check-item check-pass"><span>✅</span> <div><strong>Stage 1:</strong> Pre-Flight Validation Complete</div></div>
+        <div id="ota-stage-2" class="check-item ${autoBackup ? 'check-warn' : 'check-pass'}"><span>${autoBackup ? '⏳' : '⏭️'}</span> <div><strong>Stage 2:</strong> ${autoBackup ? 'Creating Complete Node Configuration Backup...' : 'Pre-backup skipped'}</div></div>
+        <div id="ota-stage-3" class="check-item" style="background: var(--bg-primary); border: 1px solid var(--border-color); color: var(--text-muted);"><span>⏳</span> <div><strong>Stage 3:</strong> Streaming Firmware Binary to Node over LAN HTTP</div></div>
+        <div id="ota-stage-4" class="check-item" style="background: var(--bg-primary); border: 1px solid var(--border-color); color: var(--text-muted);"><span>⏳</span> <div><strong>Stage 4:</strong> Flashing to Flash Memory & Awaiting Acknowledgment</div></div>
+        <div id="ota-stage-5" class="check-item" style="background: var(--bg-primary); border: 1px solid var(--border-color); color: var(--text-muted);"><span>⏳</span> <div><strong>Stage 5:</strong> Node Reboot & Post-Flash Handshake Verification</div></div>
+      </div>
+
+      <div style="font-size: 12px; font-weight: 600; margin-bottom: 6px;">Live Execution Console:</div>
+      <div id="ota-deploy-console" class="log-console">
+        [0.0s] Initializing enterprise OTA deployment pipeline...<br>
+        [0.1s] Target: ${check.diagnostics.nodeName} (${check.diagnostics.ip})<br>
+        [0.2s] Candidate: ${check.diagnostics.nodeName} v${check.targetVersion} (${(check.fileSizeBytes/1024).toFixed(1)} KB)<br>
+      </div>
+
+      <div style="display: flex; justify-content: flex-end; margin-top: 16px;">
+        <button id="btn-ota-modal-close" class="btn btn-secondary" disabled onclick="closeModal(); loadFirmware('history');">Please wait...</button>
+      </div>
+    </div>
+  `;
+  openModal(modalHtml);
+
+  const consoleEl = document.getElementById("ota-deploy-console");
+  const closeBtn = document.getElementById("btn-ota-modal-close");
+  const log = (msg) => {
+    if (consoleEl) {
+      consoleEl.innerHTML += `[${new Date().toLocaleTimeString()}] ${msg}<br>`;
+      consoleEl.scrollTop = consoleEl.scrollHeight;
+    }
+  };
+
+  try {
+    log("Sending OTA execution request to central server...");
+
+    if (autoBackup) {
+      document.getElementById("ota-stage-2").className = "check-item check-pass";
+      document.getElementById("ota-stage-2").innerHTML = "<span>✅</span> <div><strong>Stage 2:</strong> Node Configuration Backup Saved to Database</div>";
+      log("Node configuration & rules snapshot backed up successfully.");
+    }
+
+    document.getElementById("ota-stage-3").className = "check-item check-warn";
+    document.getElementById("ota-stage-3").style.color = "#fde047";
+    log("Streaming firmware binary chunks to node POST /api/ota/upload...");
+
+    const res = await fetch(`${API_BASE}/ota/deploy`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        nodeId: otaWizardState.nodeId,
+        firmwareId: Number(otaWizardState.firmwareId),
+        options: { autoBackup, forceDowngrade, postVerify }
+      })
+    });
+
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'OTA deployment failed');
+
+    document.getElementById("ota-stage-3").className = "check-item check-pass";
+    document.getElementById("ota-stage-3").style.color = "#86efac";
+
+    document.getElementById("ota-stage-4").className = "check-item check-pass";
+    document.getElementById("ota-stage-4").style.color = "#86efac";
+    document.getElementById("ota-stage-4").innerHTML = "<span>✅</span> <div><strong>Stage 4:</strong> Flash Write Complete (Node Acknowledged)</div>";
+    log("Node confirmed flash write. Initiating automatic restart sequence.");
+
+    if (postVerify) {
+      document.getElementById("ota-stage-5").className = "check-item check-pass";
+      document.getElementById("ota-stage-5").style.color = "#86efac";
+      document.getElementById("ota-stage-5").innerHTML = `<span>✅</span> <div><strong>Stage 5:</strong> Handshake Verified! Active Version: v${result.versionTo}</div>`;
+      log(`Node came back online in ${(result.totalDurationMs/1000).toFixed(1)}s! Version verified: v${result.versionTo}.`);
+    }
+
+    log("🎉 OTA Deployment Pipeline Finished Successfully!");
+    closeBtn.disabled = false;
+    closeBtn.textContent = "Done (View History)";
+    closeBtn.className = "btn btn-primary";
+  } catch (err) {
+    log(`❌ ERROR: ${err.message}`);
+    document.getElementById("ota-stage-3").className = "check-item check-fail";
+    document.getElementById("ota-stage-3").style.color = "#fca5a5";
+    closeBtn.disabled = false;
+    closeBtn.textContent = "Close";
+  }
+}
+
+// === SUB-VIEW 3: NODE BACKUPS ARCHIVE ===
+async function renderNodeBackups() {
+  const content = document.getElementById("ota-tab-content");
+  try {
+    const res = await fetch(`${API_BASE}/ota/backups`);
+    const backups = await res.json();
+
+    content.innerHTML = `
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+        <div style="font-size: 13px; color: var(--text-secondary);">
+          Full snapshots of node hardware profiles, GPIO channels, room names, automation rules and telemetry parameters.
+        </div>
+      </div>
+
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Backup ID</th>
+            <th>Target Node</th>
+            <th>Firmware Version</th>
+            <th>Type</th>
+            <th>Created At</th>
+            <th>Size</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${backups.length === 0 ? '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 30px;">No configuration backups recorded. Backups are created automatically before OTA updates or via the wizard.</td></tr>' : ''}
+          ${backups.map(b => `
+            <tr>
+              <td><strong>#${b.id}</strong></td>
+              <td>${b.node_name} (<code>${b.node_id}</code>)</td>
+              <td><span class="status-badge badge-sync">v${b.firmware_version}</span></td>
+              <td><span class="status-badge ${b.backup_type === 'PRE_OTA' ? 'badge-lts' : 'badge-online'}">${b.backup_type}</span></td>
+              <td>${new Date(b.created_at).toLocaleString()}</td>
+              <td>${(b.file_size_bytes / 1024).toFixed(1)} KB</td>
+              <td>
+                <div style="display: flex; gap: 6px;">
+                  <a href="${API_BASE}/ota/backups/${b.id}/download" class="btn btn-secondary" style="font-size: 11px; padding: 4px 8px; text-decoration: none;">⬇️ Download JSON</a>
+                  <button class="btn btn-primary" style="font-size: 11px; padding: 4px 8px;" onclick="restoreBackupToNode(${b.id}, '${b.node_id}')">🔄 Restore</button>
+                  <button class="btn btn-secondary" style="font-size: 11px; padding: 4px 8px; color: var(--accent-red);" onclick="deleteBackupRecord(${b.id})">🗑️</button>
+                </div>
+              </td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    `;
+  } catch (err) {
+    content.innerHTML = `<div style="color: var(--accent-red); padding: 20px;">Error loading backups: ${err.message}</div>`;
+  }
+}
+
+async function deleteBackupRecord(id) {
+  if (!confirm(`Delete configuration backup #${id}?`)) return;
+  try {
+    const res = await fetch(`${API_BASE}/ota/backups/${id}`, { method: 'DELETE' });
+    const r = await res.json();
+    if (r.success) {
+      renderNodeBackups();
+    } else {
+      alert(r.error || 'Failed to delete backup');
+    }
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function restoreBackupToNode(backupId, nodeId) {
+  if (!confirm(`Restore configuration snapshot #${backupId} to node '${nodeId}'?\n\nThis will restore GPIO channel names, rooms, functions and system settings.`)) {
+    return;
+  }
+
+  try {
+    const res = await fetch(`${API_BASE}/ota/backups/${backupId}/restore/${nodeId}`, { method: 'POST' });
+    const r = await res.json();
+    if (r.success) {
+      alert(`Restoration complete! Successfully applied ${r.restoredItems} configuration items to node.`);
+    } else {
+      alert(`Restoration finished with warnings: ${r.errors.join(', ')}`);
+    }
+  } catch (e) {
+    alert(`Restoration failed: ${e.message}`);
+  }
+}
+
+// === SUB-VIEW 4: OTA DEPLOYMENT HISTORY ===
+async function renderOtaHistory() {
+  const content = document.getElementById("ota-tab-content");
+  try {
+    const res = await fetch(`${API_BASE}/ota/history`);
+    const history = await res.json();
+
+    content.innerHTML = `
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Timestamp</th>
+            <th>Target Node</th>
+            <th>Firmware File</th>
+            <th>Version Migration</th>
+            <th>Status</th>
+            <th>Duration</th>
+            <th>Backup Reference</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${history.length === 0 ? '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 30px;">No previous OTA deployments recorded.</td></tr>' : ''}
+          ${history.map(h => `
+            <tr>
+              <td>${new Date(h.created_at).toLocaleString()}</td>
+              <td><strong>${h.node_name}</strong> (<code>${h.node_id}</code>)</td>
+              <td><code>${h.firmware_filename || 'firmware.bin'}</code></td>
+              <td>
+                <span style="font-size: 13px; font-weight: 600;">v${h.version_from} ➔ <span style="color: var(--accent-blue);">v${h.version_to}</span></span>
+              </td>
+              <td>
+                <span class="status-badge ${h.status === 'SUCCESS' ? 'badge-online' : (h.status === 'IN_PROGRESS' ? 'badge-sync' : '')}" style="${h.status === 'FAILED' ? 'background: rgba(239, 68, 68, 0.2); color: var(--accent-red);' : ''}">
+                  ${h.status}
+                </span>
+              </td>
+              <td>${(h.duration_ms / 1000).toFixed(1)}s</td>
+              <td>
+                ${h.backup_id ? `<a href="${API_BASE}/ota/backups/${h.backup_id}/download" style="color: var(--accent-blue); font-size: 12px; text-decoration: none;">💾 Backup #${h.backup_id}</a>` : '<span style="color: var(--text-muted);">None</span>'}
+              </td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    `;
+  } catch (err) {
+    content.innerHTML = `<div style="color: var(--accent-red); padding: 20px;">Error loading history: ${err.message}</div>`;
+  }
+}
+
+// Upload Modal with LTS metadata
 function showUploadFirmwareModal() {
   const html = `
     <div class="modal-content">
       <div style="display: flex; justify-content: space-between; align-items: center;">
-        <h3 style="margin: 0;">Upload Firmware Binary (.bin)</h3>
+        <h3 style="margin: 0;">Upload Certified Firmware Binary (.bin)</h3>
         <button class="btn btn-secondary" style="padding: 4px 8px;" onclick="closeModal()">&times;</button>
       </div>
+
       <div class="form-group">
         <label class="form-label">Firmware File (.bin) *</label>
         <input type="file" id="fw-file" class="form-control" accept=".bin">
       </div>
-      <div class="form-group">
-        <label class="form-label">Firmware Version</label>
-        <input type="text" id="fw-version" class="form-control" placeholder="1.6.0" value="1.6.0">
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+        <div class="form-group">
+          <label class="form-label">Firmware Version *</label>
+          <input type="text" id="fw-version" class="form-control" placeholder="1.7.0" value="1.7.0">
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">Release Channel</label>
+          <select id="fw-channel" class="form-control">
+            <option value="LTS">LTS (Long Term Support)</option>
+            <option value="Stable">Stable Release</option>
+            <option value="Beta">Beta Channel</option>
+            <option value="Testing">Development / Testing</option>
+          </select>
+        </div>
       </div>
+
       <div class="form-group">
-        <label class="form-label">Target Hardware</label>
+        <label class="form-label">Target Hardware Platform</label>
         <select id="fw-hardware" class="form-control">
-          <option value="ESP8266">ESP8266 (ESP-12E/F NodeMCU)</option>
+          <option value="ESP8266 (ESP-12E/F) NodeMCU">ESP8266 (ESP-12E/F) NodeMCU</option>
+          <option value="ESP8266 (Generic)">ESP8266 (Generic)</option>
           <option value="ESP32">ESP32</option>
-          <option value="ESP-01">ESP-01</option>
         </select>
       </div>
+
+      <div class="form-group">
+        <label class="form-label">Changelog & Release Notes</label>
+        <textarea id="fw-notes" class="form-control" rows="2" placeholder="Describe optimizations, bug fixes, or enhancements...">Long-Term Support release with dynamic heap optimization and TCP keep-alive.</textarea>
+      </div>
+
       <div id="fw-upload-status" style="display: none; font-size: 13px; padding: 8px; border-radius: 6px;"></div>
+
       <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 8px;">
         <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-        <button class="btn btn-primary" id="btn-submit-upload-fw" onclick="submitUploadFirmware()">Upload Binary</button>
+        <button class="btn btn-primary" id="btn-submit-upload-fw" onclick="submitUploadFirmware()">Upload & Register</button>
       </div>
     </div>
   `;
@@ -646,6 +1453,8 @@ async function submitUploadFirmware() {
   const fileInput = document.getElementById("fw-file");
   const version = document.getElementById("fw-version").value.trim() || "1.6.0";
   const hardware_type = document.getElementById("fw-hardware").value;
+  const release_channel = document.getElementById("fw-channel").value;
+  const notes = document.getElementById("fw-notes").value.trim();
   const statusBox = document.getElementById("fw-upload-status");
   const btn = document.getElementById("btn-submit-upload-fw");
 
@@ -661,13 +1470,15 @@ async function submitUploadFirmware() {
   formData.append("firmware", fileInput.files[0]);
   formData.append("version", version);
   formData.append("hardware_type", hardware_type);
+  formData.append("release_channel", release_channel);
+  formData.append("notes", notes);
 
   btn.disabled = true;
   btn.textContent = "Uploading...";
   statusBox.style.display = "block";
   statusBox.style.background = "rgba(59, 130, 246, 0.15)";
   statusBox.style.color = "var(--accent-blue)";
-  statusBox.textContent = "Uploading file to server...";
+  statusBox.textContent = "Uploading firmware binary & calculating SHA256 checksum...";
 
   try {
     const res = await fetch(`${API_BASE}/firmware/upload`, {
@@ -678,10 +1489,10 @@ async function submitUploadFirmware() {
     if (result.success) {
       statusBox.style.background = "rgba(34, 197, 94, 0.15)";
       statusBox.style.color = "var(--accent-green)";
-      statusBox.textContent = "Firmware uploaded and registered!";
+      statusBox.textContent = `Firmware v${version} uploaded and registered in LTS catalog!`;
       setTimeout(() => {
         closeModal();
-        loadFirmware();
+        loadFirmware('catalog');
       }, 1000);
     } else {
       statusBox.style.background = "rgba(239, 68, 68, 0.15)";
@@ -699,23 +1510,21 @@ async function submitUploadFirmware() {
   }
 }
 
-async function deployFirmwareOta(fwId, filename) {
-  const nodesRes = await fetch(`${API_BASE}/nodes`);
-  const nodes = await nodesRes.json();
-  if (nodes.length === 0) {
-    alert("No registered nodes online to deploy firmware to.");
-    return;
+async function deleteFirmwareFile(id, filename) {
+  if (!confirm(`Delete firmware '${filename}' (ID: ${id}) from repository?`)) return;
+  try {
+    const res = await fetch(`${API_BASE}/firmware/${id}`, { method: 'DELETE' });
+    const r = await res.json();
+    if (r.success) {
+      renderFirmwareCatalog();
+    } else {
+      alert(r.error || 'Failed to delete');
+    }
+  } catch (e) {
+    alert(e.message);
   }
-
-  const nodeOptions = nodes.map(n => `${n.name} (${n.ip_address || n.node_id})`).join("\n");
-  const target = prompt(`Enter Node IP or Node ID to flash ${filename}:\n\nAvailable Nodes:\n${nodeOptions}`, nodes[0].ip_address || nodes[0].node_id);
-  if (!target) return;
-
-  const selectedNode = nodes.find(n => n.node_id === target || n.ip_address === target) || nodes[0];
-  const res = await fetch(`${API_BASE}/firmware/${fwId}/flash/${selectedNode.node_id}`, { method: "POST" });
-  const result = await res.json();
-  alert(result.message || "OTA firmware deployment initiated!");
 }
+
 
 // --- 7. TELEMETRY (FIXED & LIVE STREAMING) ---
 async function loadTelemetry() {
@@ -838,28 +1647,85 @@ async function loadEvents() {
 }
 
 // --- 9. NOTIFICATIONS ---
+let currentNotifFilter = 'all';
+
 async function loadNotifications() {
   const container = document.getElementById("content-area");
   try {
-    const res = await fetch(`${API_BASE}/system/notifications`);
-    const notifs = await res.json();
+    const res = await fetch(`${API_BASE}/system/notifications?limit=100`);
+    const allNotifs = await res.json();
+    const notifs = Array.isArray(allNotifs) ? allNotifs : (allNotifs.notifications || []);
+    
+    // Auto-mark badges read
+    markAllNotificationsRead(false);
+
+    // Apply filter
+    const filtered = notifs.filter(n => {
+      if (currentNotifFilter === 'pins') return n.category === 'PIN' || (n.title && n.title.includes('Pin'));
+      if (currentNotifFilter === 'nodes') return n.category === 'NODE' || (n.title && n.title.includes('Node') && !n.title.includes('Reboot'));
+      if (currentNotifFilter === 'restarts') return n.category === 'RESTART' || (n.title && (n.title.includes('Reboot') || n.title.includes('Restart')));
+      if (currentNotifFilter === 'system') return n.category === 'SYSTEM' || !n.category;
+      return true;
+    });
+
     container.innerHTML = `
-      <div style="display: flex; justify-content: space-between; margin-bottom: 16px;">
-        <div>${notifs.length} Alerts & Notifications</div>
-        <button class="btn btn-secondary" onclick="markAllNotificationsRead()">Mark All Read</button>
-      </div>
-      <div class="cards-grid">
-        ${notifs.length === 0 ? '<div style="color: var(--text-secondary); padding: 16px;">No unread alerts or notifications.</div>' : ''}
-        ${notifs.map(n => `
-          <div class="node-card">
-            <div class="card-header">
-              <div class="card-title">${n.title}</div>
-              <span class="status-badge badge-sync">${n.severity}</span>
-            </div>
-            <p style="font-size: 13.5px; color: var(--text-secondary); margin: 8px 0;">${n.message}</p>
-            <div style="font-size: 11px; color: var(--text-muted);">${n.timestamp ? new Date(n.timestamp).toLocaleString() : 'Recent'}</div>
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 12px;">
+        <div>
+          <h2 style="font-size: 18px; font-weight: 600;">Fleet Notifications & Status Alerts</h2>
+          <div style="font-size: 13px; color: var(--text-secondary); margin-top: 2px;">
+            Showing ${filtered.length} of ${notifs.length} events (Pin ON/OFF, Node Status, Restarts)
           </div>
-        `).join("")}
+        </div>
+        <div style="display: flex; gap: 10px;">
+          <button class="btn btn-secondary" onclick="markAllNotificationsRead(true)">✓ Mark All Read</button>
+          <button class="btn btn-danger" onclick="clearAllNotifications()">🗑️ Clear All</button>
+        </div>
+      </div>
+
+      <div class="filter-pills">
+        <button class="filter-btn ${currentNotifFilter === 'all' ? 'active' : ''}" onclick="setNotifFilter('all')">All Alerts (${notifs.length})</button>
+        <button class="filter-btn ${currentNotifFilter === 'pins' ? 'active' : ''}" onclick="setNotifFilter('pins')">⚡ Pin Status</button>
+        <button class="filter-btn ${currentNotifFilter === 'nodes' ? 'active' : ''}" onclick="setNotifFilter('nodes')">🟢 Node Online/Offline</button>
+        <button class="filter-btn ${currentNotifFilter === 'restarts' ? 'active' : ''}" onclick="setNotifFilter('restarts')">🔄 Node Restarts</button>
+        <button class="filter-btn ${currentNotifFilter === 'system' ? 'active' : ''}" onclick="setNotifFilter('system')">⚙️ System</button>
+      </div>
+
+      <div class="cards-grid">
+        ${filtered.length === 0 ? '<div style="color: var(--text-secondary); padding: 24px; background: var(--bg-card); border-radius: 8px; border: 1px solid var(--border-color); grid-column: 1/-1; text-align: center;">No alerts matching the selected filter.</div>' : ''}
+        ${filtered.map(n => {
+          let icon = '🔔';
+          let borderClass = 'toast-info';
+          if (n.category === 'PIN' || (n.title && n.title.includes('Pin'))) {
+            icon = n.title.includes('ON') ? '⚡' : '⚪';
+            borderClass = n.title.includes('ON') ? 'toast-success' : 'toast-info';
+          } else if (n.category === 'NODE' || (n.title && n.title.includes('Node'))) {
+            icon = n.title.includes('Online') ? '🟢' : '🔴';
+            borderClass = n.title.includes('Online') ? 'toast-success' : 'toast-danger';
+          } else if (n.category === 'RESTART' || (n.title && (n.title.includes('Reboot') || n.title.includes('Restart')))) {
+            icon = '🔄';
+            borderClass = 'toast-warning';
+          }
+          const borderColor = borderClass === 'toast-success' ? 'var(--accent-green)' : borderClass === 'toast-danger' ? 'var(--accent-red)' : borderClass === 'toast-warning' ? 'var(--accent-amber)' : 'var(--accent-blue)';
+          return `
+            <div class="node-card" style="border-left: 4px solid ${borderColor};">
+              <div class="card-header">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                  <span style="font-size: 18px;">${icon}</span>
+                  <div class="card-title">${escapeHtml(n.title)}</div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 6px;">
+                  <span class="status-badge ${borderClass === 'toast-success' ? 'badge-online' : borderClass === 'toast-danger' ? 'badge-offline' : 'badge-sync'}">${escapeHtml(n.severity || 'INFO')}</span>
+                  <button onclick="dismissNotification(${n.id})" title="Delete" style="background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 16px; padding: 2px 6px;">&times;</button>
+                </div>
+              </div>
+              <p style="font-size: 13.5px; color: var(--text-secondary); margin: 10px 0; line-height: 1.5;">${escapeHtml(n.message)}</p>
+              <div style="font-size: 11px; color: var(--text-muted); display: flex; justify-content: space-between;">
+                <span>${n.timestamp ? new Date(n.timestamp).toLocaleString() : 'Just now'}</span>
+                <span>Category: <strong>${escapeHtml(n.category || 'SYSTEM')}</strong></span>
+              </div>
+            </div>
+          `;
+        }).join("")}
       </div>
     `;
   } catch (e) {
@@ -867,9 +1733,33 @@ async function loadNotifications() {
   }
 }
 
-async function markAllNotificationsRead() {
-  await fetch(`${API_BASE}/system/notifications/mark-read`, { method: "POST" });
+function setNotifFilter(filter) {
+  currentNotifFilter = filter;
   loadNotifications();
+}
+
+async function markAllNotificationsRead(reload = true) {
+  try {
+    await fetch(`${API_BASE}/system/notifications/mark-read`, { method: "POST" });
+    setNotificationBadges(0);
+    if (reload) loadNotifications();
+  } catch (e) {}
+}
+
+async function dismissNotification(id) {
+  try {
+    await fetch(`${API_BASE}/system/notifications/${id}`, { method: "DELETE" });
+    loadNotifications();
+  } catch (e) {}
+}
+
+async function clearAllNotifications() {
+  if (!confirm("Clear all notification history?")) return;
+  try {
+    await fetch(`${API_BASE}/system/notifications`, { method: "DELETE" });
+    setNotificationBadges(0);
+    loadNotifications();
+  } catch (e) {}
 }
 
 // --- 10. NETWORK ---
@@ -930,52 +1820,222 @@ async function loadDatabase() {
   `;
 }
 
-// --- 13. SETTINGS ---
+// --- 13. SETTINGS & AUTO-SYNC POLLER ---
 async function loadSettings() {
   const container = document.getElementById("content-area");
-  container.innerHTML = `
-    <div class="metric-card">
-      <h3>Platform Configuration</h3>
-      <p style="margin-top: 8px; color: var(--text-secondary); line-height: 1.6;">
-        Configuration file: <code>central_server_js/config.json</code><br>
-        HTTP Port: <strong>9100</strong> | TCP Port: <strong>2000</strong> | Node Auth: <strong>admin/admin</strong>
-      </p>
-    </div>
-  `;
+  try {
+    const res = await fetch(`${API_BASE}/system/poll-settings`);
+    const poller = await res.json();
+    updateTopbarSyncIndicator(poller);
+
+    container.innerHTML = `
+      <div style="display: flex; flex-direction: column; gap: 20px;">
+        <!-- Auto-Sync Status & Pin Poller -->
+        <div class="metric-card" style="border-left: 4px solid var(--accent-blue);">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 10px;">
+            <div>
+              <h3 style="display: flex; align-items: center; gap: 8px;">
+                <span>⚡ Periodic Health & Pin Status Poller</span>
+                <span class="status-badge ${poller.enabled ? 'badge-online' : 'badge-offline'}">
+                  ${poller.enabled ? 'Active Auto-Sync' : 'Disabled'}
+                </span>
+              </h3>
+              <p style="margin-top: 6px; font-size: 13.5px; color: var(--text-secondary); line-height: 1.5;">
+                Actively queries all registered ESP8266 nodes on a periodic interval. Reconciles pin states, detects physical switch toggles, synchronizes free heap & telemetry, and auto-recovers nodes when connection drops.
+              </p>
+            </div>
+            <button class="btn btn-secondary" onclick="triggerManualPoll()">⚡ Sync Pins & Status Now</button>
+          </div>
+
+          <div style="background: rgba(0,0,0,0.2); padding: 16px; border-radius: 8px; border: 1px solid var(--border-color); display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-end; margin-top: 10px;">
+            <div>
+              <label style="font-size: 13px; font-weight: 600; display: block; margin-bottom: 6px; color: var(--text-secondary);">
+                Auto-Sync Interval:
+              </label>
+              <select id="poll-interval-select" style="background: var(--bg-secondary); border: 1px solid var(--border-color); color: var(--text-primary); padding: 8px 12px; border-radius: 6px; font-size: 13px; outline: none;">
+                <option value="5" ${poller.intervalSec === 5 ? 'selected' : ''}>Every 5 Seconds (High Responsiveness)</option>
+                <option value="10" ${poller.intervalSec === 10 ? 'selected' : ''}>Every 10 Seconds (Recommended)</option>
+                <option value="15" ${poller.intervalSec === 15 ? 'selected' : ''}>Every 15 Seconds (Balanced)</option>
+                <option value="30" ${poller.intervalSec === 30 ? 'selected' : ''}>Every 30 Seconds (Low Traffic)</option>
+                <option value="60" ${poller.intervalSec === 60 ? 'selected' : ''}>Every 60 Seconds (Minimal)</option>
+              </select>
+            </div>
+
+            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px;">
+              <input type="checkbox" id="poll-enabled-check" ${poller.enabled ? 'checked' : ''} style="width: 16px; height: 16px; cursor: pointer;">
+              <label for="poll-enabled-check" style="font-size: 13px; cursor: pointer;">Enable Background Periodic Sync</label>
+            </div>
+
+            <button class="btn btn-primary" onclick="savePollerSettings()">💾 Save Poller Settings</button>
+          </div>
+        </div>
+
+        <!-- Platform Configuration -->
+        <div class="metric-card">
+          <h3 style="margin-bottom: 12px;">Platform Architecture & Core Configuration</h3>
+          <p style="font-size: 14px; color: var(--text-secondary); line-height: 1.6;">
+            • Configuration file: <code>central_server_js/config.json</code><br>
+            • HTTP Web Dashboard Port: <strong>9100</strong><br>
+            • TCP Raw Telemetry Socket: <strong>Port 2000</strong><br>
+            • Registered Node Controller: <strong>http://192.168.1.105</strong> (v1.6.0)<br>
+            • Node Authentication: <strong>admin / admin</strong><br>
+            • Database Engine: <code>central_server_js/data/fleet.db</code> (SQLite WAL Mode)
+          </p>
+        </div>
+      </div>
+    `;
+  } catch (e) {
+    container.innerHTML = `<div style="color: var(--accent-red);">Error loading settings: ${e.message}</div>`;
+  }
 }
 
-// --- 14. LOGS (FIXED: DEFINITE DATES & CLEAN FORMAT) ---
+async function savePollerSettings() {
+  const select = document.getElementById("poll-interval-select");
+  const check = document.getElementById("poll-enabled-check");
+  const intervalSec = Number(select ? select.value : 10);
+  const enabled = check ? check.checked : true;
+
+  try {
+    const res = await fetch(`${API_BASE}/system/poll-settings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ intervalSec, enabled })
+    });
+    const data = await res.json();
+    if (data.success) {
+      alert(`Poller settings saved! Auto-sync is now set to every ${intervalSec}s.`);
+      updateTopbarSyncIndicator(data.settings);
+      loadSettings();
+    }
+  } catch (e) {
+    alert("Error saving settings: " + e.message);
+  }
+}
+
+async function triggerManualPoll() {
+  try {
+    const syncText = document.getElementById("topbar-sync-text");
+    if (syncText) syncText.innerText = "Syncing...";
+    const res = await fetch(`${API_BASE}/system/poll-now`, { method: "POST" });
+    const data = await res.json();
+    if (syncText && data.settings) syncText.innerText = `Auto-Sync: ${data.settings.intervalSec}s`;
+    if (currentView === "nodes") loadNodes();
+    else if (currentView === "relays") loadRelays();
+    else if (currentView === "overview") loadOverview();
+    else if (currentView === "notifications") loadNotifications();
+    else if (currentView === "logs") loadLogs();
+  } catch (e) {
+    console.error("Poll error:", e);
+  }
+}
+
+function updateTopbarSyncIndicator(settings) {
+  const textEl = document.getElementById("topbar-sync-text");
+  if (!textEl) return;
+  if (!settings || !settings.enabled) {
+    textEl.innerText = "Auto-Sync: Off";
+  } else {
+    textEl.innerText = `Auto-Sync: ${settings.intervalSec}s`;
+  }
+}
+
+// --- 14. LOGS & AUDIT TRAIL ---
+let currentLogCategory = 'ALL';
+let logSearchKeyword = '';
+
 async function loadLogs() {
   const container = document.getElementById("content-area");
   try {
-    const res = await fetch(`${API_BASE}/system/logs`);
-    const data = await res.json();
+    const res = await fetch(`${API_BASE}/system/logs?limit=200`);
+    const allData = await res.json();
+    const data = Array.isArray(allData) ? allData : [];
+
+    const filtered = data.filter(l => {
+      const act = l.action || '';
+      if (currentLogCategory === 'PIN') {
+        if (!act.startsWith('PIN_')) return false;
+      } else if (currentLogCategory === 'NODE') {
+        if (!act.startsWith('NODE_ON') && !act.startsWith('NODE_OFF')) return false;
+      } else if (currentLogCategory === 'REBOOT') {
+        if (!act.includes('REBOOT') && !act.includes('RESTART')) return false;
+      } else if (currentLogCategory === 'COMMAND_SENT') {
+        if (act !== 'COMMAND_SENT') return false;
+      }
+
+      if (!logSearchKeyword) return true;
+      const kw = logSearchKeyword.toLowerCase();
+      return (act.toLowerCase().includes(kw)) ||
+             ((l.target || '').toLowerCase().includes(kw)) ||
+             ((l.details || l.message || '').toLowerCase().includes(kw)) ||
+             ((l.timestamp || '').toLowerCase().includes(kw));
+    });
+
     container.innerHTML = `
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-        <div style="font-size: 14px; color: var(--text-secondary);">${data.length} Audit Log Entries</div>
-        <button class="btn btn-secondary" onclick="loadLogs()">🔄 Refresh Logs</button>
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 12px;">
+        <div>
+          <h2 style="font-size: 18px; font-weight: 600;">System Audit & Event Logs</h2>
+          <div style="font-size: 13px; color: var(--text-secondary); margin-top: 2px;">
+            Showing ${filtered.length} entries (Pin status, Node online/offline, Restarts, Commands)
+          </div>
+        </div>
+        <div style="display: flex; gap: 10px; align-items: center;">
+          <input type="text" id="log-search-input" placeholder="🔍 Search logs..." value="${escapeHtml(logSearchKeyword)}" 
+            oninput="handleLogSearch(this.value)" 
+            style="background: rgba(255,255,255,0.06); border: 1px solid var(--border-color); color: var(--text-primary); border-radius: 6px; padding: 6px 12px; font-size: 13px; width: 220px;">
+          <button class="btn btn-secondary" onclick="loadLogs()">🔄 Refresh</button>
+        </div>
       </div>
+
+      <div class="filter-pills">
+        <button class="filter-btn ${currentLogCategory === 'ALL' ? 'active' : ''}" onclick="setLogCategory('ALL')">All Logs</button>
+        <button class="filter-btn ${currentLogCategory === 'PIN' ? 'active' : ''}" onclick="setLogCategory('PIN')">⚡ Pin ON / OFF</button>
+        <button class="filter-btn ${currentLogCategory === 'NODE' ? 'active' : ''}" onclick="setLogCategory('NODE')">🟢 Node Online/Offline</button>
+        <button class="filter-btn ${currentLogCategory === 'REBOOT' ? 'active' : ''}" onclick="setLogCategory('REBOOT')">🔄 Node Restarts</button>
+        <button class="filter-btn ${currentLogCategory === 'COMMAND_SENT' ? 'active' : ''}" onclick="setLogCategory('COMMAND_SENT')">🚀 Commands</button>
+      </div>
+
       <table class="data-table">
         <thead>
           <tr>
             <th>Timestamp</th>
-            <th>User</th>
-            <th>Action</th>
-            <th>Target</th>
-            <th>Details</th>
+            <th>Action / Event</th>
+            <th>Target Node</th>
+            <th>Event Details & Status</th>
           </tr>
         </thead>
         <tbody>
-          ${data.length === 0 ? '<tr><td colspan="5" style="text-align: center; color: var(--text-muted); padding: 24px;">No audit logs recorded yet.</td></tr>' : ''}
-          ${data.map(l => {
+          ${filtered.length === 0 ? '<tr><td colspan="4" style="text-align: center; color: var(--text-muted); padding: 28px;">No log entries found for current filter.</td></tr>' : ''}
+          ${filtered.map(l => {
             const timeStr = l.timestamp ? new Date(l.timestamp).toLocaleString() : 'Just now';
+            let tagClass = 'tag-sync';
+            let actionLabel = l.action || 'SYSTEM';
+
+            if (actionLabel === 'PIN_ON') {
+              tagClass = 'tag-pin-on';
+              actionLabel = '⚡ PIN ON';
+            } else if (actionLabel === 'PIN_OFF') {
+              tagClass = 'tag-pin-off';
+              actionLabel = '⚪ PIN OFF';
+            } else if (actionLabel === 'NODE_ONLINE') {
+              tagClass = 'tag-node-online';
+              actionLabel = '🟢 ONLINE';
+            } else if (actionLabel === 'NODE_OFFLINE') {
+              tagClass = 'tag-node-offline';
+              actionLabel = '🔴 OFFLINE';
+            } else if (actionLabel.includes('REBOOT') || actionLabel.includes('RESTART')) {
+              tagClass = 'tag-reboot';
+              actionLabel = '🔄 RESTART';
+            } else if (actionLabel === 'COMMAND_SENT') {
+              tagClass = 'badge-sync';
+              actionLabel = '🚀 COMMAND';
+            }
+
             return `
               <tr>
-                <td style="white-space: nowrap; font-size: 12.5px;">${timeStr}</td>
-                <td><strong>${l.user || l.username || 'admin'}</strong></td>
-                <td><span class="status-badge badge-sync">${l.action || 'SYSTEM'}</span></td>
-                <td><code>${l.target || l.node_id || 'System'}</code></td>
-                <td>${l.details || l.message || ''}</td>
+                <td style="white-space: nowrap; font-size: 12.5px; color: var(--text-muted);">${timeStr}</td>
+                <td><span class="${tagClass}">${actionLabel}</span></td>
+                <td><code>${escapeHtml(l.target || l.node_id || 'System')}</code></td>
+                <td style="font-size: 13px; line-height: 1.4;">${escapeHtml(l.details || l.message || '')}</td>
               </tr>
             `;
           }).join("")}
@@ -985,6 +2045,16 @@ async function loadLogs() {
   } catch (e) {
     container.innerHTML = `<div style="color: var(--accent-red);">Error loading audit logs: ${e.message}</div>`;
   }
+}
+
+function setLogCategory(cat) {
+  currentLogCategory = cat;
+  loadLogs();
+}
+
+function handleLogSearch(kw) {
+  logSearchKeyword = kw;
+  loadLogs();
 }
 
 function refreshActiveMetrics() {

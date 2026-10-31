@@ -95,8 +95,9 @@ server.on('upgrade', (request, socket, head) => {
 const tcpServer = new TcpTelemetryServer(nodeManager, config);
 tcpServer.start();
 
-// 6. Start Offline Watcher
+// 6. Start Offline Watcher & Active Health & Pin Poller
 nodeManager.startOfflineWatcher();
+nodeManager.startPeriodicStatusPoller();
 
 // 7. Start HTTP Server
 const host = config.bind_host || '0.0.0.0';
