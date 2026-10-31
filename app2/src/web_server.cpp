@@ -8,23 +8,57 @@
 #include "receiver_client.h"
 #include <LittleFS.h>
 
-// Initialize static Logger members
-std::vector<LogEntry> Logger::_logs;
+// Initialize static circular Logger ring buffer
+LogEntry Logger::_logs[LOG_RING_CAPACITY];
+size_t Logger::_head = 0;
+size_t Logger::_count = 0;
 
 void Logger::log(const String& msg) {
     Serial.println(msg);
-    if (_logs.size() >= LOG_BUFFER_CAPACITY) {
-        _logs.erase(_logs.begin());
+
+    size_t writeIdx;
+    if (_count < LOG_RING_CAPACITY) {
+        writeIdx = (_head + _count) % LOG_RING_CAPACITY;
+        _count++;
+    } else {
+        writeIdx = _head;
+        _head = (_head + 1) % LOG_RING_CAPACITY;
     }
-    _logs.push_back({ millis(), msg });
+
+    _logs[writeIdx].timestampMs = millis();
+    strncpy(_logs[writeIdx].message, msg.c_str(), LOG_MSG_MAX_LEN - 1);
+    _logs[writeIdx].message[LOG_MSG_MAX_LEN - 1] = '\0';
+}
+
+void Logger::log(const __FlashStringHelper* msg) {
+    Serial.println(msg);
+
+    size_t writeIdx;
+    if (_count < LOG_RING_CAPACITY) {
+        writeIdx = (_head + _count) % LOG_RING_CAPACITY;
+        _count++;
+    } else {
+        writeIdx = _head;
+        _head = (_head + 1) % LOG_RING_CAPACITY;
+    }
+
+    _logs[writeIdx].timestampMs = millis();
+    strncpy_P(_logs[writeIdx].message, (PGM_P)msg, LOG_MSG_MAX_LEN - 1);
+    _logs[writeIdx].message[LOG_MSG_MAX_LEN - 1] = '\0';
 }
 
 void Logger::getLogsJson(JsonArray& arr) {
-    for (const auto& entry : _logs) {
+    for (size_t i = 0; i < _count; i++) {
+        size_t idx = (_head + i) % LOG_RING_CAPACITY;
         JsonObject obj = arr.createNestedObject();
-        obj["uptimeMs"] = entry.timestampMs;
-        obj["msg"] = entry.message;
+        obj["uptimeMs"] = _logs[idx].timestampMs;
+        obj["msg"] = _logs[idx].message;
     }
+}
+
+void Logger::clear() {
+    _head = 0;
+    _count = 0;
 }
 
 WebServerManager::WebServerManager() : _server(80), _deviceName(FIRMWARE_NAME) {}
@@ -42,7 +76,7 @@ bool WebServerManager::begin() {
         }
     }
 
-    const char* headerKeys[] = { "Cookie", "Authorization", "X-Session-Token" };
+    const char* headerKeys[] = { "Cookie", "Authorization", "X-Session-Token", "X-File-MD5" };
     _server.collectHeaders(headerKeys, sizeof(headerKeys) / sizeof(char*));
 
     registerRoutes();
@@ -66,15 +100,32 @@ void WebServerManager::setDeviceName(const String& name) {
 }
 
 bool WebServerManager::checkAuthOrReject() {
-    if (!AuthManager::getInstance().authenticate(_server)) {
-        _server.send(401, "application/json", F("{\"error\":\"Unauthorized\"}"));
-        return false;
+    // 1. Allow authenticated user session (Cookie or Bearer token)
+    if (AuthManager::getInstance().authenticate(_server)) {
+        return true;
     }
-    return true;
+
+    // 2. Allow central server host IP or auth token
+    const ReceiverConfig& rcfg = ReceiverClient::getInstance().getConfig();
+    if (rcfg.enabled && rcfg.serverHost.length() > 0) {
+        String clientIp = _server.client().remoteIP().toString();
+        if (clientIp == rcfg.serverHost) {
+            return true;
+        }
+    }
+    if (rcfg.authToken.length() > 0 && _server.hasHeader("Authorization")) {
+        String authHeader = _server.header("Authorization");
+        if (authHeader == ("Bearer " + rcfg.authToken)) {
+            return true;
+        }
+    }
+
+    _server.send(401, "application/json", F("{\"error\":\"Unauthorized\"}"));
+    return false;
 }
 
 void WebServerManager::sendJsonResponse(int code, bool success, const String& message) {
-    DynamicJsonDocument doc(256);
+    StaticJsonDocument<256> doc;
     doc["success"] = success;
     if (success) {
         doc["message"] = message;
@@ -127,7 +178,7 @@ void WebServerManager::registerCaptiveRoutes() {
 void WebServerManager::registerApiRoutes() {
     // === AUTHENTICATION ===
     _server.on("/api/auth/login", HTTP_POST, [this]() {
-        DynamicJsonDocument doc(256);
+        StaticJsonDocument<256> doc;
         DeserializationError err = deserializeJson(doc, _server.arg("plain"));
         if (err) {
             sendJsonResponse(400, false, F("Invalid JSON payload"));
@@ -140,7 +191,7 @@ void WebServerManager::registerApiRoutes() {
 
         if (AuthManager::getInstance().login(user, pass, token)) {
             _server.sendHeader(F("Set-Cookie"), String(F("session=")) + token + F("; Path=/; HttpOnly"));
-            DynamicJsonDocument resp(256);
+            StaticJsonDocument<256> resp;
             resp["success"] = true;
             resp["token"] = token;
             resp["username"] = user;
@@ -155,7 +206,7 @@ void WebServerManager::registerApiRoutes() {
 
     _server.on("/api/auth/check", HTTP_GET, [this]() {
         bool authed = AuthManager::getInstance().authenticate(_server);
-        DynamicJsonDocument resp(128);
+        StaticJsonDocument<128> resp;
         resp["authenticated"] = authed;
         resp["adminUser"] = AuthManager::getInstance().getAdminUsername();
         String out;
@@ -177,7 +228,7 @@ void WebServerManager::registerApiRoutes() {
             s_minFreeHeap = freeHeap;
         }
 
-        DynamicJsonDocument doc(1792);
+        DynamicJsonDocument doc(1152);
         doc["deviceName"] = _deviceName;
         doc["firmwareVersion"] = FIRMWARE_VERSION;
         doc["hardware"] = HARDWARE_TARGET;
@@ -392,7 +443,7 @@ void WebServerManager::registerApiRoutes() {
     _server.on("/api/wifi/mode", HTTP_POST, [this]() {
         if (!checkAuthOrReject()) return;
 
-        DynamicJsonDocument doc(128);
+        StaticJsonDocument<128> doc;
         deserializeJson(doc, _server.arg("plain"));
         uint8_t mode = doc["mode"] | (uint8_t)WIFI_MODE_AP_ROUTER;
 
@@ -410,7 +461,8 @@ void WebServerManager::registerApiRoutes() {
 
     // === GPIO / RELAY MANAGEMENT ===
     _server.on("/api/gpio", HTTP_GET, [this]() {
-        DynamicJsonDocument doc(2048);
+        _server.sendHeader(F("Cache-Control"), F("no-cache, no-store, must-revalidate"));
+        DynamicJsonDocument doc(1536);
         JsonArray arr = doc.to<JsonArray>();
         GpioManager::getInstance().toJson(arr);
         String out;
@@ -466,7 +518,7 @@ void WebServerManager::registerApiRoutes() {
     _server.on("/api/gpio/delete", HTTP_POST, [this]() {
         if (!checkAuthOrReject()) return;
 
-        DynamicJsonDocument doc(128);
+        StaticJsonDocument<128> doc;
         deserializeJson(doc, _server.arg("plain"));
         uint8_t id = doc["id"] | 0;
 
@@ -481,7 +533,7 @@ void WebServerManager::registerApiRoutes() {
     _server.on("/api/gpio/state", HTTP_POST, [this]() {
         if (!checkAuthOrReject()) return;
 
-        DynamicJsonDocument doc(256);
+        StaticJsonDocument<256> doc;
         deserializeJson(doc, _server.arg("plain"));
 
         uint8_t id = doc["id"] | 0;
@@ -507,7 +559,7 @@ void WebServerManager::registerApiRoutes() {
 
     // === AUTOMATION RULES ===
     _server.on("/api/automation", HTTP_GET, [this]() {
-        DynamicJsonDocument doc(2048);
+        DynamicJsonDocument doc(1024);
         JsonArray arr = doc.to<JsonArray>();
         AutomationEngine::getInstance().toJson(arr);
         String out;
@@ -540,7 +592,7 @@ void WebServerManager::registerApiRoutes() {
 
     _server.on("/api/automation/toggle", HTTP_POST, [this]() {
         if (!checkAuthOrReject()) return;
-        DynamicJsonDocument doc(128);
+        StaticJsonDocument<128> doc;
         deserializeJson(doc, _server.arg("plain"));
         uint8_t id = doc["id"] | 0;
         if (AutomationEngine::getInstance().toggleRule(id)) {
@@ -552,7 +604,7 @@ void WebServerManager::registerApiRoutes() {
 
     _server.on("/api/automation/delete", HTTP_POST, [this]() {
         if (!checkAuthOrReject()) return;
-        DynamicJsonDocument doc(128);
+        StaticJsonDocument<128> doc;
         deserializeJson(doc, _server.arg("plain"));
         uint8_t id = doc["id"] | 0;
         if (AutomationEngine::getInstance().removeRule(id)) {
@@ -585,7 +637,7 @@ void WebServerManager::registerApiRoutes() {
         if (!checkAuthOrReject()) return;
         AutomationEngine::getInstance().syncNtp();
         Logger::log(F("[NTP] Immediate NTP synchronization triggered"));
-        DynamicJsonDocument res(256);
+        StaticJsonDocument<256> res;
         res["success"] = true;
         res["message"] = F("NTP synchronization triggered.");
         res["formattedTime"] = AutomationEngine::getInstance().getFormattedTime();
@@ -627,7 +679,7 @@ void WebServerManager::registerApiRoutes() {
     _server.on("/api/settings/password", HTTP_POST, [this]() {
         if (!checkAuthOrReject()) return;
 
-        DynamicJsonDocument doc(256);
+        StaticJsonDocument<256> doc;
         deserializeJson(doc, _server.arg("plain"));
 
         String curr = doc["currentPassword"] | "";
@@ -718,7 +770,7 @@ void WebServerManager::registerApiRoutes() {
     });
 
     _server.on("/api/logs", HTTP_GET, [this]() {
-        DynamicJsonDocument doc(4096);
+        DynamicJsonDocument doc(2560);
         JsonArray arr = doc.to<JsonArray>();
         Logger::getLogsJson(arr);
         String out;
@@ -748,13 +800,158 @@ void WebServerManager::registerApiRoutes() {
     }, [this]() {
         HTTPUpload& upload = _server.upload();
         if (upload.status == UPLOAD_FILE_START) {
-            OtaManager::getInstance().handleUploadStart(upload.filename);
+            String typeParam = _server.hasArg("type") ? _server.arg("type") : "";
+            if (_server.hasHeader("X-File-MD5")) {
+                OtaManager::getInstance().setExpectedMD5(_server.header("X-File-MD5"));
+            }
+            OtaManager::getInstance().handleUploadStart(upload.filename, typeParam);
         } else if (upload.status == UPLOAD_FILE_WRITE) {
             OtaManager::getInstance().handleUploadWrite(upload.buf, upload.currentSize);
         } else if (upload.status == UPLOAD_FILE_END) {
             OtaManager::getInstance().handleUploadFinish();
         } else if (upload.status == UPLOAD_FILE_ABORTED) {
             OtaManager::getInstance().handleUploadAbort();
+        }
+    });
+
+    // === DOWNLOAD RUNNING FIRMWARE BINARY TO BROWSER ===
+    _server.on("/api/firmware/download", HTTP_GET, [this]() {
+        uint32_t sketchSize = ESP.getSketchSize();
+        if (sketchSize == 0 || sketchSize > 1048576) {
+            sendJsonResponse(500, false, F("Unable to determine sketch size"));
+            return;
+        }
+
+        String nodeMac = WiFi.macAddress();
+        nodeMac.replace(":", "");
+        String filename = "firmware_backup_" + nodeMac + "_v" + String(FIRMWARE_VERSION) + ".bin";
+
+        _server.sendHeader(F("Content-Disposition"), "attachment; filename=\"" + filename + "\"");
+        _server.sendHeader(F("Content-Type"), F("application/octet-stream"));
+        _server.sendHeader(F("Content-Length"), String(sketchSize));
+        _server.sendHeader(F("Cache-Control"), F("no-cache, no-store, must-revalidate"));
+        _server.setContentLength(sketchSize);
+        _server.send(200, "application/octet-stream", "");
+
+        WiFiClient client = _server.client();
+        uint32_t offset = 0;
+        uint32_t remaining = sketchSize;
+        const size_t CHUNK_SIZE = 512;
+        uint32_t buf[CHUNK_SIZE / 4]; // 512 bytes on stack, 4-byte aligned for spi_flash_read
+
+        while (remaining > 0 && client.connected()) {
+            size_t bytesToRead = (remaining < CHUNK_SIZE) ? remaining : CHUNK_SIZE;
+            size_t alignedBytes = (bytesToRead + 3) & ~3;
+            if (ESP.flashRead(offset, buf, alignedBytes)) {
+                size_t written = client.write((const uint8_t*)buf, bytesToRead);
+                if (written > 0) {
+                    offset += written;
+                    remaining -= written;
+                } else {
+                    delay(1);
+                }
+            } else {
+                break;
+            }
+            yield();
+        }
+    });
+
+    // === DOWNLOAD CONFIGURATION & SETTINGS BACKUP (.JSON) ===
+    _server.on("/api/backup/download", HTTP_GET, [this]() {
+        DynamicJsonDocument backupDoc(4096);
+        backupDoc["nodeId"] = ReceiverClient::getInstance().getConfig().nodeId;
+        backupDoc["nodeName"] = ReceiverClient::getInstance().getConfig().nodeName;
+        backupDoc["firmwareVersion"] = FIRMWARE_VERSION;
+        backupDoc["timestamp"] = AutomationEngine::getInstance().getFormattedTime();
+        backupDoc["epoch"] = (unsigned long)time(nullptr);
+
+        DynamicJsonDocument subDoc(1024);
+        if (StorageManager::getInstance().loadJsonFile(FILE_SYSTEM_CONFIG, subDoc)) {
+            backupDoc["system"] = subDoc;
+        }
+        subDoc.clear();
+        if (StorageManager::getInstance().loadJsonFile(FILE_GPIO_CONFIG, subDoc)) {
+            backupDoc["gpio"] = subDoc;
+        }
+        subDoc.clear();
+        if (StorageManager::getInstance().loadJsonFile(FILE_RULES_CONFIG, subDoc)) {
+            backupDoc["rules"] = subDoc;
+        }
+        subDoc.clear();
+        if (StorageManager::getInstance().loadJsonFile(FILE_RECEIVER_CONFIG, subDoc)) {
+            backupDoc["receiver"] = subDoc;
+        }
+        subDoc.clear();
+        if (StorageManager::getInstance().loadJsonFile(FILE_WIFI_CONFIG, subDoc)) {
+            backupDoc["wifi"] = subDoc;
+        }
+
+        String nodeMac = WiFi.macAddress();
+        nodeMac.replace(":", "");
+        String filename = "smarthome_config_" + nodeMac + ".json";
+
+        _server.sendHeader(F("Content-Disposition"), "attachment; filename=\"" + filename + "\"");
+        _server.sendHeader(F("Content-Type"), F("application/json"));
+        _server.sendHeader(F("Cache-Control"), F("no-cache, no-store, must-revalidate"));
+
+        String out;
+        serializeJsonPretty(backupDoc, out);
+        _server.send(200, "application/json", out);
+    });
+
+    // === RESTORE CONFIGURATION FROM BACKUP (.JSON) ===
+    _server.on("/api/backup/restore", HTTP_POST, [this]() {
+        if (!checkAuthOrReject()) return;
+
+        DynamicJsonDocument backupDoc(4096);
+        DeserializationError err = deserializeJson(backupDoc, _server.arg("plain"));
+        if (err) {
+            sendJsonResponse(400, false, F("Invalid JSON backup file"));
+            return;
+        }
+
+        auto saveVariant = [](const char* path, JsonVariantConst var) -> bool {
+            String tmp = String(path) + ".tmp";
+            File f = LittleFS.open(tmp.c_str(), "w");
+            if (!f) return false;
+            size_t w = serializeJson(var, f);
+            f.flush();
+            f.close();
+            if (w == 0) { LittleFS.remove(tmp.c_str()); return false; }
+            LittleFS.remove(path);
+            return LittleFS.rename(tmp.c_str(), path);
+        };
+
+        bool restoredAny = false;
+        if (backupDoc.containsKey("system")) {
+            saveVariant(FILE_SYSTEM_CONFIG, backupDoc["system"]);
+            restoredAny = true;
+        }
+        if (backupDoc.containsKey("gpio")) {
+            saveVariant(FILE_GPIO_CONFIG, backupDoc["gpio"]);
+            restoredAny = true;
+        }
+        if (backupDoc.containsKey("rules")) {
+            saveVariant(FILE_RULES_CONFIG, backupDoc["rules"]);
+            restoredAny = true;
+        }
+        if (backupDoc.containsKey("receiver")) {
+            saveVariant(FILE_RECEIVER_CONFIG, backupDoc["receiver"]);
+            restoredAny = true;
+        }
+        if (backupDoc.containsKey("wifi")) {
+            saveVariant(FILE_WIFI_CONFIG, backupDoc["wifi"]);
+            restoredAny = true;
+        }
+
+        if (restoredAny) {
+            Logger::log(F("[SYS] Configuration restored from backup file. Rebooting..."));
+            sendJsonResponse(200, true, F("Settings restored successfully! Rebooting in 2 seconds..."));
+            delay(1000);
+            ESP.restart();
+        } else {
+            sendJsonResponse(400, false, F("Backup file did not contain recognized settings"));
         }
     });
 
@@ -824,14 +1021,22 @@ bool WebServerManager::handleFileRead(String path) {
     else if (path.endsWith(".png")) contentType = "image/png";
     else if (path.endsWith(".ico")) contentType = "image/x-icon";
 
+    auto applyCacheHeaders = [this, &path]() {
+        if (path.endsWith(".css") || path.endsWith(".js") || path.endsWith(".png") || path.endsWith(".ico")) {
+            _server.sendHeader(F("Cache-Control"), F("public, max-age=86400, immutable"));
+        } else if (path.endsWith(".html")) {
+            _server.sendHeader(F("Cache-Control"), F("public, max-age=600, must-revalidate"));
+        } else {
+            _server.sendHeader(F("Cache-Control"), F("no-cache"));
+        }
+    };
+
     // Check gzip compressed version first
     String pathWithGz = path + ".gz";
     if (LittleFS.exists(pathWithGz)) {
         File file = LittleFS.open(pathWithGz, "r");
-        _server.sendHeader("Content-Encoding", "gzip");
-        _server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-        _server.sendHeader("Pragma", "no-cache");
-        _server.sendHeader("Expires", "-1");
+        _server.sendHeader(F("Content-Encoding"), F("gzip"));
+        applyCacheHeaders();
         _server.streamFile(file, contentType);
         file.close();
         return true;
@@ -839,9 +1044,7 @@ bool WebServerManager::handleFileRead(String path) {
 
     if (LittleFS.exists(path)) {
         File file = LittleFS.open(path, "r");
-        _server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-        _server.sendHeader("Pragma", "no-cache");
-        _server.sendHeader("Expires", "-1");
+        applyCacheHeaders();
         _server.streamFile(file, contentType);
         file.close();
         return true;

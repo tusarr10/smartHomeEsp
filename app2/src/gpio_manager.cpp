@@ -216,6 +216,8 @@ void GpioManager::toJson(JsonArray& arr) {
         JsonObject obj = arr.createNestedObject();
         obj["id"] = ch.id;
         obj["pin"] = ch.pin;
+        obj["enabled"] = ch.enabled;
+        obj["state"] = ch.currentState;
 
         // Find pin label
         String label = String("GPIO") + String(ch.pin);
@@ -237,13 +239,11 @@ void GpioManager::toJson(JsonArray& arr) {
         obj["function"] = (ch.function.length() > 0) ? ch.function : F("Relay");
         obj["activeLow"] = ch.activeLow;
         obj["initialMode"] = ch.initialMode;
-        obj["enabled"] = ch.enabled;
-        obj["state"] = ch.currentState;
     }
 }
 
 void GpioManager::loadFromStorage() {
-    DynamicJsonDocument doc(2048);
+    DynamicJsonDocument doc(1024);
     if (!StorageManager::getInstance().loadJsonFile(FILE_GPIO_CONFIG, doc)) {
         return;
     }
@@ -274,7 +274,7 @@ void GpioManager::loadFromStorage() {
 }
 
 void GpioManager::saveToStorage() {
-    DynamicJsonDocument doc(2048);
+    DynamicJsonDocument doc(1024);
     JsonArray arr = doc.to<JsonArray>();
     toJson(arr);
     StorageManager::getInstance().saveJsonFile(FILE_GPIO_CONFIG, doc);

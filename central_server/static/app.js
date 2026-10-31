@@ -131,15 +131,31 @@ function updateWsStatus(connected) {
 function handleLiveEvent(type, data) {
   if (type === "relay_state_confirmed") {
     // Update relay toggles in DOM
-    const el = document.getElementById(`relay-toggle-${data.node_id}-${data.channel_id}`);
-    if (el) el.checked = data.new_state;
-    const syncBadge = document.getElementById(`sync-badge-${data.node_id}-${data.channel_id}`);
+    const nid = data.node_id || data.nodeId;
+    const chid = data.channel_id !== undefined ? data.channel_id : data.channelId;
+    const el = document.getElementById(`relay-toggle-${nid}-${chid}`);
+    if (el) el.checked = Boolean(data.new_state);
+    const syncBadge = document.getElementById(`sync-badge-${nid}-${chid}`);
     if (syncBadge) syncBadge.style.display = "none";
   } else if (type === "node_status") {
     // Refresh if in nodes or overview
     if (currentView === "nodes" || currentView === "overview") loadCurrentView();
   } else if (type === "telemetry_update") {
     if (currentView === "telemetry") appendTelemetryLog(data);
+    // Live real-time update of all relay toggles from incoming node telemetry
+    if (data.channels && Array.isArray(data.channels)) {
+      const nid = data.nodeId || data.node_id;
+      data.channels.forEach(ch => {
+        const chid = ch.id !== undefined ? ch.id : ch.channel_id;
+        const isState = Boolean(ch.state);
+        const el = document.getElementById(`relay-toggle-${nid}-${chid}`);
+        if (el) {
+          el.checked = isState;
+        }
+        const syncBadge = document.getElementById(`sync-badge-${nid}-${chid}`);
+        if (syncBadge) syncBadge.style.display = "none";
+      });
+    }
   }
 }
 
@@ -229,8 +245,10 @@ async function loadNodes() {
               <div><strong>Uptime:</strong> ${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m</div>
               <div><strong>Free Heap:</strong> ${(heap / 1024).toFixed(1)} KB</div>
             </div>
-            <div style="border-top: 1px solid var(--border-color); padding-top: 12px; display: flex; gap: 8px;">
+            <div style="border-top: 1px solid var(--border-color); padding-top: 12px; display: flex; gap: 8px; flex-wrap: wrap;">
               <button class="btn btn-secondary" onclick="restartNode('${n.node_id}')">🔄 Reboot</button>
+              <button class="btn btn-secondary" onclick="downloadNodeBackup('${n.node_id}')" ${!isOnline ? 'disabled' : ''} title="Download Node Configuration JSON">💾 Config</button>
+              <button class="btn btn-secondary" onclick="downloadNodeFirmware('${n.node_id}')" ${!isOnline ? 'disabled' : ''} title="Download Running Node Firmware Binary (.bin)">📦 FW Backup</button>
               <button class="btn btn-danger" onclick="deleteNode('${n.node_id}')">🗑️ Delete</button>
             </div>
           </div>
@@ -299,13 +317,18 @@ async function toggleRelay(nodeId, channelId, state) {
   if (syncBadge) syncBadge.style.display = "inline";
 
   try {
-    await fetch(`${API_BASE}/relays/${nodeId}/${channelId}/command`, {
+    const res = await fetch(`${API_BASE}/relays/${nodeId}/${channelId}/command`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "setState", state: state })
     });
+    const result = await res.json();
+    if (result.success && result.delivery === "direct_lan_http") {
+      if (syncBadge) syncBadge.style.display = "none";
+    }
   } catch (e) {
     alert("Relay command failed: " + e.message);
+    if (syncBadge) syncBadge.style.display = "none";
   }
 }
 
@@ -422,36 +445,242 @@ async function loadAutomation() {
 async function loadFirmware() {
   const container = document.getElementById("content-area");
   try {
-    const res = await fetch(`${API_BASE}/firmware`);
-    const files = await res.json();
+    const [fwRes, nodesRes] = await Promise.all([
+      fetch(`${API_BASE}/firmware`),
+      fetch(`${API_BASE}/nodes`)
+    ]);
+    const files = await fwRes.json();
+    const nodes = await nodesRes.json();
+
     container.innerHTML = `
-      <div style="margin-bottom: 20px; font-size: 14px; color: var(--text-secondary);">Firmware Repository & Staged OTA Deployments</div>
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th>Filename</th>
-            <th>Version</th>
-            <th>Target Hardware</th>
-            <th>Size (Bytes)</th>
-            <th>MD5 Checksum</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${files.map(f => `
-            <tr>
-              <td>${f.filename}</td>
-              <td>v${f.version}</td>
-              <td><strong>${f.hardware_type}</strong></td>
-              <td>${(f.file_size_bytes / 1024).toFixed(1)} KB</td>
-              <td><code>${f.checksum_md5}</code></td>
-            </tr>
-          `).join("")}
-        </tbody>
-      </table>
+      <div style="display: flex; flex-direction: column; gap: 24px;">
+        <!-- Fleet Safe Backup & Maintenance Hub -->
+        <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px; padding: 20px;">
+          <div style="font-size: 16px; font-weight: 700; margin-bottom: 8px;">🛡️ Fleet Node Safe Backups</div>
+          <div style="font-size: 13px; color: var(--text-secondary); margin-bottom: 16px;">
+            Export configuration settings (.json) or stream exact running firmware binaries (.bin) directly from any node to your device.
+          </div>
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Node ID</th>
+                <th>Name / Hardware</th>
+                <th>IP Address</th>
+                <th>Firmware</th>
+                <th>Status</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${nodes.length === 0 ? '<tr><td colspan="6" style="text-align: center; color: var(--text-secondary);">No nodes registered</td></tr>' : nodes.map(n => {
+                const isOnline = !!n.is_online;
+                return `
+                <tr>
+                  <td><code>${n.node_id}</code></td>
+                  <td><strong>${n.node_name || n.node_id}</strong> <span style="font-size: 11px; color: var(--text-secondary);">(${n.hardware_type || 'ESP8266'})</span></td>
+                  <td><a href="http://${n.ip_address}" target="_blank" style="color: var(--accent-blue);">${n.ip_address}</a></td>
+                  <td>v${n.firmware_version || '1.6.0'}</td>
+                  <td><span class="status-badge ${isOnline ? 'badge-online' : 'badge-offline'}">${isOnline ? 'Online' : 'Offline'}</span></td>
+                  <td style="display: flex; gap: 6px; flex-wrap: wrap;">
+                    <button class="btn btn-secondary btn-sm" onclick="downloadNodeBackup('${n.node_id}')" ${!isOnline ? 'disabled' : ''} title="Download configuration JSON">💾 Config</button>
+                    <button class="btn btn-secondary btn-sm" onclick="downloadNodeFirmware('${n.node_id}')" ${!isOnline ? 'disabled' : ''} title="Download running firmware .bin">📦 FW Binary</button>
+                    <a href="http://${n.ip_address}" target="_blank" class="btn btn-secondary btn-sm">🌐 Node UI</a>
+                  </td>
+                </tr>
+                `;
+              }).join("")}
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Staged OTA Deployment Assistant -->
+        <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px; padding: 20px;">
+          <div style="font-size: 16px; font-weight: 700; margin-bottom: 8px;">🚀 Staged Dual-Target OTA Deployer</div>
+          <div style="font-size: 13px; color: var(--text-secondary); margin-bottom: 16px;">
+            Safely deploy firmware updates or LittleFS web filesystems to online fleet nodes with automatic binary validation.
+          </div>
+
+          <div style="margin-bottom: 16px;">
+            <label style="font-size: 13px; font-weight: 600; display: block; margin-bottom: 6px;">Select Target Node:</label>
+            <select id="ota-target-node" style="background: rgba(0,0,0,0.3); border: 1px solid var(--border-color); color: var(--text-primary); padding: 8px 12px; border-radius: 6px; width: 100%; max-width: 400px;">
+              ${nodes.filter(n => n.is_online).map(n => `<option value="${n.ip_address}">[${n.ip_address}] ${n.node_name || n.node_id} (v${n.firmware_version || '1.6.0'})</option>`).join("")}
+            </select>
+          </div>
+
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px;">
+            <!-- Target A: Firmware -->
+            <div style="border: 1px solid var(--border-color); border-radius: 8px; padding: 16px; background: rgba(0,0,0,0.15);">
+              <div style="font-weight: 600; font-size: 14px; margin-bottom: 6px;">🚀 Application Firmware (firmware.bin)</div>
+              <p style="font-size: 12px; color: var(--text-secondary); margin-bottom: 12px;">Validates ESP8266 binary magic byte (<code>0xE9</code>) before uploading.</p>
+              <input type="file" id="fleet-ota-fw-file" accept=".bin" style="font-size: 12px; margin-bottom: 8px; width: 100%;" onchange="validateFleetFwFile(this)">
+              <div id="fleet-ota-fw-info" style="font-size: 12px; margin-bottom: 10px;"></div>
+              <div id="fleet-ota-fw-progress" style="display: none; margin-bottom: 10px; background: rgba(0,0,0,0.3); border-radius: 4px; overflow: hidden; height: 18px;">
+                <div id="fleet-ota-fw-bar" style="width: 0%; height: 100%; background: var(--accent-blue); text-align: center; font-size: 11px; line-height: 18px; color: white;">0%</div>
+              </div>
+              <button id="fleet-ota-fw-btn" class="btn btn-primary btn-sm" onclick="deployFleetOta('firmware')">⚡ Flash Application Firmware</button>
+            </div>
+
+            <!-- Target B: Filesystem -->
+            <div style="border: 1px solid var(--border-color); border-radius: 8px; padding: 16px; background: rgba(0,0,0,0.15);">
+              <div style="font-weight: 600; font-size: 14px; margin-bottom: 6px;">📁 Web Filesystem (littlefs.bin)</div>
+              <p style="font-size: 12px; color: var(--text-secondary); margin-bottom: 12px;">Updates HTML/CSS/JS portal assets. Rejects firmware binaries.</p>
+              <input type="file" id="fleet-ota-fs-file" accept=".bin" style="font-size: 12px; margin-bottom: 8px; width: 100%;" onchange="validateFleetFsFile(this)">
+              <div id="fleet-ota-fs-info" style="font-size: 12px; margin-bottom: 10px;"></div>
+              <div id="fleet-ota-fs-progress" style="display: none; margin-bottom: 10px; background: rgba(0,0,0,0.3); border-radius: 4px; overflow: hidden; height: 18px;">
+                <div id="fleet-ota-fs-bar" style="width: 0%; height: 100%; background: var(--accent-green); text-align: center; font-size: 11px; line-height: 18px; color: white;">0%</div>
+              </div>
+              <button id="fleet-ota-fs-btn" class="btn btn-secondary btn-sm" onclick="deployFleetOta('fs')">⚡ Flash LittleFS Filesystem</button>
+            </div>
+          </div>
+          <div id="fleet-ota-status" style="margin-top: 15px; font-size: 13px;"></div>
+        </div>
+      </div>
     `;
   } catch (e) {
-    container.innerHTML = `<div style="color: var(--accent-red);">Error loading firmware: ${e.message}</div>`;
+    container.innerHTML = `<div style="color: var(--accent-red);">Error loading firmware manager: ${e.message}</div>`;
   }
+}
+
+// Fleet Helper Functions
+async function downloadNodeBackup(nodeId) {
+  try {
+    const res = await fetch(`${API_BASE}/nodes/${nodeId}/backup/download`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const disposition = res.headers.get("Content-Disposition");
+    let filename = `backup_${nodeId}.json`;
+    if (disposition && disposition.includes("filename=")) {
+      const match = disposition.match(/filename="?([^"]+)"?/);
+      if (match && match[1]) filename = match[1];
+    }
+    const blob = await res.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    window.URL.revokeObjectURL(url);
+    a.remove();
+  } catch (e) {
+    alert(`Failed to download backup for ${nodeId}: ${e.message}`);
+  }
+}
+
+async function downloadNodeFirmware(nodeId) {
+  try {
+    const res = await fetch(`${API_BASE}/nodes/${nodeId}/firmware/download`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const disposition = res.headers.get("Content-Disposition");
+    let filename = `firmware_${nodeId}.bin`;
+    if (disposition && disposition.includes("filename=")) {
+      const match = disposition.match(/filename="?([^"]+)"?/);
+      if (match && match[1]) filename = match[1];
+    }
+    const blob = await res.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    window.URL.revokeObjectURL(url);
+    a.remove();
+  } catch (e) {
+    alert(`Failed to download firmware binary for ${nodeId}: ${e.message}`);
+  }
+}
+
+function validateFleetFwFile(input) {
+  const file = input.files[0];
+  const info = document.getElementById("fleet-ota-fw-info");
+  const btn = document.getElementById("fleet-ota-fw-btn");
+  if (!file) { if (info) info.innerHTML = ""; return; }
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const bytes = new Uint8Array(e.target.result);
+    if (bytes[0] === 0xE9) {
+      if (info) info.innerHTML = `<span style="color:var(--accent-green);">✅ Valid ESP8266 Firmware (0xE9, ${(file.size/1024).toFixed(1)} KB)</span>`;
+      if (btn) btn.disabled = false;
+    } else {
+      if (info) info.innerHTML = `<span style="color:var(--accent-red); font-weight:bold;">⚠️ REJECTED: Header magic byte 0x${bytes[0].toString(16).toUpperCase()} is not 0xE9.</span>`;
+      if (btn) btn.disabled = true;
+    }
+  };
+  reader.readAsArrayBuffer(file.slice(0, 16));
+}
+
+function validateFleetFsFile(input) {
+  const file = input.files[0];
+  const info = document.getElementById("fleet-ota-fs-info");
+  const btn = document.getElementById("fleet-ota-fs-btn");
+  if (!file) { if (info) info.innerHTML = ""; return; }
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const bytes = new Uint8Array(e.target.result);
+    if (bytes[0] === 0xE9) {
+      if (info) info.innerHTML = `<span style="color:var(--accent-red); font-weight:bold;">⚠️ REJECTED: Firmware binary detected (0xE9). Do not upload to filesystem!</span>`;
+      if (btn) btn.disabled = true;
+    } else {
+      if (info) info.innerHTML = `<span style="color:var(--accent-green);">✅ Valid Filesystem Binary (${(file.size/1024).toFixed(1)} KB)</span>`;
+      if (btn) btn.disabled = false;
+    }
+  };
+  reader.readAsArrayBuffer(file.slice(0, 16));
+}
+
+function deployFleetOta(targetType = 'firmware') {
+  const isFs = targetType === 'fs';
+  const targetNodeIp = document.getElementById("ota-target-node") ? document.getElementById("ota-target-node").value : null;
+  const fileInput = document.getElementById(isFs ? "fleet-ota-fs-file" : "fleet-ota-fw-file");
+  const file = fileInput ? fileInput.files[0] : null;
+  const statusEl = document.getElementById("fleet-ota-status");
+  const progContainer = document.getElementById(isFs ? "fleet-ota-fs-progress" : "fleet-ota-fw-progress");
+  const progBar = document.getElementById(isFs ? "fleet-ota-fs-bar" : "fleet-ota-fw-bar");
+  const btn = document.getElementById(isFs ? "fleet-ota-fs-btn" : "fleet-ota-fw-btn");
+
+  if (!targetNodeIp) {
+    alert("Please select an online target node first");
+    return;
+  }
+  if (!file) {
+    alert(`Please select a ${isFs ? "LittleFS image (.bin)" : "firmware binary (.bin)"} file`);
+    return;
+  }
+
+  if (progContainer) progContainer.style.display = "block";
+  if (btn) btn.disabled = true;
+  if (statusEl) statusEl.innerHTML = `Uploading to node <strong>${targetNodeIp}</strong>...`;
+
+  const formData = new FormData();
+  formData.append(isFs ? "filesystem" : "firmware", file);
+
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", `http://${targetNodeIp}/api/ota/upload?type=${isFs ? "fs" : "firmware"}`, true);
+
+  xhr.upload.onprogress = (e) => {
+    if (e.lengthComputable && progBar) {
+      const pct = Math.round((e.loaded / e.total) * 100);
+      progBar.style.width = pct + "%";
+      progBar.innerText = pct + "%";
+    }
+  };
+
+  xhr.onload = () => {
+    if (btn) btn.disabled = false;
+    if (xhr.status === 200) {
+      if (progBar) { progBar.style.width = "100%"; progBar.innerText = "100%"; }
+      if (statusEl) statusEl.innerHTML = `<span style="color:var(--accent-green); font-weight:bold;">✅ Success! Flashed to ${targetNodeIp}. Device is rebooting now.</span>`;
+    } else {
+      if (statusEl) statusEl.innerHTML = `<span style="color:var(--accent-red);">❌ Upload failed with HTTP ${xhr.status}: ${xhr.responseText}</span>`;
+    }
+  };
+
+  xhr.onerror = () => {
+    if (btn) btn.disabled = false;
+    if (statusEl) statusEl.innerHTML = `<span style="color:var(--accent-red);">❌ Network error uploading to ${targetNodeIp}</span>`;
+  };
+
+  xhr.send(formData);
 }
 
 // --- 7. TELEMETRY ---

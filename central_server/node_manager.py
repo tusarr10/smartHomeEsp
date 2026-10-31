@@ -110,10 +110,26 @@ class NodeManager:
 
         if direct_success:
             # Optimistically update database state
+            new_state = False
             if action == "setState":
-                self.db.update_channel_state(node_id, int(channel_id), bool(command.get("state")))
+                new_state = bool(command.get("state", False))
+                self.db.update_channel_state(node_id, int(channel_id), new_state)
+            elif action == "toggle":
+                node = self.db.get_node(node_id) or {}
+                curr = False
+                for ch in node.get("channels", []):
+                    if (ch.get("id") or ch.get("channel_id")) == int(channel_id):
+                        curr = bool(ch.get("state", False))
+                        break
+                new_state = not curr
+                self.db.update_channel_state(node_id, int(channel_id), new_state)
+
             await self.broadcast_sse("command_executed", {
+                "node_id": node_id,
                 "nodeId": node_id,
+                "channel_id": int(channel_id),
+                "channelId": int(channel_id),
+                "new_state": new_state,
                 "command": command,
                 "delivery": "direct_lan_http"
             })

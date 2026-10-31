@@ -3,11 +3,18 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <WiFiClient.h>
 #include "config.h"
 
 enum ReceiverProtocol {
     RECEIVER_PROTO_HTTP = 0,   // HTTP/REST POST JSON
     RECEIVER_PROTO_TCP  = 1    // Raw TCP Socket JSON Stream (e.g. port 2000)
+};
+
+enum ReceiverState {
+    RC_STATE_IDLE = 0,
+    RC_STATE_SENDING,
+    RC_STATE_AWAITING_REPLY
 };
 
 struct ReceiverConfig {
@@ -30,7 +37,7 @@ public:
     void begin();
     void loop();
 
-    // Trigger an immediate transmission with an event type ("heartbeat", "gpio_change", "boot", "test", "manual_push")
+    // Trigger an immediate transmission with an event type ("heartbeat", "gpio_change", "boot", "test_ping", "manual_push")
     bool pushTelemetry(const String& eventType, String& outResult, int& outCode);
 
     // Configuration
@@ -51,15 +58,25 @@ private:
     ReceiverClient(const ReceiverClient&) = delete;
     ReceiverClient& operator=(const ReceiverClient&) = delete;
 
-    String buildTelemetryPayload(const String& eventType);
-    bool sendHttp(const String& payload, String& outResponse, int& outCode);
-    bool sendTcp(const String& payload, String& outResponse, int& outCode);
-    void processServerCommands(const String& response);
+    void startAsyncPush(const char* eventType);
+    void finishAsyncPush(bool ok);
+    void fillTelemetryDoc(DynamicJsonDocument& doc, const char* eventType);
+    bool sendTcpSync(const char* eventType, String& outResponse, int& outCode);
+    bool sendHttp(const char* eventType, String& outResponse, int& outCode);
+    void processServerCommands(const char* response);
 
     ReceiverConfig _config;
     unsigned long _lastReportTime;
     unsigned long _lastStateChangePushTime;
     bool _pendingStateChange;
+
+    // Asynchronous TCP State Machine
+    ReceiverState _state;
+    unsigned long _stateStartTime;
+    String _activeEventType;
+    WiFiClient _tcpClient;
+    char _rxBuf[256];
+    size_t _rxLen;
 
     // Telemetry Statistics
     unsigned long _packetsSent;

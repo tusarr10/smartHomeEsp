@@ -7,17 +7,25 @@
 #include <vector>
 #include "config.h"
 
+#define LOG_RING_CAPACITY     30
+#define LOG_MSG_MAX_LEN       112
+
 struct LogEntry {
-    unsigned long timestampMs;
-    String message;
+    uint32_t timestampMs;
+    char message[LOG_MSG_MAX_LEN];
 };
 
 class Logger {
 public:
     static void log(const String& msg);
+    static void log(const __FlashStringHelper* msg);
     static void getLogsJson(JsonArray& arr);
+    static size_t getCount() { return _count; }
+    static void clear();
 private:
-    static std::vector<LogEntry> _logs;
+    static LogEntry _logs[LOG_RING_CAPACITY];
+    static size_t _head;
+    static size_t _count;
 };
 
 class WebServerManager {

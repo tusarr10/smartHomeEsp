@@ -5,18 +5,22 @@
 #include "automation.h"
 #include "web_server.h" // For Logger
 #include <ESP8266HTTPClient.h>
-#include <WiFiClient.h>
 
 ReceiverClient::ReceiverClient()
     : _lastReportTime(0),
       _lastStateChangePushTime(0),
       _pendingStateChange(false),
+      _state(RC_STATE_IDLE),
+      _stateStartTime(0),
+      _activeEventType(""),
+      _rxLen(0),
       _packetsSent(0),
       _packetsFailed(0),
       _lastSyncTimestamp("Never"),
       _lastSyncStatus("Not configured"),
       _lastServerResponse(""),
       _lastStatusCode(0) {
+    _rxBuf[0] = '\0';
 }
 
 ReceiverClient& ReceiverClient::getInstance() {
@@ -32,34 +36,152 @@ void ReceiverClient::begin() {
 
     loadFromStorage();
     _lastReportTime = millis();
-    Serial.println(F("[RECEIVER] Multi-node receiver client initialized"));
+    _state = RC_STATE_IDLE;
+    Serial.println(F("[RECEIVER] Multi-node receiver client initialized (Async TCP enabled)"));
 }
 
 void ReceiverClient::loop() {
-    if (!WifiManager::getInstance().isSTAConnected()) return;
+    if (!WifiManager::getInstance().isSTAConnected()) {
+        if (_state != RC_STATE_IDLE) {
+            _tcpClient.stop(10);
+            _state = RC_STATE_IDLE;
+        }
+        return;
+    }
     if (!_config.enabled) return;
 
     unsigned long now = millis();
 
-    // 1. Check for pending state change events (debounced by 600ms)
-    if (_pendingStateChange) {
-        if (now - _lastStateChangePushTime >= 600) {
-            _pendingStateChange = false;
-            _lastStateChangePushTime = now;
-            String res;
-            int code = 0;
-            pushTelemetry("gpio_change", res, code);
+    switch (_state) {
+        case RC_STATE_IDLE: {
+            // 1. Debounced event push on GPIO state change
+            if (_pendingStateChange) {
+                if (now - _lastStateChangePushTime >= 400) {
+                    _pendingStateChange = false;
+                    _lastStateChangePushTime = now;
+                    startAsyncPush("gpio_change");
+                }
+                break;
+            }
+
+            // 2. Periodic heartbeat / telemetry reporting (if reportIntervalSec > 0)
+            if (_config.reportIntervalSec > 0) {
+                unsigned long intervalMs = _config.reportIntervalSec * 1000UL;
+                if (now - _lastReportTime >= intervalMs) {
+                    _lastReportTime = now;
+                    startAsyncPush("heartbeat");
+                }
+            }
+            break;
+        }
+
+        case RC_STATE_SENDING: {
+            if (!_tcpClient.connected()) {
+                _packetsFailed++;
+                _lastSyncStatus = F("TCP Dropped before send");
+                _lastStatusCode = -2;
+                _tcpClient.stop(10);
+                _state = RC_STATE_IDLE;
+                break;
+            }
+
+            // Stream telemetry JSON directly into WiFiClient - zero intermediate String on heap!
+            DynamicJsonDocument doc(1536);
+            fillTelemetryDoc(doc, _activeEventType.c_str());
+            serializeJson(doc, _tcpClient);
+            _tcpClient.print('\n');
+            _tcpClient.flush(50);
+
+            _rxLen = 0;
+            _rxBuf[0] = '\0';
+            _state = RC_STATE_AWAITING_REPLY;
+            _stateStartTime = now;
+            break;
+        }
+
+        case RC_STATE_AWAITING_REPLY: {
+            // Non-blocking read of available bytes (0ms loop delay)
+            while (_tcpClient.available() && _rxLen < (sizeof(_rxBuf) - 1)) {
+                char c = (char)_tcpClient.read();
+                if (c == '\n' || c == '\r') {
+                    if (_rxLen > 0) {
+                        _rxBuf[_rxLen] = '\0';
+                        finishAsyncPush(true);
+                        return;
+                    }
+                } else {
+                    _rxBuf[_rxLen++] = c;
+                }
+            }
+
+            // Server disconnected after transmission (normal server-side close)
+            if (!_tcpClient.connected() && !_tcpClient.available()) {
+                _rxBuf[_rxLen] = '\0';
+                finishAsyncPush(true);
+                return;
+            }
+
+            // Timeout after 1500ms
+            if (now - _stateStartTime > 1500) {
+                _rxBuf[_rxLen] = '\0';
+                finishAsyncPush(_rxLen > 0);
+                return;
+            }
+            break;
         }
     }
+}
 
-    // 2. Periodic heartbeat telemetry reporting
-    unsigned long intervalMs = (_config.reportIntervalSec < 2 ? 10 : _config.reportIntervalSec) * 1000UL;
-    if (now - _lastReportTime >= intervalMs) {
-        _lastReportTime = now;
+void ReceiverClient::startAsyncPush(const char* eventType) {
+    if (_state != RC_STATE_IDLE) return;
+    if (!WifiManager::getInstance().isSTAConnected()) return;
+    if (_config.serverHost.length() == 0) return;
+
+    if (_config.protocol == RECEIVER_PROTO_HTTP) {
         String res;
         int code = 0;
-        pushTelemetry("heartbeat", res, code);
+        sendHttp(eventType, res, code);
+        return;
     }
+
+    _activeEventType = eventType;
+    _tcpClient.setTimeout(800);
+    _stateStartTime = millis();
+
+    if (!_tcpClient.connect(_config.serverHost.c_str(), _config.serverPort)) {
+        _packetsFailed++;
+        _lastSyncStatus = F("TCP Connection failed");
+        _lastStatusCode = -2;
+        _tcpClient.stop(10);
+        _state = RC_STATE_IDLE;
+        return;
+    }
+
+    _state = RC_STATE_SENDING;
+}
+
+void ReceiverClient::finishAsyncPush(bool ok) {
+    _tcpClient.stop(10);
+    _lastSyncTimestamp = AutomationEngine::getInstance().getFormattedTime();
+
+    if (ok) {
+        _packetsSent++;
+        _lastStatusCode = 200;
+        _lastSyncStatus = F("OK (Code 200)");
+        if (_rxLen > 0) {
+            _lastServerResponse = _rxBuf;
+            processServerCommands(_rxBuf);
+        } else {
+            _lastServerResponse = F("OK (No response payload)");
+        }
+    } else {
+        _packetsFailed++;
+        _lastStatusCode = -2;
+        _lastSyncStatus = F("TCP ACK Timeout");
+        _lastServerResponse = F("Timeout waiting for server ACK");
+    }
+
+    _state = RC_STATE_IDLE;
 }
 
 void ReceiverClient::onGpioStateChanged(uint8_t gpioId, bool newState) {
@@ -70,8 +192,7 @@ void ReceiverClient::onGpioStateChanged(uint8_t gpioId, bool newState) {
     }
 }
 
-String ReceiverClient::buildTelemetryPayload(const String& eventType) {
-    DynamicJsonDocument doc(2048);
+void ReceiverClient::fillTelemetryDoc(DynamicJsonDocument& doc, const char* eventType) {
     doc["nodeId"] = _config.nodeId;
     doc["nodeName"] = _config.nodeName;
     doc["eventType"] = eventType;
@@ -93,17 +214,13 @@ String ReceiverClient::buildTelemetryPayload(const String& eventType) {
     // Channels payload
     JsonArray gpios = doc.createNestedArray("channels");
     GpioManager::getInstance().toJson(gpios);
-
-    String output;
-    serializeJson(doc, output);
-    return output;
 }
 
-bool ReceiverClient::sendHttp(const String& payload, String& outResponse, int& outCode) {
+bool ReceiverClient::sendHttp(const char* eventType, String& outResponse, int& outCode) {
     WiFiClient client;
     HTTPClient http;
 
-    client.setTimeout(3500);
+    client.setTimeout(2500);
     String path = _config.httpPath;
     if (!path.startsWith("/")) path = "/" + path;
     String url = "http://" + _config.serverHost + ":" + String(_config.serverPort) + path;
@@ -114,12 +231,17 @@ bool ReceiverClient::sendHttp(const String& payload, String& outResponse, int& o
         return false;
     }
 
-    http.setTimeout(3500);
+    http.setTimeout(2500);
     http.addHeader(F("Content-Type"), F("application/json"));
     http.addHeader(F("X-Node-ID"), _config.nodeId);
     if (_config.authToken.length() > 0) {
         http.addHeader(F("Authorization"), "Bearer " + _config.authToken);
     }
+
+    DynamicJsonDocument doc(1536);
+    fillTelemetryDoc(doc, eventType);
+    String payload;
+    serializeJson(doc, payload);
 
     int httpCode = http.POST(payload);
     outCode = httpCode;
@@ -135,9 +257,9 @@ bool ReceiverClient::sendHttp(const String& payload, String& outResponse, int& o
     }
 }
 
-bool ReceiverClient::sendTcp(const String& payload, String& outResponse, int& outCode) {
+bool ReceiverClient::sendTcpSync(const char* eventType, String& outResponse, int& outCode) {
     WiFiClient client;
-    client.setTimeout(3500);
+    client.setTimeout(1200);
 
     if (!client.connect(_config.serverHost.c_str(), _config.serverPort)) {
         outCode = -2;
@@ -145,29 +267,36 @@ bool ReceiverClient::sendTcp(const String& payload, String& outResponse, int& ou
         return false;
     }
 
-    // Send JSON telemetry packet with newline delimiter
-    client.println(payload);
-    client.flush();
+    // Direct streaming to socket - no intermediate payload String!
+    DynamicJsonDocument doc(1536);
+    fillTelemetryDoc(doc, eventType);
+    serializeJson(doc, client);
+    client.print('\n');
+    client.flush(50);
 
-    // Read response line if available within 2000ms
+    // Read response line with 1000ms timeout
     unsigned long startWait = millis();
-    String response = "";
-    while (client.connected() && (millis() - startWait < 2000)) {
-        while (client.available()) {
-            char c = client.read();
+    char respBuf[256];
+    size_t respLen = 0;
+    respBuf[0] = '\0';
+
+    while (client.connected() && (millis() - startWait < 1000)) {
+        while (client.available() && respLen < sizeof(respBuf) - 1) {
+            char c = (char)client.read();
             if (c == '\n' || c == '\r') {
-                if (response.length() > 0) break;
+                if (respLen > 0) break;
             } else {
-                response += c;
+                respBuf[respLen++] = c;
             }
         }
-        if (response.length() > 0) break;
-        delay(10);
+        if (respLen > 0) break;
+        delay(5);
     }
+    respBuf[respLen] = '\0';
 
-    client.stop();
+    client.stop(10);
     outCode = 200;
-    outResponse = (response.length() > 0) ? response : F("OK (No response payload)");
+    outResponse = (respLen > 0) ? String(respBuf) : String(F("OK (No response payload)"));
     return true;
 }
 
@@ -186,42 +315,42 @@ bool ReceiverClient::pushTelemetry(const String& eventType, String& outResult, i
         return false;
     }
 
-    String payload = buildTelemetryPayload(eventType);
-    String response = "";
-    int code = 0;
-    bool ok = false;
-
-    if (_config.protocol == RECEIVER_PROTO_HTTP) {
-        ok = sendHttp(payload, response, code);
-    } else {
-        ok = sendTcp(payload, response, code);
+    // Stop any async connection in flight before doing synchronous push
+    if (_state != RC_STATE_IDLE) {
+        _tcpClient.stop(10);
+        _state = RC_STATE_IDLE;
     }
 
-    outCode = code;
-    outResult = response;
+    bool ok = false;
+    if (_config.protocol == RECEIVER_PROTO_HTTP) {
+        ok = sendHttp(eventType.c_str(), outResult, outCode);
+    } else {
+        ok = sendTcpSync(eventType.c_str(), outResult, outCode);
+    }
 
     _lastSyncTimestamp = AutomationEngine::getInstance().getFormattedTime();
-    _lastStatusCode = code;
-    _lastServerResponse = (response.length() > 256) ? response.substring(0, 256) + "..." : response;
+    _lastStatusCode = outCode;
+    _lastServerResponse = (outResult.length() > 256) ? outResult.substring(0, 256) + "..." : outResult;
 
     if (ok) {
         _packetsSent++;
-        _lastSyncStatus = "OK (Code " + String(code) + ")";
-        Logger::log(String(F("[RECEIVER] Pushed telemetry (Event: ")) + eventType + F(", Code: ") + String(code) + F(")"));
-        processServerCommands(response);
+        _lastSyncStatus = "OK (Code " + String(outCode) + ")";
+        Logger::log(String(F("[RECEIVER] Pushed telemetry (Event: ")) + eventType + F(", Code: ") + String(outCode) + F(")"));
+        processServerCommands(outResult.c_str());
     } else {
         _packetsFailed++;
-        _lastSyncStatus = "Failed: " + response + " (" + String(code) + ")";
-        Logger::log(String(F("[RECEIVER] Push failed: ")) + response + F(" (Code: ") + String(code) + F(")"));
+        _lastSyncStatus = "Failed: " + outResult + " (" + String(outCode) + ")";
+        Logger::log(String(F("[RECEIVER] Push failed: ")) + outResult + F(" (Code: ") + String(outCode) + F(")"));
     }
 
     return ok;
 }
 
-void ReceiverClient::processServerCommands(const String& response) {
-    if (response.length() == 0 || !response.startsWith("{")) return;
+void ReceiverClient::processServerCommands(const char* response) {
+    if (!response || response[0] != '{') return;
 
-    DynamicJsonDocument doc(1024);
+    // Fixed stack document: 384 bytes stack (safe on ESP8266 stack, zero heap allocation!)
+    StaticJsonDocument<384> doc;
     DeserializationError err = deserializeJson(doc, response);
     if (err) return;
 

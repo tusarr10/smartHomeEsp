@@ -13,6 +13,7 @@ import sys
 import time
 import mimetypes
 import urllib.parse
+import urllib.request
 from typing import Dict, Any, Optional
 
 from database import FleetDatabase
@@ -404,6 +405,46 @@ async def handle_http_client(reader: asyncio.StreamReader, writer: asyncio.Strea
             await send_json(writer, nodes)
             return
 
+        # REST API: Proxy Node Configuration Backup Download
+        if method == "GET" and norm_path.startswith("/api/nodes/") and norm_path.endswith("/backup/download"):
+            nid = norm_path.split("/")[3]
+            node = db.get_node(nid)
+            ip = node.get("ip_address") if node else None
+            if not ip or ip == "0.0.0.0":
+                await send_json(writer, {"error": "Node not found or offline"}, status_code=404)
+                return
+            try:
+                def _fetch_backup():
+                    req = urllib.request.Request(f"http://{ip}/api/backup/download", method="GET")
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        return resp.read(), resp.headers.get("Content-Disposition", f'attachment; filename="backup_{nid}.json"')
+                loop = asyncio.get_running_loop()
+                data, disposition = await loop.run_in_executor(None, _fetch_backup)
+                await send_response(writer, 200, "application/json; charset=utf-8", data, extra_headers={"Content-Disposition": disposition})
+            except Exception as e:
+                await send_json(writer, {"error": f"Failed to fetch backup from node: {str(e)}"}, status_code=502)
+            return
+
+        # REST API: Proxy Node Running Firmware Binary Download
+        if method == "GET" and norm_path.startswith("/api/nodes/") and norm_path.endswith("/firmware/download"):
+            nid = norm_path.split("/")[3]
+            node = db.get_node(nid)
+            ip = node.get("ip_address") if node else None
+            if not ip or ip == "0.0.0.0":
+                await send_json(writer, {"error": "Node not found or offline"}, status_code=404)
+                return
+            try:
+                def _fetch_fw():
+                    req = urllib.request.Request(f"http://{ip}/api/firmware/download", method="GET")
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        return resp.read(), resp.headers.get("Content-Disposition", f'attachment; filename="firmware_{nid}.bin"')
+                loop = asyncio.get_running_loop()
+                data, disposition = await loop.run_in_executor(None, _fetch_fw)
+                await send_response(writer, 200, "application/octet-stream", data, extra_headers={"Content-Disposition": disposition})
+            except Exception as e:
+                await send_json(writer, {"error": f"Failed to fetch firmware from node: {str(e)}"}, status_code=502)
+            return
+
         # REST API: Specific Node Detail
         if method == "GET" and norm_path.startswith("/api/nodes/"):
             nid = norm_path.split("/")[3]
@@ -442,6 +483,7 @@ async def handle_http_client(reader: asyncio.StreamReader, writer: asyncio.Strea
             else:
                 await send_json(writer, {"success": False, "error": "Node not found"}, status_code=404)
             return
+
 
         # REST API: Broadcast Command to All Nodes
         if method == "POST" and norm_path == "/api/broadcast/command":

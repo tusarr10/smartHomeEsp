@@ -115,15 +115,20 @@ const app = {
       this.changePassword();
     });
 
-    // OTA Form
-    document.getElementById('ota-form').addEventListener('submit', (e) => {
-      e.preventDefault();
-      this.uploadOta();
-    });
+    // OTA Form (Legacy fallback if present)
+    const otaForm = document.getElementById('ota-form');
+    if (otaForm) {
+      otaForm.addEventListener('submit', (e) => {
+        e.preventDefault();
+        this.uploadOta();
+      });
+    }
 
     // Logs
     document.getElementById('refresh-logs-btn').addEventListener('click', () => this.loadLogs());
   },
+
+  _isAutoLoggingIn: false,
 
   async apiRequest(url, options = {}) {
     options.headers = options.headers || {};
@@ -136,7 +141,25 @@ const app = {
       const res = await fetch(url, options);
       if (res.status === 401 || res.status === 403) {
         if (!url.includes('/api/auth/login')) {
-          this.showLoginModal();
+          // Token expired or invalid session: attempt silent auto-login
+          const savedPass = localStorage.getItem('sh_pass') || 'admin';
+          const savedUser = localStorage.getItem('sh_user') || 'admin';
+          const remember = localStorage.getItem('sh_remember') !== 'false';
+
+          if (remember && !this._isAutoLoggingIn) {
+            this._isAutoLoggingIn = true;
+            const authed = await this.autoLogin(savedUser, savedPass);
+            this._isAutoLoggingIn = false;
+            if (authed) {
+              // Retry request with fresh token
+              if (this.token) {
+                options.headers['Authorization'] = 'Bearer ' + this.token;
+                options.headers['X-Session-Token'] = this.token;
+              }
+              return await fetch(url, options);
+            }
+          }
+          this.showLoginModal('Session expired. Please log in to continue.');
         }
       }
       return res;
@@ -144,6 +167,34 @@ const app = {
       console.error('API Error:', err);
       throw err;
     }
+  },
+
+  async autoLogin(user = 'admin', pass = 'admin') {
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: user, password: pass })
+      });
+      const data = await res.json();
+      if (data.success && data.token) {
+        this.token = data.token;
+        localStorage.setItem('sh_token', this.token);
+        localStorage.setItem('sh_user', user);
+        localStorage.setItem('sh_pass', pass);
+        localStorage.setItem('sh_remember', 'true');
+        const logoutBtn = document.getElementById('logout-btn');
+        if (logoutBtn) {
+          logoutBtn.title = 'Logout (' + (user || 'admin') + ')';
+          logoutBtn.innerText = '🚪';
+        }
+        this.hideLoginModal();
+        return true;
+      }
+    } catch (e) {
+      console.warn('Auto-login failed:', e);
+    }
+    return false;
   },
 
   async checkAuth() {
@@ -158,32 +209,69 @@ const app = {
           logoutBtn.innerText = '🚪';
         }
       } else {
+        // Device session expired or not active: attempt auto-login
+        const savedPass = localStorage.getItem('sh_pass') || 'admin';
+        const savedUser = localStorage.getItem('sh_user') || 'admin';
+        const remember = localStorage.getItem('sh_remember') !== 'false';
+
+        if (remember) {
+          const authed = await this.autoLogin(savedUser, savedPass);
+          if (authed) {
+            this.refreshAll();
+            return;
+          }
+        }
+
+        // Auto-login failed or disabled: clear state and prompt user
         this.token = '';
         localStorage.removeItem('sh_token');
         if (logoutBtn) {
           logoutBtn.title = 'Admin Login';
           logoutBtn.innerText = '🔐';
         }
+        this.showLoginModal('Please log in with admin password to control devices.');
       }
     } catch (e) {
-      this.token = '';
-      localStorage.removeItem('sh_token');
+      // Offline / network failure: attempt auto-login or show modal
+      const savedPass = localStorage.getItem('sh_pass') || 'admin';
+      const savedUser = localStorage.getItem('sh_user') || 'admin';
+      const authed = await this.autoLogin(savedUser, savedPass);
+      if (!authed) {
+        this.showLoginModal();
+      }
     }
   },
 
-  showLoginModal() {
-    document.getElementById('login-modal').classList.remove('hidden');
-    document.getElementById('login-password').value = '';
-    document.getElementById('login-error').classList.add('hidden');
+  showLoginModal(msg = '') {
+    const modal = document.getElementById('login-modal');
+    if (modal) modal.classList.remove('hidden');
+    const userInp = document.getElementById('login-username');
+    const passInp = document.getElementById('login-password');
+    if (userInp) userInp.value = localStorage.getItem('sh_user') || 'admin';
+    if (passInp) passInp.value = localStorage.getItem('sh_pass') || 'admin';
+    const errEl = document.getElementById('login-error');
+    if (errEl) {
+      if (msg) {
+        errEl.innerText = msg;
+        errEl.classList.remove('hidden');
+        errEl.style.color = 'var(--text-muted)';
+      } else {
+        errEl.classList.add('hidden');
+      }
+    }
   },
 
   hideLoginModal() {
-    document.getElementById('login-modal').classList.add('hidden');
+    const modal = document.getElementById('login-modal');
+    if (modal) modal.classList.add('hidden');
   },
 
   async login() {
-    const user = document.getElementById('login-username').value.trim();
-    const pass = document.getElementById('login-password').value;
+    const userInp = document.getElementById('login-username');
+    const passInp = document.getElementById('login-password');
+    const user = userInp ? userInp.value.trim() : 'admin';
+    const pass = passInp ? passInp.value : '';
+    const remember = document.getElementById('login-remember') ? document.getElementById('login-remember').checked : true;
     const errEl = document.getElementById('login-error');
 
     try {
@@ -196,6 +284,15 @@ const app = {
       if (data.success && data.token) {
         this.token = data.token;
         localStorage.setItem('sh_token', this.token);
+        if (remember) {
+          localStorage.setItem('sh_user', user);
+          localStorage.setItem('sh_pass', pass);
+          localStorage.setItem('sh_remember', 'true');
+        } else {
+          localStorage.removeItem('sh_user');
+          localStorage.removeItem('sh_pass');
+          localStorage.setItem('sh_remember', 'false');
+        }
         this.hideLoginModal();
         const logoutBtn = document.getElementById('logout-btn');
         if (logoutBtn) {
@@ -204,12 +301,18 @@ const app = {
         }
         this.startDashboard();
       } else {
-        errEl.innerText = data.error || 'Invalid username or password';
-        errEl.classList.remove('hidden');
+        if (errEl) {
+          errEl.innerText = data.error || 'Invalid username or password';
+          errEl.style.color = 'var(--danger)';
+          errEl.classList.remove('hidden');
+        }
       }
     } catch (err) {
-      errEl.innerText = 'Network error during login';
-      errEl.classList.remove('hidden');
+      if (errEl) {
+        errEl.innerText = 'Network error during login';
+        errEl.style.color = 'var(--danger)';
+        errEl.classList.remove('hidden');
+      }
     }
   },
 
@@ -219,12 +322,14 @@ const app = {
     } catch (e) {}
     this.token = '';
     localStorage.removeItem('sh_token');
+    localStorage.removeItem('sh_pass');
+    localStorage.setItem('sh_remember', 'false');
     const logoutBtn = document.getElementById('logout-btn');
     if (logoutBtn) {
       logoutBtn.title = 'Admin Login';
       logoutBtn.innerText = '🔐';
     }
-    alert('Logged out of admin session');
+    this.showLoginModal('Logged out. Enter credentials to log back in.');
   },
 
   startDashboard() {
@@ -414,8 +519,23 @@ const app = {
     const manageContainer = document.getElementById('gpio-cards-container');
 
     if (this.channels.length === 0) {
-      overviewContainer.innerHTML = '<p class="placeholder-text">No GPIO outputs configured yet. Go to GPIO / Relays tab to add outputs.</p>';
-      manageContainer.innerHTML = '<p class="placeholder-text">No GPIO outputs configured yet.</p>';
+      if (overviewContainer) {
+        overviewContainer.innerHTML = `
+          <div style="text-align: center; padding: 20px; color: var(--text-muted); grid-column: 1 / -1;">
+            <p style="margin-bottom: 12px; font-size: 0.95rem;">No GPIO relay channels found.</p>
+            <button class="btn btn-primary btn-sm" onclick="app.openAddGpioModal()">➕ Add Relay Output</button>
+            <button class="btn btn-secondary btn-sm" style="margin-left: 8px;" onclick="app.loadGpios()">🔄 Refresh</button>
+          </div>
+        `;
+      }
+      if (manageContainer) {
+        manageContainer.innerHTML = `
+          <div style="text-align: center; padding: 20px; color: var(--text-muted); grid-column: 1 / -1;">
+            <p style="margin-bottom: 12px;">No GPIO relay channels configured.</p>
+            <button class="btn btn-primary btn-sm" onclick="app.openAddGpioModal()">➕ Add New Channel</button>
+          </div>
+        `;
+      }
       return;
     }
 
@@ -484,13 +604,17 @@ const app = {
 
   async toggleGpio(id) {
     try {
-      await this.apiRequest('/api/gpio/state', {
+      const res = await this.apiRequest('/api/gpio/state', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: id, action: 'toggle' })
       });
-      this.loadGpios(true);
-    } catch (e) {}
+      if (res && res.ok) {
+        this.loadGpios(true);
+      }
+    } catch (e) {
+      console.error('Toggle GPIO error:', e);
+    }
   },
 
   async pulseGpio(id, durationMs) {
@@ -1248,12 +1372,148 @@ const app = {
     }
   },
 
-  // ==== OTA FIRMWARE UPLOAD ====
-  uploadOta() {
-    const fileInput = document.getElementById('ota-file-input');
-    const file = fileInput.files[0];
+  // ==== BACKUP & RESTORE ====
+  downloadSettingsBackup() {
+    const url = this.token ? `/api/backup/download?token=${encodeURIComponent(this.token)}` : '/api/backup/download';
+    window.location.href = url;
+  },
+
+  downloadFirmwareBackup() {
+    const url = this.token ? `/api/firmware/download?token=${encodeURIComponent(this.token)}` : '/api/firmware/download';
+    window.location.href = url;
+  },
+
+  async restoreSettingsBackup() {
+    const fileInput = document.getElementById('backup-restore-file');
+    const file = fileInput ? fileInput.files[0] : null;
+    const statusMsg = document.getElementById('restore-status-msg');
     if (!file) {
-      alert('Please select a .bin firmware file');
+      alert('Please select a .json configuration backup file');
+      return;
+    }
+
+    if (!confirm('⚠️ Restoring settings will overwrite existing device configurations and restart the controller. Continue?')) {
+      return;
+    }
+
+    if (statusMsg) statusMsg.innerHTML = 'Reading and validating backup file...';
+
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      try {
+        const jsonText = e.target.result;
+        const parsed = JSON.parse(jsonText);
+        if (!parsed || typeof parsed !== 'object') {
+          throw new Error('Invalid JSON structure');
+        }
+
+        if (statusMsg) statusMsg.innerHTML = 'Uploading backup to device...';
+
+        const res = await this.apiRequest('/api/backup/restore', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: jsonText
+        });
+
+        const data = await res.json();
+        if (res.ok && data.success) {
+          if (statusMsg) statusMsg.innerHTML = '<span style="color:var(--success);">✅ Configuration restored successfully! Controller is rebooting now...</span>';
+          alert('Configuration restored successfully! Controller is restarting. Page will reload in 15 seconds.');
+          setTimeout(() => {
+            window.location.reload();
+          }, 15000);
+        } else {
+          if (statusMsg) statusMsg.innerHTML = '<span style="color:var(--danger);">❌ ' + (data.error || 'Restore failed') + '</span>';
+          alert('Restore failed: ' + (data.error || 'Unknown error'));
+        }
+      } catch (err) {
+        if (statusMsg) statusMsg.innerHTML = '<span style="color:var(--danger);">❌ Error: ' + err.message + '</span>';
+        alert('Failed to process backup file: ' + err.message);
+      }
+    };
+    reader.readAsText(file);
+  },
+
+  // ==== FILE PRE-VALIDATION ====
+  validateFirmwareFile(input) {
+    const file = input.files[0];
+    const info = document.getElementById('ota-fw-file-info');
+    const submitBtn = document.getElementById('ota-fw-submit-btn');
+    if (!file) {
+      if (info) info.innerHTML = '';
+      if (submitBtn) submitBtn.disabled = false;
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const buffer = e.target.result;
+      if (buffer.byteLength < 4) {
+        if (info) info.innerHTML = '<span style="color:var(--danger);">❌ File is too small to be a valid firmware binary</span>';
+        if (submitBtn) submitBtn.disabled = true;
+        return;
+      }
+      const bytes = new Uint8Array(buffer);
+      const magic = bytes[0];
+      const sizeKb = Math.round(file.size / 1024);
+
+      if (magic === 0xE9) {
+        if (info) info.innerHTML = `<span style="color:var(--success);">✅ Valid ESP8266 Firmware Binary (Magic byte: 0xE9 confirmed, Size: ${sizeKb} KB)</span>`;
+        if (submitBtn) submitBtn.disabled = false;
+      } else {
+        if (info) info.innerHTML = `<span style="color:var(--danger); font-weight: bold;">⚠️ REJECTED: Header magic byte is 0x${magic.toString(16).toUpperCase()} (Expected 0xE9). This is NOT an ESP8266 firmware binary! If this is a filesystem image, please use the Filesystem upload form below.</span>`;
+        if (submitBtn) submitBtn.disabled = true;
+      }
+    };
+    reader.readAsArrayBuffer(file.slice(0, 16));
+  },
+
+  validateFilesystemFile(input) {
+    const file = input.files[0];
+    const info = document.getElementById('ota-fs-file-info');
+    const submitBtn = document.getElementById('ota-fs-submit-btn');
+    if (!file) {
+      if (info) info.innerHTML = '';
+      if (submitBtn) submitBtn.disabled = false;
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const buffer = e.target.result;
+      if (buffer.byteLength < 4) {
+        if (info) info.innerHTML = '<span style="color:var(--danger);">❌ File is too small to be a valid LittleFS image</span>';
+        if (submitBtn) submitBtn.disabled = true;
+        return;
+      }
+      const bytes = new Uint8Array(buffer);
+      const magic = bytes[0];
+      const sizeKb = Math.round(file.size / 1024);
+
+      if (magic === 0xE9) {
+        if (info) info.innerHTML = `<span style="color:var(--danger); font-weight: bold;">⚠️ REJECTED: This file starts with ESP8266 firmware header (0xE9)! Flashing a firmware binary into the LittleFS filesystem partition will corrupt the file storage. Please use the Application Firmware form above.</span>`;
+        if (submitBtn) submitBtn.disabled = true;
+      } else {
+        if (info) info.innerHTML = `<span style="color:var(--success);">✅ Valid Filesystem Binary Image (Magic byte: 0x${magic.toString(16).toUpperCase()}, Size: ${sizeKb} KB)</span>`;
+        if (submitBtn) submitBtn.disabled = false;
+      }
+    };
+    reader.readAsArrayBuffer(file.slice(0, 16));
+  },
+
+  // ==== OTA DUAL-TARGET UPLOAD ====
+  uploadOta(targetType = 'firmware') {
+    const isFs = targetType === 'fs';
+    const inputId = isFs ? 'ota-fs-file' : 'ota-fw-file';
+    const progContainerId = isFs ? 'ota-fs-progress-container' : 'ota-fw-progress-container';
+    const progBarId = isFs ? 'ota-fs-progress-bar' : 'ota-fw-progress-bar';
+    const statusMsgId = isFs ? 'ota-fs-status-msg' : 'ota-fw-status-msg';
+    const submitBtnId = isFs ? 'ota-fs-submit-btn' : 'ota-fw-submit-btn';
+
+    const fileInput = document.getElementById(inputId) || document.getElementById('ota-file-input');
+    const file = fileInput ? fileInput.files[0] : null;
+    if (!file) {
+      alert(`Please select a ${isFs ? 'LittleFS filesystem' : 'firmware'} .bin file`);
       return;
     }
 
@@ -1262,27 +1522,28 @@ const app = {
       return;
     }
 
-    const progressContainer = document.getElementById('ota-progress-container');
-    const progressBar = document.getElementById('ota-progress-bar');
-    const statusMsg = document.getElementById('ota-status-msg');
-    const submitBtn = document.getElementById('ota-submit-btn');
+    const progressContainer = document.getElementById(progContainerId) || document.getElementById('ota-progress-container');
+    const progressBar = document.getElementById(progBarId) || document.getElementById('ota-progress-bar');
+    const statusMsg = document.getElementById(statusMsgId) || document.getElementById('ota-status-msg');
+    const submitBtn = document.getElementById(submitBtnId) || document.getElementById('ota-submit-btn');
 
-    progressContainer.classList.remove('hidden');
-    submitBtn.disabled = true;
-    statusMsg.innerText = 'Uploading firmware binary...';
+    if (progressContainer) progressContainer.classList.remove('hidden');
+    if (submitBtn) submitBtn.disabled = true;
+    if (statusMsg) statusMsg.innerText = `Uploading ${isFs ? 'LittleFS filesystem' : 'application firmware'} binary...`;
 
     const formData = new FormData();
-    formData.append('firmware', file);
+    formData.append(isFs ? 'filesystem' : 'firmware', file);
 
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/ota/upload', true);
+    const endpoint = `/api/ota/upload?type=${isFs ? 'fs' : 'firmware'}`;
+    xhr.open('POST', endpoint, true);
     if (this.token) {
       xhr.setRequestHeader('Authorization', 'Bearer ' + this.token);
       xhr.setRequestHeader('X-Session-Token', this.token);
     }
 
     xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) {
+      if (e.lengthComputable && progressBar) {
         const pct = Math.round((e.loaded / e.total) * 100);
         progressBar.style.width = pct + '%';
         progressBar.innerText = pct + '%';
@@ -1290,27 +1551,31 @@ const app = {
     };
 
     xhr.onload = () => {
-      submitBtn.disabled = false;
+      if (submitBtn) submitBtn.disabled = false;
       if (xhr.status === 200) {
-        progressBar.style.width = '100%';
-        progressBar.innerText = '100%';
-        statusMsg.innerText = '✅ Firmware uploaded successfully! ESP8266 is rebooting now. Reconnecting in 15 seconds...';
+        if (progressBar) {
+          progressBar.style.width = '100%';
+          progressBar.innerText = '100%';
+        }
+        if (statusMsg) {
+          statusMsg.innerText = `✅ ${isFs ? 'Filesystem' : 'Firmware'} flashed successfully! Controller is rebooting now. Reconnecting in 15 seconds...`;
+        }
         setTimeout(() => {
           window.location.reload();
         }, 15000);
       } else {
         try {
           const res = JSON.parse(xhr.responseText);
-          statusMsg.innerText = '❌ Update failed: ' + (res.error || 'Upload error');
+          if (statusMsg) statusMsg.innerText = '❌ Update failed: ' + (res.error || 'Upload error');
         } catch (e) {
-          statusMsg.innerText = '❌ Update failed with HTTP ' + xhr.status;
+          if (statusMsg) statusMsg.innerText = '❌ Update failed with HTTP ' + xhr.status;
         }
       }
     };
 
     xhr.onerror = () => {
-      submitBtn.disabled = false;
-      statusMsg.innerText = '❌ Network error during firmware upload';
+      if (submitBtn) submitBtn.disabled = false;
+      if (statusMsg) statusMsg.innerText = `❌ Network error during ${isFs ? 'filesystem' : 'firmware'} upload`;
     };
 
     xhr.send(formData);

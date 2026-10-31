@@ -24,6 +24,12 @@
           <input type="password" id="login-password" required placeholder="Default: admin" autocomplete="current-password">
           <small class="hint-text">Default password is <code>admin</code></small>
         </div>
+        <div class="form-group checkbox-group" style="margin-bottom: 15px;">
+          <label style="display: flex; align-items: center; gap: 8px; font-size: 0.9rem; cursor: pointer;">
+            <input type="checkbox" id="login-remember" checked>
+            <span>Remember login & auto-reconnect on session expire</span>
+          </label>
+        </div>
         <div id="login-error" class="error-msg hidden"></div>
         <button type="submit" class="btn btn-primary btn-block">Log In</button>
       </form>
@@ -407,6 +413,35 @@
             </form>
           </div>
 
+          <!-- Configuration Backup & Restore -->
+          <div class="card">
+            <div class="card-header">
+              <h3>💾 Configuration Backup & Restore</h3>
+            </div>
+            <p>Safely export your system configurations and running firmware directly to your computer or phone, or restore from a previously downloaded configuration backup file.</p>
+            
+            <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 15px;">
+              <button type="button" class="btn btn-secondary" onclick="app.downloadSettingsBackup()">
+                💾 Download Settings Backup (.json)
+              </button>
+              <button type="button" class="btn btn-secondary" onclick="app.downloadFirmwareBackup()">
+                📦 Download Running Firmware (.bin)
+              </button>
+            </div>
+
+            <hr style="border: 0; border-top: 1px solid var(--border-color); margin: 15px 0;">
+
+            <h4>Restore Settings from File</h4>
+            <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 10px;">Select a previously exported <code>smarthome_config_*.json</code> file to restore device configurations, channel names, and automation rules.</p>
+            <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+              <input type="file" id="backup-restore-file" accept=".json" style="flex: 1; min-width: 200px;">
+              <button type="button" class="btn btn-warning" onclick="app.restoreSettingsBackup()">
+                📥 Restore Configuration
+              </button>
+            </div>
+            <div id="restore-status-msg" class="ota-msg" style="margin-top: 10px;"></div>
+          </div>
+
           <!-- Maintenance Actions -->
           <div class="card danger-border">
             <div class="card-header">
@@ -423,24 +458,64 @@
         <!-- 6. OTA FIRMWARE UPDATE TAB -->
         <section id="tab-ota" class="tab-pane">
           <div class="section-header">
-            <h2>OTA Firmware Update</h2>
+            <h2>OTA Firmware & Filesystem Updates</h2>
           </div>
 
+          <!-- Safety First Backup Card -->
+          <div class="card" style="border-left: 4px solid var(--primary);">
+            <div class="card-header">
+              <h3 style="color: var(--primary);">🛡️ Safety First: Save Backup to Your Device</h3>
+            </div>
+            <p>Before flashing new firmware or web files, save a copy directly to your device so you can roll back instantly if needed.</p>
+            <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px;">
+              <button type="button" class="btn btn-secondary" onclick="app.downloadSettingsBackup()">
+                💾 Download Settings Backup (.json)
+              </button>
+              <button type="button" class="btn btn-secondary" onclick="app.downloadFirmwareBackup()">
+                📦 Download Running Firmware (.bin)
+              </button>
+            </div>
+          </div>
+
+          <!-- Target 1: Application Firmware Binary Update -->
           <div class="card">
             <div class="card-header">
-              <h3>Upload Firmware Binary (.bin)</h3>
+              <h3>🚀 Flash Application Firmware (firmware.bin)</h3>
             </div>
-            <p>Select a compiled firmware binary file (<code>firmware.bin</code>) built for ESP8266 NodeMCU.</p>
+            <p>Upload a compiled application firmware binary (e.g. <code>firmware.bin</code>). Built-in verification checks the ESP8266 binary magic header (<code>0xE9</code>) before flashing to prevent device corruption.</p>
             
-            <form id="ota-form">
+            <form id="ota-fw-form" onsubmit="event.preventDefault(); app.uploadOta('firmware');">
               <div class="form-group">
-                <input type="file" id="ota-file-input" accept=".bin" required>
+                <label for="ota-fw-file">Firmware Binary File:</label>
+                <input type="file" id="ota-fw-file" accept=".bin" required onchange="app.validateFirmwareFile(this)">
+                <div id="ota-fw-file-info" style="font-size: 0.85rem; margin-top: 6px;"></div>
               </div>
-              <div id="ota-progress-container" class="progress-container hidden">
-                <div id="ota-progress-bar" class="progress-bar">0%</div>
+              <div id="ota-fw-progress-container" class="progress-container hidden">
+                <div id="ota-fw-progress-bar" class="progress-bar">0%</div>
               </div>
-              <div id="ota-status-msg" class="ota-msg"></div>
-              <button type="submit" id="ota-submit-btn" class="btn btn-primary">Flash Firmware</button>
+              <div id="ota-fw-status-msg" class="ota-msg"></div>
+              <button type="submit" id="ota-fw-submit-btn" class="btn btn-primary">⚡ Flash Application Firmware</button>
+            </form>
+          </div>
+
+          <!-- Target 2: Web Filesystem Binary Update (LittleFS) -->
+          <div class="card">
+            <div class="card-header">
+              <h3>📁 Flash Web Filesystem (littlefs.bin)</h3>
+            </div>
+            <p>Upload a compiled LittleFS filesystem image (e.g. <code>littlefs.bin</code>) containing web portal HTML, CSS, and JS assets. Built-in verification ensures firmware binaries are rejected from this partition.</p>
+            
+            <form id="ota-fs-form" onsubmit="event.preventDefault(); app.uploadOta('fs');">
+              <div class="form-group">
+                <label for="ota-fs-file">Filesystem Image File:</label>
+                <input type="file" id="ota-fs-file" accept=".bin" required onchange="app.validateFilesystemFile(this)">
+                <div id="ota-fs-file-info" style="font-size: 0.85rem; margin-top: 6px;"></div>
+              </div>
+              <div id="ota-fs-progress-container" class="progress-container hidden">
+                <div id="ota-fs-progress-bar" class="progress-bar">0%</div>
+              </div>
+              <div id="ota-fs-status-msg" class="ota-msg"></div>
+              <button type="submit" id="ota-fs-submit-btn" class="btn btn-secondary">⚡ Flash LittleFS Filesystem</button>
             </form>
           </div>
         </section>
