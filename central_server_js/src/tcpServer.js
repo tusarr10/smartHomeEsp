@@ -21,37 +21,42 @@ class TcpTelemetryServer {
       socket.on('data', async (chunk) => {
         buffer += chunk.toString('utf-8');
 
-        // Look for framed JSON packet
-        if (buffer.includes('\n') || buffer.trim().endsWith('}')) {
-          const raw = buffer.trim();
-          buffer = '';
+        // Split on newline delimiter (ESP8266 client.println)
+        if (buffer.includes('\n')) {
+          const lines = buffer.split('\n');
+          buffer = lines.pop(); // keep any unfinished trailing chunk
 
-          try {
-            const payload = JSON.parse(raw);
-            if (!payload.ip || payload.ip === '0.0.0.0') {
-              payload.ip = clientIp;
+          for (const line of lines) {
+            const raw = line.trim();
+            if (!raw) continue;
+
+            try {
+              const payload = JSON.parse(raw);
+              if (!payload.ip || payload.ip === '0.0.0.0') {
+                payload.ip = clientIp;
+              }
+
+              const pendingCommands = await this.nodeManager.processTelemetry(payload, clientIp, 'TCP');
+
+              const response = {
+                status: 'ok',
+                epoch: Math.floor(Date.now() / 1000)
+              };
+
+              if (pendingCommands && pendingCommands.length > 0) {
+                response.commands = pendingCommands;
+              }
+
+              socket.write(JSON.stringify(response) + '\n', () => {
+                socket.end();
+              });
+            } catch (err) {
+              console.error(`[TCP] Malformed JSON from ${clientIp}:`, err.message);
+              const errResp = { status: 'error', message: 'Malformed JSON payload' };
+              socket.write(JSON.stringify(errResp) + '\n', () => {
+                socket.end();
+              });
             }
-
-            const pendingCommands = await this.nodeManager.processTelemetry(payload, clientIp, 'TCP');
-
-            const response = {
-              status: 'ok',
-              epoch: Math.floor(Date.now() / 1000)
-            };
-
-            if (pendingCommands && pendingCommands.length > 0) {
-              response.commands = pendingCommands;
-            }
-
-            socket.write(JSON.stringify(response) + '\n', () => {
-              socket.end();
-            });
-          } catch (err) {
-            console.error(`[TCP] Malformed JSON from ${clientIp}:`, err.message);
-            const errResp = { status: 'error', message: 'Malformed JSON payload' };
-            socket.write(JSON.stringify(errResp) + '\n', () => {
-              socket.end();
-            });
           }
         }
       });

@@ -11,6 +11,10 @@ class FleetDatabase {
       fs.mkdirSync(dir, { recursive: true });
     }
     this.db = new DatabaseSync(this.dbPath);
+    try {
+      this.db.exec('PRAGMA journal_mode = WAL;');
+      this.db.exec('PRAGMA busy_timeout = 5000;');
+    } catch {}
     this.init();
   }
 
@@ -140,10 +144,14 @@ class FleetDatabase {
         title TEXT,
         message TEXT,
         severity TEXT DEFAULT 'INFO',
+        category TEXT DEFAULT 'SYSTEM',
         read INTEGER DEFAULT 0,
         timestamp TEXT
       )
     `);
+    try {
+      this.db.exec("ALTER TABLE notifications ADD COLUMN category TEXT DEFAULT 'SYSTEM'");
+    } catch (e) {}
 
     // 9. Automations Table (Upgraded schema with conditions and actions)
     this.db.exec(`
@@ -168,10 +176,47 @@ class FleetDatabase {
         filename TEXT NOT NULL,
         version TEXT NOT NULL,
         hardware_type TEXT DEFAULT 'ESP8266',
+        release_channel TEXT DEFAULT 'LTS',
+        notes TEXT DEFAULT '',
         file_size_bytes INTEGER DEFAULT 0,
         checksum_md5 TEXT,
+        checksum_sha256 TEXT,
         file_path TEXT,
         uploaded_at TEXT
+      )
+    `);
+
+    // 11. Node Configuration & State Backups
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS node_backups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        node_id TEXT NOT NULL,
+        node_name TEXT,
+        firmware_version TEXT,
+        backup_type TEXT DEFAULT 'PRE_OTA',
+        backup_path TEXT NOT NULL,
+        file_size_bytes INTEGER DEFAULT 0,
+        snapshot_json TEXT,
+        created_at TEXT
+      )
+    `);
+
+    // 12. OTA Deployment History (LTS Audit Trail)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS ota_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        node_id TEXT NOT NULL,
+        node_name TEXT,
+        firmware_id INTEGER,
+        firmware_filename TEXT,
+        version_from TEXT,
+        version_to TEXT,
+        status TEXT DEFAULT 'PENDING',
+        backup_id INTEGER,
+        duration_ms INTEGER DEFAULT 0,
+        details TEXT,
+        error_message TEXT,
+        created_at TEXT
       )
     `);
 
@@ -212,6 +257,15 @@ class FleetDatabase {
     } catch {}
     try {
       this.db.exec(`ALTER TABLE firmware ADD COLUMN uploaded_at TEXT DEFAULT ''`);
+    } catch {}
+    try {
+      this.db.exec(`ALTER TABLE firmware ADD COLUMN release_channel TEXT DEFAULT 'LTS'`);
+    } catch {}
+    try {
+      this.db.exec(`ALTER TABLE firmware ADD COLUMN notes TEXT DEFAULT ''`);
+    } catch {}
+    try {
+      this.db.exec(`ALTER TABLE firmware ADD COLUMN checksum_sha256 TEXT DEFAULT ''`);
     } catch {}
 
     this.seedDefaults();
@@ -308,13 +362,66 @@ class FleetDatabase {
       insertStmt.run(nodeId, name, hw, fw, ip, mac, gateway, rssi, uptime, heap, nowEpoch, nowStr, channelsJson, nowEpoch);
     }
 
+    const stateChanges = [];
     if (Array.isArray(data.channels)) {
+      const activeChannelIds = [];
       for (const ch of data.channels) {
+        const chId = Number(ch.id ?? ch.channel_id);
+        if (!isNaN(chId) && chId > 0) {
+          activeChannelIds.push(chId);
+          const chRes = this.upsertRelayFromChannel(nodeId, ch);
+          if (chRes && chRes.changed) {
+            stateChanges.push(chRes);
+          }
+        }
+      }
+
+      // Automatically prune / delete any relays for this node that are NOT on the node
+      if (activeChannelIds.length > 0) {
+        const placeholders = activeChannelIds.map(() => '?').join(',');
+        this.db.prepare(`
+          DELETE FROM relays 
+          WHERE node_id = ? AND channel_id NOT IN (${placeholders})
+        `).run(nodeId, ...activeChannelIds);
+      } else {
+        this.db.prepare('DELETE FROM relays WHERE node_id = ?').run(nodeId);
+      }
+    }
+
+    return { success: true, stateChanges };
+  }
+
+  syncNodeRelays(nodeId, channels) {
+    if (!Array.isArray(channels)) return 0;
+    const activeChannelIds = [];
+    for (const ch of channels) {
+      const chId = Number(ch.id ?? ch.channel_id);
+      if (!isNaN(chId) && chId > 0) {
+        activeChannelIds.push(chId);
         this.upsertRelayFromChannel(nodeId, ch);
       }
     }
 
-    return true;
+    if (activeChannelIds.length > 0) {
+      const placeholders = activeChannelIds.map(() => '?').join(',');
+      this.db.prepare(`
+        DELETE FROM relays 
+        WHERE node_id = ? AND channel_id NOT IN (${placeholders})
+      `).run(nodeId, ...activeChannelIds);
+    } else {
+      this.db.prepare('DELETE FROM relays WHERE node_id = ?').run(nodeId);
+    }
+    return activeChannelIds.length;
+  }
+
+  touchNode(nodeId) {
+    const nowEpoch = Date.now() / 1000;
+    const nowStr = new Date().toISOString();
+    try {
+      this.db.prepare('UPDATE nodes SET last_seen_epoch = ?, last_seen_str = ? WHERE node_id = ?').run(nowEpoch, nowStr, nodeId);
+    } catch (e) {
+      console.error('Error touching node:', e);
+    }
   }
 
   upsertRelayFromChannel(nodeId, ch) {
@@ -331,10 +438,15 @@ class FleetDatabase {
     const state = ch.state ? 1 : 0;
     const nowStr = new Date().toISOString();
 
-    const existingRelay = this.db.prepare('SELECT current_state FROM relays WHERE node_id = ? AND channel_id = ?').get(nodeId, chId);
+    const existingRelay = this.db.prepare('SELECT current_state, name, pin FROM relays WHERE node_id = ? AND channel_id = ?').get(nodeId, chId);
+
+    let changed = false;
+    let oldState = 0;
 
     if (existingRelay) {
+      oldState = existingRelay.current_state;
       if (existingRelay.current_state !== state) {
+        changed = true;
         this.logRelayEvent(nodeId, chId, existingRelay.current_state, state, 'TELEMETRY_SYNC');
       }
       const updateStmt = this.db.prepare(`
@@ -353,6 +465,15 @@ class FleetDatabase {
       `);
       insertStmt.run(nodeId, chId, pin, name, room, func, activeLow, initialMode, enabled, state, state, nowStr);
     }
+
+    return {
+      changed,
+      channelId: chId,
+      pin,
+      name,
+      oldState,
+      newState: state
+    };
   }
 
   getNodes(filters = {}) {
@@ -652,8 +773,13 @@ class FleetDatabase {
     `).run(nowStr, nowEpoch, category, nodeId || '', message);
   }
 
-  getAuditLogs(limit = 100) {
-    const rows = this.db.prepare('SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?').all(limit);
+  getAuditLogs(limit = 100, category = null) {
+    let rows;
+    if (category && category !== 'ALL') {
+      rows = this.db.prepare('SELECT * FROM audit_logs WHERE category = ? ORDER BY id DESC LIMIT ?').all(category, limit);
+    } else {
+      rows = this.db.prepare('SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?').all(limit);
+    }
     return rows.map(r => ({
       id: r.id,
       timestamp: r.timestamp_str || new Date(r.epoch * 1000).toISOString(),
@@ -661,6 +787,7 @@ class FleetDatabase {
       user: 'Administrator',
       username: 'admin',
       action: r.category || 'SYSTEM',
+      category: r.category || 'SYSTEM',
       target: r.node_id || 'System',
       node_id: r.node_id,
       details: r.message || '',
@@ -682,16 +809,50 @@ class FleetDatabase {
     return this.db.prepare('SELECT * FROM system_events ORDER BY id DESC LIMIT ?').all(limit);
   }
 
-  addNotification(title, message, severity = 'INFO') {
+  addNotification(title, message, severity = 'INFO', category = 'SYSTEM') {
     const nowStr = new Date().toISOString();
-    this.db.prepare(`
-      INSERT INTO notifications (title, message, severity, read, timestamp)
-      VALUES (?, ?, ?, 0, ?)
-    `).run(title, message, severity, nowStr);
+    let res;
+    try {
+      res = this.db.prepare(`
+        INSERT INTO notifications (title, message, severity, category, read, timestamp)
+        VALUES (?, ?, ?, ?, 0, ?)
+      `).run(title, message, severity, category, nowStr);
+    } catch (e) {
+      res = this.db.prepare(`
+        INSERT INTO notifications (title, message, severity, read, timestamp)
+        VALUES (?, ?, ?, 0, ?)
+      `).run(title, message, severity, nowStr);
+    }
+    return {
+      id: Number(res.lastInsertRowid),
+      title,
+      message,
+      severity,
+      category,
+      read: 0,
+      timestamp: nowStr
+    };
   }
 
   getNotifications(limit = 50) {
     return this.db.prepare('SELECT * FROM notifications ORDER BY id DESC LIMIT ?').all(limit);
+  }
+
+  getUnreadNotificationCount() {
+    try {
+      const row = this.db.prepare('SELECT COUNT(*) as count FROM notifications WHERE read = 0').get();
+      return row ? Number(row.count) : 0;
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  deleteNotification(id) {
+    return this.db.prepare('DELETE FROM notifications WHERE id = ?').run(id);
+  }
+
+  clearAllNotifications() {
+    return this.db.prepare('DELETE FROM notifications').run();
   }
 
   markNotificationsRead() {
@@ -772,26 +933,50 @@ class FleetDatabase {
       filename: r.filename,
       version: r.version,
       hardware_type: r.hardware_type,
+      release_channel: r.release_channel || 'LTS',
+      notes: r.notes || '',
       file_size_bytes: r.file_size_bytes,
       checksum_md5: r.checksum_md5 || 'N/A',
+      checksum_sha256: r.checksum_sha256 || 'N/A',
       file_path: r.file_path,
       uploaded_at: r.uploaded_at
     }));
+  }
+
+  getFirmware(id) {
+    const r = this.db.prepare('SELECT * FROM firmware WHERE id = ?').get(Number(id));
+    if (!r) return null;
+    return {
+      id: r.id,
+      filename: r.filename,
+      version: r.version,
+      hardware_type: r.hardware_type,
+      release_channel: r.release_channel || 'LTS',
+      notes: r.notes || '',
+      file_size_bytes: r.file_size_bytes,
+      checksum_md5: r.checksum_md5 || 'N/A',
+      checksum_sha256: r.checksum_sha256 || 'N/A',
+      file_path: r.file_path,
+      uploaded_at: r.uploaded_at
+    };
   }
 
   addFirmwareRecord(fw) {
     const nowStr = new Date().toISOString();
     const stmt = this.db.prepare(`
       INSERT INTO firmware (
-        filename, version, hardware_type, file_size_bytes, checksum_md5, file_path, uploaded_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        filename, version, hardware_type, release_channel, notes, file_size_bytes, checksum_md5, checksum_sha256, file_path, uploaded_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const res = stmt.run(
       fw.filename,
       fw.version || '1.6.0',
       fw.hardware_type || 'ESP8266',
+      fw.release_channel || 'LTS',
+      fw.notes || '',
       Number(fw.file_size_bytes) || 0,
       fw.checksum_md5 || '',
+      fw.checksum_sha256 || '',
       fw.file_path || '',
       nowStr
     );
@@ -801,6 +986,146 @@ class FleetDatabase {
   deleteFirmware(id) {
     const res = this.db.prepare('DELETE FROM firmware WHERE id = ?').run(Number(id));
     return res.changes > 0;
+  }
+
+  // === NODE BACKUPS ===
+
+  addNodeBackup(b) {
+    const nowStr = new Date().toISOString();
+    const stmt = this.db.prepare(`
+      INSERT INTO node_backups (
+        node_id, node_name, firmware_version, backup_type, backup_path, file_size_bytes, snapshot_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const res = stmt.run(
+      b.node_id,
+      b.node_name || 'SmartHome-Node',
+      b.firmware_version || '1.6.0',
+      b.backup_type || 'PRE_OTA',
+      b.backup_path || '',
+      Number(b.file_size_bytes) || 0,
+      typeof b.snapshot_json === 'string' ? b.snapshot_json : JSON.stringify(b.snapshot_json || {}),
+      nowStr
+    );
+    return res.lastInsertRowid;
+  }
+
+  getNodeBackups(nodeId = null) {
+    let rows;
+    if (nodeId) {
+      rows = this.db.prepare('SELECT * FROM node_backups WHERE node_id = ? ORDER BY id DESC').all(nodeId);
+    } else {
+      rows = this.db.prepare('SELECT * FROM node_backups ORDER BY id DESC').all();
+    }
+    return rows.map(r => ({
+      id: r.id,
+      node_id: r.node_id,
+      node_name: r.node_name,
+      firmware_version: r.firmware_version,
+      backup_type: r.backup_type,
+      backup_path: r.backup_path,
+      file_size_bytes: r.file_size_bytes,
+      created_at: r.created_at
+    }));
+  }
+
+  getNodeBackup(id) {
+    const r = this.db.prepare('SELECT * FROM node_backups WHERE id = ?').get(Number(id));
+    if (!r) return null;
+    return {
+      id: r.id,
+      node_id: r.node_id,
+      node_name: r.node_name,
+      firmware_version: r.firmware_version,
+      backup_type: r.backup_type,
+      backup_path: r.backup_path,
+      file_size_bytes: r.file_size_bytes,
+      snapshot_json: r.snapshot_json,
+      created_at: r.created_at
+    };
+  }
+
+  deleteNodeBackup(id) {
+    const res = this.db.prepare('DELETE FROM node_backups WHERE id = ?').run(Number(id));
+    return res.changes > 0;
+  }
+
+  // === OTA DEPLOYMENT HISTORY (LTS AUDIT TRAIL) ===
+
+  addOtaHistory(rec) {
+    const nowStr = new Date().toISOString();
+    const stmt = this.db.prepare(`
+      INSERT INTO ota_history (
+        node_id, node_name, firmware_id, firmware_filename, version_from, version_to, status, backup_id, duration_ms, details, error_message, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const res = stmt.run(
+      rec.node_id,
+      rec.node_name || 'SmartHome-Node',
+      rec.firmware_id ? Number(rec.firmware_id) : null,
+      rec.firmware_filename || '',
+      rec.version_from || '1.6.0',
+      rec.version_to || '1.6.0',
+      rec.status || 'PENDING',
+      rec.backup_id ? Number(rec.backup_id) : null,
+      Number(rec.duration_ms) || 0,
+      typeof rec.details === 'string' ? rec.details : JSON.stringify(rec.details || {}),
+      rec.error_message || '',
+      nowStr
+    );
+    return res.lastInsertRowid;
+  }
+
+  updateOtaHistory(id, updates) {
+    const fields = [];
+    const values = [];
+
+    if (updates.status !== undefined) {
+      fields.push('status = ?');
+      values.push(updates.status);
+    }
+    if (updates.duration_ms !== undefined) {
+      fields.push('duration_ms = ?');
+      values.push(Number(updates.duration_ms));
+    }
+    if (updates.details !== undefined) {
+      fields.push('details = ?');
+      values.push(typeof updates.details === 'string' ? updates.details : JSON.stringify(updates.details));
+    }
+    if (updates.error_message !== undefined) {
+      fields.push('error_message = ?');
+      values.push(updates.error_message);
+    }
+    if (updates.backup_id !== undefined) {
+      fields.push('backup_id = ?');
+      values.push(Number(updates.backup_id));
+    }
+
+    if (fields.length === 0) return false;
+
+    values.push(Number(id));
+    const sql = `UPDATE ota_history SET ${fields.join(', ')} WHERE id = ?`;
+    const res = this.db.prepare(sql).run(...values);
+    return res.changes > 0;
+  }
+
+  getOtaHistory(limit = 50) {
+    const rows = this.db.prepare('SELECT * FROM ota_history ORDER BY id DESC LIMIT ?').all(Number(limit));
+    return rows.map(r => ({
+      id: r.id,
+      node_id: r.node_id,
+      node_name: r.node_name,
+      firmware_id: r.firmware_id,
+      firmware_filename: r.firmware_filename,
+      version_from: r.version_from,
+      version_to: r.version_to,
+      status: r.status,
+      backup_id: r.backup_id,
+      duration_ms: r.duration_ms,
+      details: r.details,
+      error_message: r.error_message,
+      created_at: r.created_at
+    }));
   }
 }
 
