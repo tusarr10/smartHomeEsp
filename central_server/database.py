@@ -127,6 +127,10 @@ class FleetDatabase:
                 except Exception:
                     node["channels"] = []
                 node.pop("channels_json", None)
+                node["name"] = node.get("node_name", node.get("node_id"))
+                node["ip_address"] = node.get("ip", "")
+                node["status"] = "Online" if node.get("is_online") else "Offline"
+                node["hardware_type"] = "ESP8266"
                 nodes.append(node)
         return nodes
 
@@ -143,6 +147,10 @@ class FleetDatabase:
             except Exception:
                 node["channels"] = []
             node.pop("channels_json", None)
+            node["name"] = node.get("node_name", node.get("node_id"))
+            node["ip_address"] = node.get("ip", "")
+            node["status"] = "Online" if node.get("is_online") else "Offline"
+            node["hardware_type"] = "ESP8266"
             return node
 
     def set_node_online(self, node_id: str, is_online: bool):
