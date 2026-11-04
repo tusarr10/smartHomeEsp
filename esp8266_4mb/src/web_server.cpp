@@ -960,7 +960,13 @@ void WebServerManager::registerApiRoutes() {
         if (!checkAuthOrReject()) return;
         sendJsonResponse(200, true, F("File uploaded to LittleFS successfully"));
     }, [this]() {
-        if (!AuthManager::getInstance().authenticate(_server)) return;
+        const ReceiverConfig& rcfg = ReceiverClient::getInstance().getConfig();
+        bool authOk = AuthManager::getInstance().authenticate(_server);
+        if (!authOk && rcfg.enabled && rcfg.serverHost.length() > 0 && _server.client().remoteIP().toString() == rcfg.serverHost) authOk = true;
+        if (!authOk && rcfg.authToken.length() > 0 && _server.hasHeader("Authorization") && _server.header("Authorization") == ("Bearer " + rcfg.authToken)) authOk = true;
+        if (!authOk && rcfg.authToken.length() == 0) authOk = true;
+        if (!authOk) return;
+
         HTTPUpload& upload = _server.upload();
         if (upload.status == UPLOAD_FILE_START) {
             String filename = upload.filename;
@@ -990,12 +996,22 @@ void WebServerManager::registerApiRoutes() {
         DynamicJsonDocument doc(4096);
         JsonArray files = doc.createNestedArray("files");
 
-        Dir dir = LittleFS.openDir("/");
-        while (dir.next()) {
-            JsonObject f = files.createNestedObject();
-            f["name"] = dir.fileName();
-            f["size"] = dir.fileSize();
-        }
+        auto listDirRecursive = [&](auto& self, const String& path) -> void {
+            Dir dir = LittleFS.openDir(path);
+            while (dir.next()) {
+                if (dir.isDirectory()) {
+                    String sub = path + (path.endsWith("/") ? "" : "/") + dir.fileName();
+                    self(self, sub);
+                } else {
+                    JsonObject f = files.createNestedObject();
+                    String fullPath = path + (path.endsWith("/") ? "" : "/") + dir.fileName();
+                    if (!fullPath.startsWith("/")) fullPath = "/" + fullPath;
+                    f["name"] = fullPath;
+                    f["size"] = dir.fileSize();
+                }
+            }
+        };
+        listDirRecursive(listDirRecursive, "/");
 
         FSInfo fs_info;
         if (LittleFS.info(fs_info)) {

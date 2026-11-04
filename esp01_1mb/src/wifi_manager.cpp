@@ -1,7 +1,6 @@
 #include "wifi_manager.h"
 #include "storage_manager.h"
 #include "automation.h"
-#include <algorithm>
 
 WifiManager::WifiManager()
     : _apActive(false),
@@ -226,33 +225,6 @@ void WifiManager::loop() {
             }
         }
     }
-}
-
-void WifiManager::scanNetworks(std::vector<ScannedNetwork>& outList) {
-    outList.clear();
-    int n = WiFi.scanNetworks(false, true); // Synchronous, show hidden
-    if (n <= 0) return;
-
-    for (int i = 0; i < n; i++) {
-        ScannedNetwork net;
-        net.ssid = WiFi.SSID(i);
-        net.rssi = WiFi.RSSI(i);
-        net.encryptionType = WiFi.encryptionType(i);
-        net.channel = WiFi.channel(i);
-        net.isHidden = WiFi.isHidden(i);
-
-        if (net.ssid.length() == 0) {
-            net.ssid = F("(Hidden Network)");
-        }
-        outList.push_back(net);
-    }
-
-    // Sort descending by RSSI
-    std::sort(outList.begin(), outList.end(), [](const ScannedNetwork& a, const ScannedNetwork& b) {
-        return a.rssi > b.rssi;
-    });
-
-    WiFi.scanDelete();
 }
 
 void WifiManager::setMode(uint8_t mode) {
