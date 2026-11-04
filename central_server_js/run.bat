@@ -2,6 +2,8 @@
 setlocal
 cd /d "%~dp0"
 
+set PATH=%LOCALAPPDATA%\node-lts\node-v22.11.0-win-x64;%PATH%
+
 echo ==============================================================================
 echo  SmartHome Central Platform (JavaScript / Node.js Edition)
 echo ==============================================================================
@@ -15,6 +17,6 @@ if not exist node_modules (
     call npm install
 )
 
-node server.js
+node --experimental-sqlite server.js
 
 endlocal

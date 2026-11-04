@@ -5,39 +5,262 @@ const crypto = require('node:crypto');
 const http = require('node:http');
 const multer = require('multer');
 
+const {
+  authenticateUser,
+  requirePermission,
+  verifyDeviceScope,
+  verifyPassword
+} = require('../auth');
+const OtaService = require('../otaService');
+const LittlefsService = require('../littlefsService');
+const ConfigSyncService = require('../configSyncService');
+
 function createV1Router(nodeManager, db) {
   const router = express.Router();
-  const OtaService = require('../otaService');
   const otaService = new OtaService(db, nodeManager);
+  const littlefsService = new LittlefsService(db, nodeManager);
+  const configSyncService = new ConfigSyncService(db, nodeManager);
 
-  // Configure Multer for Firmware Uploads
+  // Configure Multer for Firmware Uploads (Disk Storage)
   const firmwareDir = path.join(__dirname, '..', '..', 'data', 'firmware');
   if (!fs.existsSync(firmwareDir)) {
     fs.mkdirSync(firmwareDir, { recursive: true });
   }
 
-  const storage = multer.diskStorage({
+  const fwStorage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, firmwareDir),
     filename: (req, file, cb) => {
       const sanitized = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
       cb(null, `${Date.now()}_${sanitized}`);
     }
   });
-  const upload = multer({ storage });
+  const fwUpload = multer({ storage: fwStorage });
 
-  // === SYSTEM OVERVIEW ===
+  // Configure Multer for LittleFS Uploads (In-Memory Buffer for streaming to node)
+  const fsUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 }
+  });
+
+  // ==========================================
+  // === AUTHENTICATION & SESSION ROUTES ===
+  // ==========================================
+
+  router.post('/auth/login', (req, res) => {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ success: false, error: 'Username and password are required' });
+    }
+
+    const user = db.getUserByUsername(username);
+    if (!user) {
+      return res.status(401).json({ success: false, error: 'Invalid username or password' });
+    }
+
+    if (!user.is_active) {
+      return res.status(403).json({ success: false, error: 'Account is deactivated. Contact an administrator.' });
+    }
+
+    if (!verifyPassword(password, user.password_hash)) {
+      return res.status(401).json({ success: false, error: 'Invalid username or password' });
+    }
+
+    const clientIp = req.ip || req.socket.remoteAddress || '';
+    const userAgent = req.headers['user-agent'] || '';
+    const session = db.createSession(user.id, clientIp, userAgent);
+
+    const roles = db.getUserRoles(user.id);
+    const permissions = db.getUserPermissions(user.id);
+    const scopes = db.getUserScopes(user.id);
+
+    db.logAudit('USER_LOGIN', 'System', `User '${user.username}' signed in successfully`);
+
+    res.json({
+      success: true,
+      token: session.token,
+      expires_at: session.expires_at,
+      user: {
+        id: user.id,
+        username: user.username,
+        full_name: user.full_name,
+        email: user.email,
+        is_superuser: Boolean(user.is_superuser),
+        roles,
+        permissions,
+        scopes
+      }
+    });
+  });
+
+  router.get('/auth/me', authenticateUser(db), (req, res) => {
+    res.json({
+      success: true,
+      user: req.user
+    });
+  });
+
+  router.post('/auth/logout', authenticateUser(db), (req, res) => {
+    if (req.sessionToken) {
+      db.revokeSession(req.sessionToken);
+    }
+    res.json({ success: true, message: 'Logged out successfully' });
+  });
+
+  router.post('/auth/change-password', authenticateUser(db), (req, res) => {
+    const { oldPassword, newPassword } = req.body;
+    if (!oldPassword || !newPassword) {
+      return res.status(400).json({ success: false, error: 'Current password and new password are required' });
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).json({ success: false, error: 'New password must be at least 6 characters' });
+    }
+
+    const userWithHash = db.getUserByUsername(req.user.username);
+    if (!verifyPassword(oldPassword, userWithHash.password_hash)) {
+      return res.status(400).json({ success: false, error: 'Current password does not match' });
+    }
+
+    db.setUserPassword(req.user.id, newPassword);
+    res.json({ success: true, message: 'Password changed successfully. Please log in again.' });
+  });
+
+  // ==========================================
+  // === USER & RBAC ADMINISTRATION ROUTES ===
+  // ==========================================
+
+  router.get('/admin/users', requirePermission(db, 'users:manage'), (req, res) => {
+    const users = db.getUsers();
+    res.json({ success: true, users });
+  });
+
+  router.post('/admin/users', requirePermission(db, 'users:manage'), (req, res) => {
+    const { username, password, full_name, email, is_superuser, role_names, scope_ids } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ success: false, error: 'Username and password are required' });
+    }
+
+    try {
+      const newUser = db.createUser({
+        username,
+        password,
+        full_name,
+        email,
+        is_superuser: Boolean(is_superuser),
+        role_names: Array.isArray(role_names) ? role_names : ['OPERATOR'],
+        scope_ids: Array.isArray(scope_ids) ? scope_ids : []
+      });
+      res.json({ success: true, user: newUser });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  router.put('/admin/users/:id', requirePermission(db, 'users:manage'), (req, res) => {
+    try {
+      const updated = db.updateUser(req.params.id, req.body);
+      if (!updated) {
+        return res.status(404).json({ success: false, error: 'User not found' });
+      }
+      res.json({ success: true, user: updated });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  router.post('/admin/users/:id/password', requirePermission(db, 'users:manage'), (req, res) => {
+    const { newPassword } = req.body;
+    if (!newPassword || newPassword.length < 6) {
+      return res.status(400).json({ success: false, error: 'Password must be at least 6 characters' });
+    }
+    try {
+      db.setUserPassword(req.params.id, newPassword);
+      res.json({ success: true, message: 'User password reset successfully' });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  router.delete('/admin/users/:id', requirePermission(db, 'users:manage'), (req, res) => {
+    try {
+      const ok = db.deleteUser(req.params.id);
+      if (ok) {
+        res.json({ success: true, message: 'User deleted successfully' });
+      } else {
+        res.status(404).json({ success: false, error: 'User not found' });
+      }
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  router.get('/admin/users/:id/sessions', requirePermission(db, 'users:manage'), (req, res) => {
+    const sessions = db.getUserSessions(req.params.id);
+    res.json({ success: true, sessions });
+  });
+
+  router.post('/admin/users/:id/revoke-sessions', requirePermission(db, 'users:manage'), (req, res) => {
+    db.revokeUserSessions(req.params.id);
+    res.json({ success: true, message: 'All active sessions for this user have been revoked' });
+  });
+
+  router.get('/admin/roles', requirePermission(db, 'roles:manage'), (req, res) => {
+    res.json({ success: true, roles: db.getRoles() });
+  });
+
+  router.get('/admin/permissions', requirePermission(db, 'roles:manage'), (req, res) => {
+    res.json({ success: true, permissions: db.getPermissions() });
+  });
+
+  router.get('/admin/scopes', requirePermission(db, 'scopes:manage'), (req, res) => {
+    res.json({ success: true, scopes: db.getScopes() });
+  });
+
+  router.post('/admin/scopes', requirePermission(db, 'scopes:manage'), (req, res) => {
+    const { scope_type, scope_identifier, name, description } = req.body;
+    if (!scope_type || !scope_identifier || !name) {
+      return res.status(400).json({ success: false, error: 'scope_type, scope_identifier and name are required' });
+    }
+    try {
+      const id = db.createScope({ scope_type, scope_identifier, name, description });
+      res.json({ success: true, id, message: 'Scope created successfully' });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  router.delete('/admin/scopes/:id', requirePermission(db, 'scopes:manage'), (req, res) => {
+    try {
+      const ok = db.deleteScope(req.params.id);
+      if (ok) {
+        res.json({ success: true, message: 'Scope deleted successfully' });
+      } else {
+        res.status(404).json({ success: false, error: 'Scope not found' });
+      }
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  // ==========================================
+  // === SYSTEM OVERVIEW & FLEET NODES ===
+  // ==========================================
+
   router.get('/system/overview', (req, res) => {
     res.json(nodeManager.getOverview());
   });
 
-  // === NODES ===
-  router.get('/nodes', (req, res) => {
+  router.get('/nodes', authenticateUser(db), (req, res) => {
     const { room, status, hardware, search } = req.query;
-    const nodes = db.getNodes({ room, status, hardware, search });
+    let nodes = db.getNodes({ room, status, hardware, search });
+
+    // Enforce hierarchical scope-based filtering for non-superusers
+    if (req.user && !req.user.is_superuser) {
+      nodes = nodes.filter(node => verifyDeviceScope(req.user, node));
+    }
     res.json(nodes);
   });
 
-  // Add / Register Node (via IP or manual probe)
+  // Add / Register Node
   const addNodeHandler = async (req, res) => {
     const ip = (req.body.ip || req.body.ip_address || '').trim();
     const name = (req.body.name || req.body.node_name || '').trim();
@@ -47,7 +270,6 @@ function createV1Router(nodeManager, db) {
       return res.status(400).json({ success: false, error: 'IP address is required to probe and add a node' });
     }
 
-    // Helper: probe node REST API on LAN
     const probeNode = () => new Promise((resolve) => {
       const clientReq = http.get(`http://${ip}/api/status`, { timeout: 3000 }, (targetRes) => {
         let raw = '';
@@ -55,16 +277,13 @@ function createV1Router(nodeManager, db) {
         targetRes.on('end', () => {
           try {
             resolve({ ok: true, data: JSON.parse(raw) });
-          } catch (e) {
+          } catch {
             resolve({ ok: false, error: 'Invalid JSON response from node' });
           }
         });
       });
       clientReq.on('error', (err) => resolve({ ok: false, error: err.message }));
-      clientReq.on('timeout', () => {
-        clientReq.destroy();
-        resolve({ ok: false, error: 'Connection timed out' });
-      });
+      clientReq.on('timeout', () => { clientReq.destroy(); resolve({ ok: false, error: 'Connection timed out' }); });
     });
 
     const probeGpios = () => new Promise((resolve) => {
@@ -135,19 +354,30 @@ function createV1Router(nodeManager, db) {
     });
   };
 
-  router.post('/nodes', addNodeHandler);
-  router.post('/nodes/add', addNodeHandler);
+  router.post('/nodes', requirePermission(db, 'devices:manage'), addNodeHandler);
+  router.post('/nodes/add', requirePermission(db, 'devices:manage'), addNodeHandler);
 
-  router.get('/nodes/:nodeId', (req, res) => {
+  router.get('/nodes/:nodeId', authenticateUser(db), (req, res) => {
     const node = db.getNode(req.params.nodeId);
     if (!node) {
       return res.status(404).json({ error: 'Node not found' });
     }
+    if (!verifyDeviceScope(req.user, node)) {
+      return res.status(403).json({ error: 'Forbidden: Node is outside your assigned scope' });
+    }
     const history = db.getTelemetryHistory(req.params.nodeId, 20);
-    res.json({ node, history });
+    const capabilities = db.getDeviceCapabilities(req.params.nodeId);
+    res.json({ node, capabilities, history });
   });
 
-  router.delete('/nodes/:nodeId', (req, res) => {
+  router.delete('/nodes/:nodeId', requirePermission(db, 'devices:delete'), (req, res) => {
+    const node = db.getNode(req.params.nodeId);
+    if (!node) {
+      return res.status(404).json({ success: false, error: 'Node not found' });
+    }
+    if (!verifyDeviceScope(req.user, node)) {
+      return res.status(403).json({ success: false, error: 'Forbidden: Device outside assigned scope' });
+    }
     const ok = db.deleteNode(req.params.nodeId);
     if (ok) {
       nodeManager.broadcast('node_deleted', { nodeId: req.params.nodeId });
@@ -157,25 +387,37 @@ function createV1Router(nodeManager, db) {
     }
   });
 
-  router.post('/nodes/:nodeId/restart', async (req, res) => {
-    const result = await nodeManager.dispatchCommand(req.params.nodeId, { action: 'reboot' });
+  router.post('/nodes/:nodeId/restart', requirePermission(db, 'devices:reboot'), async (req, res) => {
+    const node = db.getNode(req.params.nodeId);
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
+    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden: Node outside assigned scope' });
+
+    const result = await nodeManager.dispatchCommand(req.params.nodeId, { action: 'reboot' }, req.user);
     res.json(result);
   });
 
-  // === RELAYS ===
-  router.get('/relays', (req, res) => {
+  // ==========================================
+  // === RELAY & HARDWARE CONTROL ROUTES ===
+  // ==========================================
+
+  router.get('/relays', authenticateUser(db), (req, res) => {
     const { room, node_id, state } = req.query;
     const filters = {};
     if (room) filters.room = room;
     if (node_id) filters.node_id = node_id;
     if (state !== undefined) filters.state = state === 'true' || state === '1';
 
-    const relays = db.getRelays(filters);
+    let relays = db.getRelays(filters);
+    if (req.user && !req.user.is_superuser) {
+      relays = relays.filter(r => {
+        const n = db.getNode(r.node_id);
+        return verifyDeviceScope(req.user, n);
+      });
+    }
     res.json(relays);
   });
 
-  // Reconcile and synchronize pins directly with all online nodes
-  router.post('/relays/sync', async (req, res) => {
+  router.post('/relays/sync', requirePermission(db, 'devices:control'), async (req, res) => {
     try {
       const results = await nodeManager.syncAllOnlineNodesPins();
       const updatedRelays = db.getRelays();
@@ -191,8 +433,11 @@ function createV1Router(nodeManager, db) {
     }
   });
 
-  // Synchronize pins for a specific node
-  router.post('/nodes/:nodeId/sync-pins', async (req, res) => {
+  router.post('/nodes/:nodeId/sync-pins', requirePermission(db, 'devices:control'), async (req, res) => {
+    const node = db.getNode(req.params.nodeId);
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
+    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden: Node outside assigned scope' });
+
     try {
       const result = await nodeManager.syncNodePins(req.params.nodeId);
       const updatedRelays = db.getRelays({ node_id: req.params.nodeId });
@@ -208,8 +453,12 @@ function createV1Router(nodeManager, db) {
     }
   });
 
-  router.post('/relays/:nodeId/:channelId/command', async (req, res) => {
+  router.post('/relays/:nodeId/:channelId/command', requirePermission(db, 'devices:control'), async (req, res) => {
     const { nodeId, channelId } = req.params;
+    const node = db.getNode(nodeId);
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
+    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden: Node outside assigned scope' });
+
     const action = req.body.action || 'setState';
     const state = Boolean(req.body.state);
     const duration = Number(req.body.duration) || 500;
@@ -222,11 +471,11 @@ function createV1Router(nodeManager, db) {
       duration
     };
 
-    const result = await nodeManager.dispatchCommand(nodeId, cmd);
+    const result = await nodeManager.dispatchCommand(nodeId, cmd, req.user);
     res.json(result);
   });
 
-  router.post('/relays/broadcast', async (req, res) => {
+  router.post('/relays/broadcast', requirePermission(db, 'devices:control'), async (req, res) => {
     const action = req.body.action || 'setState';
     const targetState = Boolean(req.body.state);
     const targetRoom = req.body.room;
@@ -235,113 +484,298 @@ function createV1Router(nodeManager, db) {
     res.json(result);
   });
 
-  router.get('/relays/:nodeId/:channelId/history', (req, res) => {
+  router.get('/relays/:nodeId/:channelId/history', authenticateUser(db), (req, res) => {
     const { nodeId, channelId } = req.params;
     const limit = Number(req.query.limit) || 50;
     const history = db.getRelayHistory(nodeId, channelId, limit);
     res.json(history);
   });
 
-  // === SENSORS ===
-  router.get('/sensors', (req, res) => {
-    const sensors = db.getSensors();
-    res.json(sensors);
-  });
+  // ==========================================
+  // === LITTLEFS FILESYSTEM MANAGER ROUTES ===
+  // ==========================================
 
-  // === AUTOMATIONS ===
-  router.get('/automations', (req, res) => {
-    const automations = db.getAutomations();
-    res.json(automations);
-  });
-
-  router.post('/automations', (req, res) => {
-    try {
-      const id = db.addAutomation(req.body);
-      db.logAudit('AUTO_RULE_ADD', 'System', `Created automation rule: ${req.body.name}`);
-      res.json({ success: true, id, message: 'Automation rule created' });
-    } catch (err) {
-      res.status(400).json({ success: false, error: err.message });
-    }
-  });
-
-  router.post('/automations/:id/toggle', (req, res) => {
-    const nextState = db.toggleAutomation(req.params.id);
-    db.logAudit('AUTO_RULE_TOGGLE', 'System', `Automation rule #${req.params.id} enabled: ${nextState}`);
-    res.json({ success: true, enabled: nextState });
-  });
-
-  router.delete('/automations/:id', (req, res) => {
-    const ok = db.deleteAutomation(req.params.id);
-    res.json({ success: ok });
-  });
-
-  // === FIRMWARE & LONG-TERM SUPPORT (LTS) OTA ===
-  router.get('/firmware', (req, res) => {
-    const list = db.getFirmwareList();
-    res.json(list);
-  });
-
-  router.post('/firmware/upload', upload.single('firmware'), (req, res) => {
-    if (!req.file) {
-      return res.status(400).json({ success: false, error: 'No firmware file uploaded' });
-    }
+  router.get('/nodes/:nodeId/fs', requirePermission(db, 'littlefs:view'), async (req, res) => {
+    const node = db.getNode(req.params.nodeId);
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
+    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
 
     try {
-      const fileBuffer = fs.readFileSync(req.file.path);
-      const hashMd5 = crypto.createHash('md5').update(fileBuffer).digest('hex');
-      const hashSha256 = crypto.createHash('sha256').update(fileBuffer).digest('hex');
-      const version = req.body.version || '1.6.0';
-      const hardware = req.body.hardware_type || 'ESP8266';
-      const releaseChannel = req.body.release_channel || 'LTS';
-      const notes = req.body.notes || '';
-
-      const id = db.addFirmwareRecord({
-        filename: req.file.originalname,
-        version,
-        hardware_type: hardware,
-        release_channel: releaseChannel,
-        notes,
-        file_size_bytes: req.file.size,
-        checksum_md5: hashMd5,
-        checksum_sha256: hashSha256,
-        file_path: req.file.path
-      });
-
-      db.logAudit('FIRMWARE_UPLOAD', 'System', `Uploaded firmware '${req.file.originalname}' v${version} [${releaseChannel}] (${req.file.size} bytes)`);
-
-      res.json({
-        success: true,
-        id,
-        filename: req.file.originalname,
-        version,
-        release_channel: releaseChannel,
-        checksum_md5: hashMd5,
-        checksum_sha256: hashSha256,
-        message: 'Firmware uploaded and registered in LTS catalog'
-      });
+      const fsData = await littlefsService.fetchFilesystemList(req.params.nodeId);
+      res.json(fsData);
     } catch (err) {
       res.status(500).json({ success: false, error: err.message });
     }
   });
 
-  router.delete('/firmware/:id', (req, res) => {
-    const id = Number(req.params.id);
-    const fw = db.getFirmware(id);
-    if (!fw) return res.status(404).json({ success: false, error: 'Firmware not found' });
+  router.get('/nodes/:nodeId/fs/download', requirePermission(db, 'littlefs:download'), async (req, res) => {
+    const node = db.getNode(req.params.nodeId);
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
+    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+
+    const filePath = req.query.path;
+    if (!filePath) return res.status(400).json({ success: false, error: 'path query parameter is required' });
 
     try {
-      if (fs.existsSync(fw.file_path)) {
-        fs.unlinkSync(fw.file_path);
-      }
-    } catch {}
+      const fileData = await littlefsService.downloadFileFromNode(req.params.nodeId, filePath);
+      res.setHeader('Content-Type', fileData.contentType);
+      res.setHeader('Content-Disposition', `attachment; filename="${fileData.filename}"`);
+      res.setHeader('Content-Length', fileData.size);
+      res.send(fileData.buffer);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
 
-    db.deleteFirmware(id);
-    db.logAudit('FIRMWARE_DELETED', 'System', `Deleted firmware '${fw.filename}' v${fw.version}`);
+  router.post('/nodes/:nodeId/fs/upload', requirePermission(db, 'littlefs:upload'), fsUpload.single('file'), async (req, res) => {
+    const node = db.getNode(req.params.nodeId);
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
+    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: 'No file uploaded' });
+    }
+
+    try {
+      const result = await littlefsService.uploadFileToNode(
+        req.params.nodeId,
+        req.file.buffer,
+        req.file.originalname,
+        req.body.dir || '/'
+      );
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  router.post('/nodes/:nodeId/fs/delete', requirePermission(db, 'littlefs:delete'), async (req, res) => {
+    const node = db.getNode(req.params.nodeId);
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
+    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+
+    const { path: filePath } = req.body;
+    if (!filePath) return res.status(400).json({ success: false, error: 'path is required' });
+
+    try {
+      const result = await littlefsService.deleteFileOnNode(req.params.nodeId, filePath);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  router.post('/nodes/:nodeId/fs/rename', requirePermission(db, 'littlefs:manage'), async (req, res) => {
+    const node = db.getNode(req.params.nodeId);
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
+    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+
+    const { oldPath, newPath } = req.body;
+    if (!oldPath || !newPath) return res.status(400).json({ success: false, error: 'oldPath and newPath are required' });
+
+    try {
+      const result = await littlefsService.renameFileOnNode(req.params.nodeId, oldPath, newPath);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  router.post('/nodes/:nodeId/fs/backup', requirePermission(db, 'littlefs:backup'), async (req, res) => {
+    const node = db.getNode(req.params.nodeId);
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
+    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+
+    try {
+      const result = await littlefsService.createFilesystemBackup(req.params.nodeId, req.body.backupType || 'MANUAL');
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  router.get('/nodes/:nodeId/fs/backups', requirePermission(db, 'littlefs:view'), (req, res) => {
+    const node = db.getNode(req.params.nodeId);
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
+    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+
+    res.json({ success: true, backups: db.getFilesystemBackups(req.params.nodeId) });
+  });
+
+  // ==========================================
+  // === DEVICE COMMAND MANAGEMENT ROUTES ===
+  // ==========================================
+
+  router.get('/commands', requirePermission(db, 'commands:view'), (req, res) => {
+    const filters = {
+      node_id: req.query.node_id,
+      status: req.query.status,
+      limit: Number(req.query.limit) || 100
+    };
+    res.json({ success: true, commands: db.getCommands(filters) });
+  });
+
+  router.post('/commands/dispatch', requirePermission(db, 'commands:execute'), async (req, res) => {
+    const { node_id, ...commandPayload } = req.body;
+    if (!node_id) return res.status(400).json({ success: false, error: 'node_id is required' });
+
+    const node = db.getNode(node_id);
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
+    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden: Device outside assigned scope' });
+
+    try {
+      const result = await nodeManager.dispatchCommand(node_id, commandPayload, req.user);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  router.get('/commands/:uuid', requirePermission(db, 'commands:view'), (req, res) => {
+    const cmd = db.getCommandByUuid(req.params.uuid);
+    if (!cmd) return res.status(404).json({ success: false, error: 'Command not found' });
+    const results = db.getCommandResults(req.params.uuid);
+    res.json({ success: true, command: cmd, results });
+  });
+
+  // ==========================================
+  // === CONFIGURATION SYNCHRONIZATION ROUTES ===
+  // ==========================================
+
+  router.get('/nodes/:nodeId/config', requirePermission(db, 'config:view'), async (req, res) => {
+    const node = db.getNode(req.params.nodeId);
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
+    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+
+    try {
+      const config = await configSyncService.getDeviceConfig(req.params.nodeId);
+      res.json({ success: true, configuration: config });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  router.put('/nodes/:nodeId/config', requirePermission(db, 'config:manage'), async (req, res) => {
+    const node = db.getNode(req.params.nodeId);
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
+    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+
+    const { config, summary } = req.body;
+    if (!config) return res.status(400).json({ success: false, error: 'config object is required' });
+
+    try {
+      const result = await configSyncService.updateDeviceConfig(req.params.nodeId, config, req.user ? req.user.id : null, summary);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  router.post('/nodes/:nodeId/config/sync', requirePermission(db, 'config:sync'), async (req, res) => {
+    const node = db.getNode(req.params.nodeId);
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
+    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+
+    try {
+      const result = await configSyncService.syncDeviceConfig(req.params.nodeId, req.user ? req.user.id : null);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  router.get('/nodes/:nodeId/config/versions', requirePermission(db, 'config:view'), (req, res) => {
+    const node = db.getNode(req.params.nodeId);
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
+    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+
+    const versions = configSyncService.getConfigurationVersions(req.params.nodeId);
+    res.json({ success: true, versions });
+  });
+
+  router.post('/nodes/:nodeId/config/rollback/:version', requirePermission(db, 'config:rollback'), async (req, res) => {
+    const node = db.getNode(req.params.nodeId);
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
+    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+
+    try {
+      const result = await configSyncService.rollbackDeviceConfig(req.params.nodeId, req.params.version, req.user ? req.user.id : null);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // ==========================================
+  // === FIRMWARE & OTA PIPELINE ROUTES ===
+  // ==========================================
+
+  router.get('/firmware', (req, res) => {
+    res.json(db.getFirmwareList());
+  });
+
+  router.post('/firmware/upload', requirePermission(db, 'firmware:upload'), fwUpload.single('firmware'), (req, res) => {
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: 'No firmware binary file uploaded' });
+    }
+
+    const { version, hardware, release_channel, notes } = req.body;
+    if (!version) {
+      return res.status(400).json({ success: false, error: 'Firmware version string is required (e.g. 1.6.0)' });
+    }
+
+    const filePath = req.file.path;
+    const buffer = fs.readFileSync(filePath);
+    const md5Hash = crypto.createHash('md5').update(buffer).digest('hex');
+    const sha256Hash = crypto.createHash('sha256').update(buffer).digest('hex');
+
+    const id = db.addFirmwareRecord({
+      filename: req.file.filename,
+      version: version.trim(),
+      hardware_type: hardware || 'ESP8266',
+      release_channel: release_channel || 'LTS',
+      notes: notes || '',
+      file_size_bytes: req.file.size,
+      checksum_md5: md5Hash,
+      checksum_sha256: sha256Hash,
+      file_path: filePath
+    });
+
+    db.logAudit('FIRMWARE_UPLOAD', 'System', `Uploaded firmware v${version} (${req.file.size} bytes, MD5: ${md5Hash})`);
+
+    res.json({
+      success: true,
+      message: 'Firmware uploaded and registered in catalog',
+      firmware: db.getFirmware(id)
+    });
+  });
+
+  router.get('/firmware/:id/download', requirePermission(db, 'firmware:download'), (req, res) => {
+    const fw = db.getFirmware(req.params.id);
+    if (!fw) return res.status(404).json({ success: false, error: 'Firmware not found' });
+
+    const resolved = otaService.resolveFirmwarePath(fw.file_path);
+    if (!resolved || !fs.existsSync(resolved)) {
+      return res.status(404).json({ success: false, error: 'Firmware binary file missing from server disk' });
+    }
+
+    res.download(resolved, fw.filename);
+  });
+
+  router.delete('/firmware/:id', requirePermission(db, 'firmware:upload'), (req, res) => {
+    const fw = db.getFirmware(req.params.id);
+    if (!fw) return res.status(404).json({ success: false, error: 'Firmware not found' });
+
+    if (fw.file_path && fs.existsSync(fw.file_path)) {
+      try { fs.unlinkSync(fw.file_path); } catch {}
+    }
+    db.deleteFirmware(req.params.id);
+    db.logAudit('FIRMWARE_DELETED', 'System', `Deleted firmware ID ${req.params.id} (${fw.filename})`);
     res.json({ success: true, message: 'Firmware removed from catalog' });
   });
 
-  // 1. Fetch live diagnostic data from node before OTA
-  router.get('/ota/node-diagnostics/:nodeId', async (req, res) => {
+  // OTA Diagnostics & Pre-check
+  router.get('/ota/diagnostics/:nodeId', authenticateUser(db), async (req, res) => {
     try {
       const diag = await otaService.fetchNodeDiagnostics(req.params.nodeId);
       res.json(diag);
@@ -350,8 +784,7 @@ function createV1Router(nodeManager, db) {
     }
   });
 
-  // 2. Pre-Check & Version Compatibility Validation
-  router.post('/ota/pre-check', async (req, res) => {
+  router.post('/ota/precheck', authenticateUser(db), async (req, res) => {
     const { nodeId, firmwareId } = req.body;
     if (!nodeId || !firmwareId) {
       return res.status(400).json({ success: false, error: 'nodeId and firmwareId are required' });
@@ -364,55 +797,8 @@ function createV1Router(nodeManager, db) {
     }
   });
 
-  // 3. Create Node Configuration & State Backup
-  router.post('/ota/backup/:nodeId', async (req, res) => {
-    try {
-      const backupType = req.body.backupType || 'MANUAL';
-      const result = await otaService.backupNode(req.params.nodeId, backupType);
-      res.json(result);
-    } catch (err) {
-      res.status(500).json({ success: false, error: err.message });
-    }
-  });
-
-  // List all backups
-  router.get('/ota/backups', (req, res) => {
-    const list = db.getNodeBackups(req.query.nodeId);
-    res.json(list);
-  });
-
-  // Download backup JSON file
-  router.get('/ota/backups/:id/download', (req, res) => {
-    const b = db.getNodeBackup(req.params.id);
-    if (!b || !fs.existsSync(b.backup_path)) {
-      return res.status(404).json({ success: false, error: 'Backup archive file not found' });
-    }
-    res.download(b.backup_path, path.basename(b.backup_path));
-  });
-
-  // Delete backup
-  router.delete('/ota/backups/:id', (req, res) => {
-    const b = db.getNodeBackup(req.params.id);
-    if (!b) return res.status(404).json({ success: false, error: 'Backup not found' });
-    try {
-      if (fs.existsSync(b.backup_path)) fs.unlinkSync(b.backup_path);
-    } catch {}
-    db.deleteNodeBackup(b.id);
-    res.json({ success: true, message: 'Backup deleted' });
-  });
-
-  // Restore node configuration from backup
-  router.post('/ota/backups/:id/restore/:nodeId', async (req, res) => {
-    try {
-      const result = await otaService.restoreNodeConfig(req.params.nodeId, req.params.id);
-      res.json(result);
-    } catch (err) {
-      res.status(500).json({ success: false, error: err.message });
-    }
-  });
-
-  // 4. Managed End-to-End OTA Deployment Pipeline
-  router.post('/ota/deploy', async (req, res) => {
+  // OTA Deployment
+  router.post('/ota/deploy', requirePermission(db, 'firmware:deploy'), async (req, res) => {
     const { nodeId, firmwareId, options } = req.body;
     if (!nodeId || !firmwareId) {
       return res.status(400).json({ success: false, error: 'nodeId and firmwareId are required' });
@@ -425,80 +811,108 @@ function createV1Router(nodeManager, db) {
     }
   });
 
-  // 5. OTA Deployment History Log
-  router.get('/ota/history', (req, res) => {
+  router.get('/ota/history', requirePermission(db, 'firmware:view'), (req, res) => {
     const limit = Number(req.query.limit) || 50;
-    const history = db.getOtaHistory(limit);
-    res.json(history);
+    res.json(db.getOtaHistory(limit));
   });
 
-  // Legacy Flash Route adapter
-  router.post('/firmware/:id/flash/:nodeId', async (req, res) => {
-    const { id, nodeId } = req.params;
+  router.get('/ota/backups', authenticateUser(db), (req, res) => {
+    res.json(db.getNodeBackups(req.query.node_id));
+  });
+
+  router.delete('/ota/backups/:id', requirePermission(db, 'system:manage'), (req, res) => {
+    const b = db.getNodeBackup(req.params.id);
+    if (!b) return res.status(404).json({ success: false, error: 'Backup not found' });
+    if (b.backup_path && fs.existsSync(b.backup_path)) {
+      try { fs.unlinkSync(b.backup_path); } catch {}
+    }
+    db.deleteNodeBackup(b.id);
+    res.json({ success: true, message: 'Backup deleted' });
+  });
+
+  // ==========================================
+  // === SENSORS, AUTOMATIONS & LOGS ===
+  // ==========================================
+
+  router.get('/sensors', authenticateUser(db), (req, res) => {
+    res.json(db.getSensors());
+  });
+
+  router.get('/automations', authenticateUser(db), (req, res) => {
+    res.json(db.getAutomations());
+  });
+
+  router.post('/automations', requirePermission(db, 'devices:manage'), (req, res) => {
     try {
-      const result = await otaService.deployOta(nodeId, id, { autoBackup: true, postVerify: true });
-      res.json(result);
+      const id = db.addAutomation(req.body);
+      db.logAudit('AUTO_RULE_ADD', 'System', `Created automation rule: ${req.body.name}`);
+      res.json({ success: true, id });
     } catch (err) {
-      res.status(500).json({ success: false, error: err.message });
+      res.status(400).json({ success: false, error: err.message });
     }
   });
 
-  // === TELEMETRY STREAM & HISTORY ===
-  router.get('/telemetry', (req, res) => {
-    const limit = Number(req.query.limit) || 50;
-    const records = db.getRecentTelemetry(limit);
-    res.json(records);
+  router.post('/automations/:id/toggle', requirePermission(db, 'devices:manage'), (req, res) => {
+    const ok = db.toggleAutomation(req.params.id);
+    res.json({ success: true, enabled: ok });
   });
 
-  // === SYSTEM EVENTS & LOGS ===
-  router.get('/system/events', (req, res) => {
+  router.delete('/automations/:id', requirePermission(db, 'devices:manage'), (req, res) => {
+    const ok = db.deleteAutomation(req.params.id);
+    res.json({ success: ok });
+  });
+
+  router.get('/telemetry', requirePermission(db, 'telemetry:view'), (req, res) => {
+    const limit = Number(req.query.limit) || 50;
+    res.json(db.getRecentTelemetry(limit));
+  });
+
+  router.get('/system/events', requirePermission(db, 'audit:view'), (req, res) => {
     const limit = Number(req.query.limit) || 100;
     res.json(db.getSystemEvents(limit));
   });
 
-  router.get('/system/notifications', (req, res) => {
+  router.get('/system/notifications', authenticateUser(db), (req, res) => {
     const limit = Number(req.query.limit) || 60;
     res.json(db.getNotifications(limit));
   });
 
-  router.get('/system/notifications/unread-count', (req, res) => {
+  router.get('/system/notifications/unread-count', authenticateUser(db), (req, res) => {
     res.json({ unreadCount: db.getUnreadNotificationCount() });
   });
 
-  router.post('/system/notifications/mark-read', (req, res) => {
+  router.post('/system/notifications/mark-read', authenticateUser(db), (req, res) => {
     db.markNotificationsRead();
     res.json({ success: true, message: 'All notifications marked as read' });
   });
 
-  router.delete('/system/notifications/:id', (req, res) => {
+  router.delete('/system/notifications/:id', authenticateUser(db), (req, res) => {
     db.deleteNotification(req.params.id);
     res.json({ success: true, message: 'Notification removed' });
   });
 
-  router.delete('/system/notifications', (req, res) => {
+  router.delete('/system/notifications', authenticateUser(db), (req, res) => {
     db.clearAllNotifications();
     res.json({ success: true, message: 'All notifications cleared' });
   });
 
-  router.get('/system/logs', (req, res) => {
+  router.get('/system/logs', requirePermission(db, 'audit:view'), (req, res) => {
     const limit = Number(req.query.limit) || 100;
     const category = req.query.category || null;
-    const logs = db.getAuditLogs(limit, category);
-    res.json(logs);
+    res.json(db.getAuditLogs(limit, category));
   });
 
-  // === HEALTH & PIN STATUS AUTO-SYNC POLLER ===
   router.get('/system/poll-settings', (req, res) => {
     res.json(nodeManager.getPollSettings());
   });
 
-  router.post('/system/poll-settings', async (req, res) => {
+  router.post('/system/poll-settings', requirePermission(db, 'system:manage'), async (req, res) => {
     const { intervalSec, enabled } = req.body;
     const settings = await nodeManager.setPollInterval(intervalSec, enabled);
     res.json({ success: true, settings });
   });
 
-  router.post('/system/poll-now', async (req, res) => {
+  router.post('/system/poll-now', requirePermission(db, 'devices:control'), async (req, res) => {
     await nodeManager.pollAllNodesStatusAndPins();
     res.json({
       success: true,

@@ -19,7 +19,8 @@ ReceiverClient::ReceiverClient()
       _lastSyncTimestamp("Never"),
       _lastSyncStatus("Not configured"),
       _lastServerResponse(""),
-      _lastStatusCode(0) {
+      _lastStatusCode(0),
+      _ackCount(0) {
     _rxBuf[0] = '\0';
 }
 
@@ -214,6 +215,18 @@ void ReceiverClient::fillTelemetryDoc(DynamicJsonDocument& doc, const char* even
     // Channels payload
     JsonArray gpios = doc.createNestedArray("channels");
     GpioManager::getInstance().toJson(gpios);
+
+    // Application-Level Command Acknowledgements
+    if (_ackCount > 0) {
+        JsonArray acks = doc.createNestedArray("acks");
+        for (size_t i = 0; i < _ackCount; i++) {
+            JsonObject a = acks.createNestedObject();
+            a["command_uuid"] = _pendingAcks[i].commandUuid;
+            a["success"] = _pendingAcks[i].success;
+            a["status"] = "ACKNOWLEDGED";
+        }
+        _ackCount = 0;
+    }
 }
 
 bool ReceiverClient::sendHttp(const char* eventType, String& outResponse, int& outCode) {
@@ -354,25 +367,35 @@ void ReceiverClient::processServerCommands(const char* response) {
     DeserializationError err = deserializeJson(doc, response);
     if (err) return;
 
-    auto executeCmd = [](JsonObject cmd) {
-        String action = cmd["action"] | "";
-        uint8_t id = cmd["id"] | (uint8_t)(cmd["gpioId"] | 0);
+    auto executeCmd = [this](JsonObject cmd) {
+        String action = cmd["action"] | cmd["command_type"] | "";
+        uint8_t id = cmd["id"] | (uint8_t)(cmd["gpioId"] | (cmd["channel_id"] | 0));
+        String cmdUuid = cmd["command_uuid"] | cmd["commandId"] | "";
 
+        bool success = false;
         if (action.equalsIgnoreCase("setState")) {
             bool state = cmd["state"] | false;
-            GpioManager::getInstance().setState(id, state);
+            success = GpioManager::getInstance().setState(id, state);
             Logger::log(String(F("[RECEIVER] Remote cmd setState ID=")) + String(id) + F(" State=") + String(state));
         } else if (action.equalsIgnoreCase("toggle")) {
-            GpioManager::getInstance().toggle(id);
+            success = GpioManager::getInstance().toggle(id);
             Logger::log(String(F("[RECEIVER] Remote cmd toggle ID=")) + String(id));
         } else if (action.equalsIgnoreCase("pulse")) {
             unsigned long dur = cmd["duration"] | 500;
-            GpioManager::getInstance().pulse(id, dur);
+            success = GpioManager::getInstance().pulse(id, dur);
             Logger::log(String(F("[RECEIVER] Remote cmd pulse ID=")) + String(id));
         } else if (action.equalsIgnoreCase("reboot")) {
             Logger::log(F("[RECEIVER] Remote cmd reboot triggered by central server"));
+            success = true;
             delay(500);
             ESP.restart();
+        }
+
+        if (cmdUuid.length() > 0 && _ackCount < MAX_PENDING_ACKS) {
+            strncpy(_pendingAcks[_ackCount].commandUuid, cmdUuid.c_str(), sizeof(_pendingAcks[_ackCount].commandUuid) - 1);
+            _pendingAcks[_ackCount].commandUuid[sizeof(_pendingAcks[_ackCount].commandUuid) - 1] = '\0';
+            _pendingAcks[_ackCount].success = success;
+            _ackCount++;
         }
     };
 

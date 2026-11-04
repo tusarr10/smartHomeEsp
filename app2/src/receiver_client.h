@@ -85,6 +85,14 @@ private:
     String _lastSyncStatus;
     String _lastServerResponse;
     int _lastStatusCode;
+
+    struct CommandAck {
+        char commandUuid[48];
+        bool success;
+    };
+    static const size_t MAX_PENDING_ACKS = 8;
+    CommandAck _pendingAcks[MAX_PENDING_ACKS];
+    size_t _ackCount;
 };
 
 #endif // RECEIVER_CLIENT_H

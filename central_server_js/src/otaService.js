@@ -281,11 +281,24 @@ class OtaService {
       }
     }
 
-    // Check 3: Flash Space Margin
+    // Check 3: Flash Space Margin & ESP-01 1MB Flash Barrier Guard
+    const flashTotal = Number(diagnostics.flashGeometry.flashSize) || 4194304;
     const freeSpace = diagnostics.flashGeometry.freeSketchSpace;
     const fwSize = fw.file_size_bytes;
     const marginBytes = freeSpace - fwSize;
     const marginKb = Math.round(marginBytes / 1024);
+
+    // Explicit ESP-01 1MB Partition Layout Barrier Check (eagle.flash.1m256.ld)
+    const isOneMbFlash = flashTotal <= 1048576 || (diagnostics.hardware && diagnostics.hardware.includes('ESP-01'));
+    if (isOneMbFlash && fwSize > 293000) {
+      checks.push({
+        id: 'esp01_flash_barrier',
+        title: 'ESP-01 1MB Flash Partition Constraint',
+        status: 'FAIL',
+        details: `CRITICAL: ESP-01 1MB Flash with LittleFS leaves ~286KB for secondary OTA bank. Incoming binary (${(fwSize/1024).toFixed(1)} KB) exceeds OTA limit and will cause OTA_NOT_ENOUGH_SPACE or corrupt LittleFS.`
+      });
+      canProceed = false;
+    }
 
     if (marginBytes > 50000) {
       checks.push({

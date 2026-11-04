@@ -982,6 +982,171 @@ void WebServerManager::registerApiRoutes() {
             }
         }
     });
+
+    // === LITTLEFS FILESYSTEM MANAGEMENT API ===
+    _server.on("/api/fs/list", HTTP_GET, [this]() {
+        if (!checkAuthOrReject()) return;
+
+        DynamicJsonDocument doc(4096);
+        JsonArray files = doc.createNestedArray("files");
+
+        Dir dir = LittleFS.openDir("/");
+        while (dir.next()) {
+            JsonObject f = files.createNestedObject();
+            f["name"] = dir.fileName();
+            f["size"] = dir.fileSize();
+        }
+
+        FSInfo fs_info;
+        if (LittleFS.info(fs_info)) {
+            doc["totalBytes"] = fs_info.totalBytes;
+            doc["usedBytes"] = fs_info.usedBytes;
+            doc["freeBytes"] = (fs_info.totalBytes > fs_info.usedBytes) ? (fs_info.totalBytes - fs_info.usedBytes) : 0;
+            doc["maxPathLength"] = fs_info.maxPathLength;
+        }
+
+        String out;
+        serializeJson(doc, out);
+        _server.send(200, "application/json", out);
+    });
+
+    _server.on("/api/fs/download", HTTP_GET, [this]() {
+        if (!checkAuthOrReject()) return;
+
+        if (!_server.hasArg("path")) {
+            sendJsonResponse(400, false, F("Query parameter 'path' required"));
+            return;
+        }
+
+        String path = _server.arg("path");
+        if (path.indexOf("..") >= 0) {
+            sendJsonResponse(400, false, F("Directory traversal rejected"));
+            return;
+        }
+        if (!path.startsWith("/")) path = "/" + path;
+
+        if (!LittleFS.exists(path)) {
+            sendJsonResponse(404, false, F("File not found on LittleFS"));
+            return;
+        }
+
+        File file = LittleFS.open(path, "r");
+        String filename = path.substring(path.lastIndexOf('/') + 1);
+        _server.sendHeader(F("Content-Disposition"), "attachment; filename=\"" + filename + "\"");
+        _server.sendHeader(F("Cache-Control"), F("no-cache"));
+        _server.streamFile(file, "application/octet-stream");
+        file.close();
+    });
+
+    _server.on("/api/fs/delete", HTTP_POST, [this]() {
+        if (!checkAuthOrReject()) return;
+
+        DynamicJsonDocument doc(256);
+        deserializeJson(doc, _server.arg("plain"));
+        String path = doc["path"] | "";
+
+        if (path.length() == 0 || path.indexOf("..") >= 0) {
+            sendJsonResponse(400, false, F("Invalid or prohibited file path"));
+            return;
+        }
+        if (!path.startsWith("/")) path = "/" + path;
+
+        if (!LittleFS.exists(path)) {
+            sendJsonResponse(404, false, F("File does not exist"));
+            return;
+        }
+
+        if (LittleFS.remove(path)) {
+            Logger::log(String(F("[FS] Deleted file: ")) + path);
+            sendJsonResponse(200, true, F("File deleted successfully"));
+        } else {
+            sendJsonResponse(500, false, F("Failed to delete file from LittleFS"));
+        }
+    });
+
+    _server.on("/api/fs/rename", HTTP_POST, [this]() {
+        if (!checkAuthOrReject()) return;
+
+        DynamicJsonDocument doc(512);
+        deserializeJson(doc, _server.arg("plain"));
+        String oldPath = doc["oldPath"] | "";
+        String newPath = doc["newPath"] | "";
+
+        if (oldPath.length() == 0 || newPath.length() == 0 || oldPath.indexOf("..") >= 0 || newPath.indexOf("..") >= 0) {
+            sendJsonResponse(400, false, F("Invalid file paths"));
+            return;
+        }
+        if (!oldPath.startsWith("/")) oldPath = "/" + oldPath;
+        if (!newPath.startsWith("/")) newPath = "/" + newPath;
+
+        if (!LittleFS.exists(oldPath)) {
+            sendJsonResponse(404, false, F("Source file does not exist"));
+            return;
+        }
+
+        if (LittleFS.rename(oldPath, newPath)) {
+            Logger::log(String(F("[FS] Renamed file: ")) + oldPath + F(" -> ") + newPath);
+            sendJsonResponse(200, true, F("File renamed successfully"));
+        } else {
+            sendJsonResponse(500, false, F("Failed to rename file on LittleFS"));
+        }
+    });
+
+    // === DIRECT COMMAND EXECUTION & ACKNOWLEDGEMENT ===
+    _server.on("/api/commands/execute", HTTP_POST, [this]() {
+        if (!checkAuthOrReject()) return;
+
+        DynamicJsonDocument doc(1024);
+        DeserializationError err = deserializeJson(doc, _server.arg("plain"));
+        if (err) {
+            sendJsonResponse(400, false, F("Invalid JSON command"));
+            return;
+        }
+
+        String cmdId = doc["commandId"] | doc["command_uuid"] | "";
+        String action = doc["action"] | doc["command_type"] | "";
+        uint8_t gpioId = doc["id"] | (uint8_t)(doc["channel_id"] | 0);
+
+        DynamicJsonDocument resp(1024);
+        resp["commandId"] = cmdId;
+        resp["nodeId"] = ReceiverClient::getInstance().getConfig().nodeId;
+        resp["status"] = "ACKNOWLEDGED";
+
+        bool ok = false;
+        if (action.equalsIgnoreCase("reboot")) {
+            resp["success"] = true;
+            resp["message"] = F("Node will restart");
+            String out; serializeJson(resp, out);
+            _server.send(200, "application/json", out);
+            delay(500);
+            ESP.restart();
+            return;
+        } else if (action.equalsIgnoreCase("setState")) {
+            bool state = doc["state"] | false;
+            ok = GpioManager::getInstance().setState(gpioId, state);
+            resp["success"] = ok;
+            resp["state"] = state;
+        } else if (action.equalsIgnoreCase("toggle")) {
+            ok = GpioManager::getInstance().toggle(gpioId);
+            resp["success"] = ok;
+        } else if (action.equalsIgnoreCase("pulse")) {
+            unsigned long dur = doc["duration"] | 500;
+            ok = GpioManager::getInstance().pulse(gpioId, dur);
+            resp["success"] = ok;
+        } else if (action.equalsIgnoreCase("readInfo")) {
+            resp["success"] = true;
+            resp["freeHeap"] = ESP.getFreeHeap();
+            resp["uptimeSec"] = millis() / 1000UL;
+            ok = true;
+        } else {
+            resp["success"] = false;
+            resp["error"] = F("Unknown command action");
+        }
+
+        String out;
+        serializeJson(resp, out);
+        _server.send(ok ? 200 : 400, "application/json", out);
+    });
 }
 
 void WebServerManager::registerStaticRoutes() {

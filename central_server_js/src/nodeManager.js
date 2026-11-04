@@ -1,4 +1,5 @@
 const http = require('node:http');
+const crypto = require('node:crypto');
 
 class NodeManager {
   constructor(db, config) {
@@ -325,6 +326,39 @@ class NodeManager {
       );
     }
 
+    // Process hardware application-level command ACKs returned by ESP node
+    if (Array.isArray(data.acks) && data.acks.length > 0) {
+      for (const ack of data.acks) {
+        const uuid = ack.command_uuid || ack.commandId;
+        if (uuid) {
+          this.db.markCommandAcknowledged(uuid, ack);
+          this.broadcast('command_acknowledged', {
+            command_uuid: uuid,
+            node_id: nodeId,
+            status: ack.status || 'ACKNOWLEDGED',
+            success: ack.success !== false,
+            ack
+          });
+          this.db.logAudit('COMMAND_ACK', nodeId, `Command '${uuid}' acknowledged by node (status: ${ack.status || 'OK'})`);
+        }
+      }
+    }
+
+    // Ingest LittleFS / Flash metrics if present
+    if (data.littlefs_total || data.fs_total || data.flash_size || data.flashSize) {
+      const fsTotal = Number(data.littlefs_total || data.fs_total) || 0;
+      const fsUsed = Number(data.littlefs_used || data.fs_used) || 0;
+      const fsFree = Number(data.littlefs_free || data.fs_free) || (fsTotal - fsUsed);
+      this.db.upsertDeviceCapabilities(nodeId, {
+        littlefs_total_bytes: fsTotal,
+        littlefs_used_bytes: fsUsed,
+        littlefs_free_bytes: fsFree,
+        flash_size_bytes: Number(data.flash_size || data.flashSize) || 4194304,
+        ram_size_bytes: Number(data.freeHeap || data.free_heap) || 81920,
+        mcu_type: data.hardware || data.hardware_type || 'ESP8266'
+      });
+    }
+
     // Live telemetry update broadcast
     this.broadcast('telemetry_update', {
       node_id: nodeId,
@@ -339,15 +373,20 @@ class NodeManager {
       timestamp: data.timestamp
     });
 
-    // Check if commands are queued for this node
-    const pending = this.commandQueues.get(nodeId) || [];
+    // Check both persistent database commands queue and in-memory queue
+    const dbPending = this.db.getPendingCommandsForNode(nodeId, 5);
+    for (const p of dbPending) {
+      this.db.markCommandDelivered(p.command_uuid);
+    }
+    const memPending = this.commandQueues.get(nodeId) || [];
     this.commandQueues.delete(nodeId);
-    return pending;
+
+    return [...dbPending, ...memPending];
   }
 
   // === COMMAND DISPATCH ===
 
-  async dispatchCommand(nodeId, command) {
+  async dispatchCommand(nodeId, command, user = null) {
     const node = this.db.getNode(nodeId);
     if (!node) {
       return { success: false, error: `Node '${nodeId}' not found in fleet` };
@@ -357,7 +396,20 @@ class NodeManager {
     const action = command.action || 'setState';
     const channelId = Number(command.id ?? command.gpioId ?? command.channel_id ?? 0);
 
-    this.db.logAudit('COMMAND_SENT', nodeId, `Dispatched command '${action}' for channel ${channelId}`);
+    const commandUuid = command.command_uuid || command.commandId || crypto.randomUUID();
+    command.command_uuid = commandUuid;
+    command.commandId = commandUuid;
+
+    // Persist command in database
+    this.db.createCommand({
+      command_uuid: commandUuid,
+      node_id: nodeId,
+      user_id: user ? user.id : null,
+      command_type: action,
+      payload: command
+    });
+
+    this.db.logAudit('COMMAND_SENT', nodeId, `Dispatched command '${action}' (UUID: ${commandUuid}) for channel ${channelId}`);
 
     if (action === 'reboot') {
       this.db.logAudit('NODE_REBOOT', nodeId, `Administrator initiated reboot command on node '${node.name}' (${ip})`);
@@ -411,7 +463,14 @@ class NodeManager {
         );
       }
 
+      this.db.markCommandAcknowledged(commandUuid, {
+        success: true,
+        delivery: 'direct_lan_http',
+        message: directMsg || 'OK'
+      });
+
       this.broadcast('command_executed', {
+        command_uuid: commandUuid,
         node_id: nodeId,
         nodeId: nodeId,
         channel_id: channelId,
@@ -421,6 +480,7 @@ class NodeManager {
 
       return {
         success: true,
+        command_uuid: commandUuid,
         delivery: 'direct_lan_http',
         message: 'Command executed instantly via LAN HTTP'
       };
@@ -434,6 +494,7 @@ class NodeManager {
 
     return {
       success: true,
+      command_uuid: commandUuid,
       delivery: 'queued',
       message: `Command queued for next check-in (Direct LAN HTTP: ${directMsg || 'offline'})`
     };
@@ -492,9 +553,15 @@ class NodeManager {
       return { success: res.statusCode === 200, message: res.data || res.error };
     }
 
-    // Standard GPIO State Command
+    // 1. Try unified firmware /api/commands/execute endpoint
     let token = this.nodeAuthTokens.get(ip);
-    let res = await makeRequest('/api/gpio/state', command, token);
+    let res = await makeRequest('/api/commands/execute', command, token);
+    if (res.statusCode === 200) {
+      return { success: true, message: res.data || 'OK' };
+    }
+
+    // 2. Fallback to legacy /api/gpio/state endpoint
+    res = await makeRequest('/api/gpio/state', command, token);
 
     if (res.statusCode === 401) {
       // Authenticate and retry

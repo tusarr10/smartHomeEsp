@@ -1,3 +1,226 @@
+let authToken = localStorage.getItem('smarthome_token') || '';
+let currentUser = null;
+
+async function fetchWithAuth(url, options = {}) {
+  const headers = { ...(options.headers || {}) };
+  if (authToken) {
+    headers['Authorization'] = `Bearer ${authToken}`;
+  }
+  const opts = { ...options, headers };
+  const res = await fetch(url, opts);
+  if (res.status === 401 && !url.includes('/auth/login')) {
+    authToken = '';
+    currentUser = null;
+    localStorage.removeItem('smarthome_token');
+    updateTopbarUserBadge();
+  }
+  return res;
+}
+
+async function checkCurrentUser() {
+  if (!authToken) {
+    // Auto-login with default admin if first time
+    try {
+      const loginRes = await fetch(`${API_BASE}/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'admin', password: 'admin123' })
+      });
+      const data = await loginRes.json();
+      if (data.success && data.token) {
+        authToken = data.token;
+        currentUser = data.user;
+        localStorage.setItem('smarthome_token', authToken);
+        updateTopbarUserBadge();
+        return;
+      }
+    } catch {}
+    updateTopbarUserBadge();
+    return;
+  }
+
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/auth/me`);
+    const data = await res.json();
+    if (data.success && data.user) {
+      currentUser = data.user;
+    } else {
+      currentUser = null;
+      authToken = '';
+      localStorage.removeItem('smarthome_token');
+    }
+  } catch {
+    currentUser = null;
+  }
+  updateTopbarUserBadge();
+}
+
+function updateTopbarUserBadge() {
+  const nameEl = document.getElementById('topbar-username');
+  const roleEl = document.getElementById('topbar-role');
+  if (!nameEl || !roleEl) return;
+
+  if (currentUser) {
+    nameEl.textContent = currentUser.username;
+    const primaryRole = (currentUser.roles && currentUser.roles[0]) || (currentUser.is_superuser ? 'SUPER_ADMIN' : 'USER');
+    roleEl.textContent = primaryRole;
+    roleEl.className = 'status-badge ' + (primaryRole === 'SUPER_ADMIN' ? 'badge-sync' : 'badge-online');
+  } else {
+    nameEl.textContent = 'Sign In';
+    roleEl.textContent = 'GUEST';
+    roleEl.className = 'status-badge badge-offline';
+  }
+}
+
+function handleUserBadgeClick() {
+  if (!currentUser) {
+    showLoginModal();
+    return;
+  }
+
+  const rolesHtml = (currentUser.roles || ['SUPER_ADMIN']).map(r => `<span class="status-badge badge-online" style="margin-right: 4px;">${r}</span>`).join('');
+  const scopesHtml = (currentUser.scopes || []).map(s => `<span class="status-badge badge-sync" style="margin-right: 4px;">${s.name || s.scope_identifier}</span>`).join('') || '<span style="color:var(--text-muted);">GLOBAL</span>';
+
+  openModal(`
+    <div class="modal-card" style="max-width: 480px;">
+      <div class="modal-header">
+        <h3>User Account Details</h3>
+        <button class="modal-close-btn" onclick="closeModal()">&times;</button>
+      </div>
+      <div style="padding: 16px 0;">
+        <div style="display:flex; align-items:center; gap:12px; margin-bottom:16px;">
+          <div style="width:48px; height:48px; border-radius:50%; background:var(--accent-blue); display:flex; align-items:center; justify-content:center; font-size:20px;">👤</div>
+          <div>
+            <h4 style="font-size:16px;">${escapeHtml(currentUser.full_name || currentUser.username)}</h4>
+            <div style="font-size:12.5px; color:var(--text-secondary);">@${escapeHtml(currentUser.username)} ${currentUser.email ? `(${escapeHtml(currentUser.email)})` : ''}</div>
+          </div>
+        </div>
+        <div style="margin-bottom:12px;">
+          <div style="font-size:12px; color:var(--text-muted); margin-bottom:4px;">Assigned Roles:</div>
+          <div>${rolesHtml}</div>
+        </div>
+        <div style="margin-bottom:18px;">
+          <div style="font-size:12px; color:var(--text-muted); margin-bottom:4px;">Resource Scopes:</div>
+          <div>${scopesHtml}</div>
+        </div>
+        <div style="border-top:1px solid var(--border-color); padding-top:14px; margin-top:14px;">
+          <h5 style="margin-bottom:8px;">Change Password</h5>
+          <input type="password" id="modal-old-pwd" placeholder="Current Password" class="input-field" style="margin-bottom:8px; width:100%;">
+          <input type="password" id="modal-new-pwd" placeholder="New Password (min 6 chars)" class="input-field" style="margin-bottom:12px; width:100%;">
+          <button class="btn btn-secondary" onclick="submitPasswordChange()" style="width:100%; margin-bottom:12px;">Update Password</button>
+        </div>
+      </div>
+      <div class="modal-footer" style="display:flex; justify-content:space-between;">
+        <button class="btn btn-danger" onclick="logoutUser()">Sign Out</button>
+        <button class="btn btn-secondary" onclick="closeModal()">Close</button>
+      </div>
+    </div>
+  `);
+}
+
+function showLoginModal() {
+  openModal(`
+    <div class="modal-card" style="max-width: 400px;">
+      <div class="modal-header">
+        <h3>Sign In to SmartHome Platform</h3>
+        <button class="modal-close-btn" onclick="closeModal()">&times;</button>
+      </div>
+      <form onsubmit="handleLoginSubmit(event)" style="padding: 16px 0;">
+        <div style="margin-bottom: 12px;">
+          <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Username</label>
+          <input type="text" id="login-username" value="admin" required class="input-field" style="width:100%;">
+        </div>
+        <div style="margin-bottom: 16px;">
+          <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Password</label>
+          <input type="password" id="login-password" value="admin123" required class="input-field" style="width:100%;">
+        </div>
+        <div id="login-error-msg" style="color:var(--accent-red); font-size:12.5px; margin-bottom:12px; display:none;"></div>
+        <button type="submit" class="btn btn-primary" style="width:100%;">Sign In</button>
+      </form>
+    </div>
+  `);
+}
+
+async function handleLoginSubmit(e) {
+  e.preventDefault();
+  const u = document.getElementById('login-username').value.trim();
+  const p = document.getElementById('login-password').value;
+  const errEl = document.getElementById('login-error-msg');
+
+  try {
+    const res = await fetch(`${API_BASE}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: u, password: p })
+    });
+    const data = await res.json();
+    if (data.success && data.token) {
+      authToken = data.token;
+      currentUser = data.user;
+      localStorage.setItem('smarthome_token', authToken);
+      updateTopbarUserBadge();
+      closeModal();
+      showToast({ title: 'Signed In', message: `Welcome back, ${data.user.full_name || data.user.username}!`, severity: 'SUCCESS' });
+      loadCurrentView();
+    } else {
+      errEl.textContent = data.error || 'Authentication failed';
+      errEl.style.display = 'block';
+    }
+  } catch (err) {
+    errEl.textContent = 'Server connection error';
+    errEl.style.display = 'block';
+  }
+}
+
+async function logoutUser() {
+  try {
+    await fetchWithAuth(`${API_BASE}/auth/logout`, { method: 'POST' });
+  } catch {}
+  authToken = '';
+  currentUser = null;
+  localStorage.removeItem('smarthome_token');
+  updateTopbarUserBadge();
+  closeModal();
+  showToast({ title: 'Signed Out', message: 'You have been signed out.', severity: 'INFO' });
+  loadCurrentView();
+}
+
+async function submitPasswordChange() {
+  const oldPassword = document.getElementById('modal-old-pwd').value;
+  const newPassword = document.getElementById('modal-new-pwd').value;
+  if (!oldPassword || !newPassword) {
+    alert('Both passwords are required');
+    return;
+  }
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/auth/change-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ oldPassword, newPassword })
+    });
+    const data = await res.json();
+    if (data.success) {
+      alert('Password updated successfully! Please sign in again.');
+      logoutUser();
+    } else {
+      alert('Error: ' + data.error);
+    }
+  } catch (err) {
+    alert('Error updating password: ' + err.message);
+  }
+}
+
+function switchView(view) {
+  const item = document.querySelector(`.nav-item[data-view="${view}"]`);
+  if (item) {
+    document.querySelectorAll(".nav-item").forEach(i => i.classList.remove("active"));
+    item.classList.add("active");
+    currentView = view;
+    document.getElementById("view-title").textContent = item.querySelector("span:last-child").textContent;
+    loadCurrentView();
+  }
+}
+
 // --- HELPER UTILITIES ---
 function escapeHtml(str) {
   if (!str) return "";
@@ -106,6 +329,7 @@ let fleetData = {
 // --- INITIALIZATION ---
 document.addEventListener("DOMContentLoaded", () => {
   setupNavigation();
+  checkCurrentUser();
   initWebSocket();
   checkUnreadNotifications();
   loadCurrentView();
@@ -142,6 +366,9 @@ function loadCurrentView() {
     case "events": loadEvents(); break;
     case "notifications": loadNotifications(); break;
     case "network": loadNetwork(); break;
+    case "littlefs": loadLittlefs(); break;
+    case "config-sync": loadConfigSync(); break;
+    case "commands": loadCommands(); break;
     case "users": loadUsers(); break;
     case "database": loadDatabase(); break;
     case "settings": loadSettings(); break;
@@ -213,6 +440,10 @@ function handleLiveEvent(type, data) {
     if (currentView === "overview") refreshActiveMetrics();
   } else if (type === "poll_settings_changed") {
     updateTopbarSyncIndicator(data);
+  } else if (type === "command_executed" || type === "command_acknowledged") {
+    if (currentView === "commands") loadCommands();
+  } else if (type === "config_updated" || type === "config_synced") {
+    if (currentView === "config-sync") loadConfigSync();
   }
 }
 
@@ -1793,16 +2024,1472 @@ async function loadNetwork() {
   `;
 }
 
-// --- 11. USERS ---
+
+// ==============================================================================
+// 11. RBAC & USER ADMINISTRATION CONSOLE
+// ==============================================================================
+let cachedUsers = [];
+let cachedRoles = [];
+let cachedScopes = [];
+
 async function loadUsers() {
   const container = document.getElementById("content-area");
-  container.innerHTML = `
-    <div class="metric-card">
-      <h3>Active Administrator</h3>
-      <p style="margin-top: 8px; color: var(--text-secondary);">User: <strong>admin</strong> | Role: <strong>Administrator</strong></p>
-    </div>
-  `;
+  container.innerHTML = `<div style="text-align:center; padding: 40px; color: var(--text-secondary);">Loading user administration and access control...</div>`;
+
+  try {
+    const [uRes, rRes, sRes] = await Promise.all([
+      fetchWithAuth(`${API_BASE}/admin/users`),
+      fetchWithAuth(`${API_BASE}/admin/roles`),
+      fetchWithAuth(`${API_BASE}/admin/scopes`)
+    ]);
+
+    const uData = await uRes.json();
+    const rData = await rRes.json();
+    const sData = await sRes.json();
+
+    cachedUsers = uData.users || [];
+    cachedRoles = rData.roles || [];
+    cachedScopes = sData.scopes || [];
+
+    const activeCount = cachedUsers.filter(u => u.is_active).length;
+
+    container.innerHTML = `
+      <div style="display: flex; flex-direction: column; gap: 20px;">
+        <!-- Top Stats Banner -->
+        <div class="metrics-grid" style="grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));">
+          <div class="metric-card">
+            <div class="metric-label">Total Users</div>
+            <div class="metric-value">${cachedUsers.length}</div>
+            <div class="metric-sub">${activeCount} Active / ${cachedUsers.length - activeCount} Deactivated</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">System Roles</div>
+            <div class="metric-value">${cachedRoles.length}</div>
+            <div class="metric-sub">Hierarchical RBAC Configured</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Access Scopes</div>
+            <div class="metric-value">${cachedScopes.length}</div>
+            <div class="metric-sub">Location & Device Boundaries</div>
+          </div>
+        </div>
+
+        <!-- Action Toolbar -->
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
+          <h2 style="font-size: 18px; font-weight: 600;">User & Scope Directory</h2>
+          <div style="display: flex; gap: 8px;">
+            <button class="btn btn-primary" onclick="openCreateUserModal()">+ Create New User</button>
+            <button class="btn btn-secondary" onclick="openScopesModal()">🌐 Manage Scopes</button>
+            <button class="btn btn-secondary" onclick="openPermissionsModal()">🛡️ Permissions Matrix</button>
+          </div>
+        </div>
+
+        <!-- Users Table -->
+        <div class="metric-card" style="padding: 0; overflow-x: auto;">
+          <table class="table" style="width: 100%; border-collapse: collapse;">
+            <thead>
+              <tr style="border-bottom: 1px solid var(--border-color); text-align: left; background: rgba(255,255,255,0.02);">
+                <th style="padding: 14px 16px;">User</th>
+                <th style="padding: 14px 16px;">Contact</th>
+                <th style="padding: 14px 16px;">Assigned Roles</th>
+                <th style="padding: 14px 16px;">Resource Scopes</th>
+                <th style="padding: 14px 16px;">Status</th>
+                <th style="padding: 14px 16px; text-align: right;">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${cachedUsers.length === 0 ? '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 30px;">No user accounts found.</td></tr>' : ''}
+              ${cachedUsers.map(u => {
+                const rolesHtml = (u.roles || []).map(r => {
+                  let badgeClass = 'badge-sync';
+                  if (r === 'SUPER_ADMIN') badgeClass = 'badge-offline';
+                  else if (r === 'ADMIN') badgeClass = 'badge-sync';
+                  else if (r === 'OPERATOR') badgeClass = 'badge-online';
+                  return `<span class="status-badge ${badgeClass}" style="margin: 2px;">${escapeHtml(r)}</span>`;
+                }).join('') || '<span style="color:var(--text-muted); font-size:12px;">None</span>';
+
+                const scopesHtml = (u.scopes || []).map(s => {
+                  return `<span class="status-badge badge-sync" style="margin: 2px;">${escapeHtml(s.name || s.scope_identifier)}</span>`;
+                }).join('') || '<span style="color:var(--text-muted); font-size:12px;">GLOBAL</span>';
+
+                return `
+                  <tr style="border-bottom: 1px solid var(--border-color);">
+                    <td style="padding: 14px 16px;">
+                      <div style="display: flex; align-items: center; gap: 10px;">
+                        <span style="font-size: 20px;">${u.is_superuser ? '⭐' : '👤'}</span>
+                        <div>
+                          <div style="font-weight: 600; color: var(--text-primary);">${escapeHtml(u.username)}</div>
+                          <div style="font-size: 12px; color: var(--text-secondary);">${escapeHtml(u.full_name || 'No full name')}</div>
+                        </div>
+                      </div>
+                    </td>
+                    <td style="padding: 14px 16px; font-size: 13px; color: var(--text-secondary);">
+                      ${escapeHtml(u.email || 'N/A')}
+                    </td>
+                    <td style="padding: 14px 16px;">${rolesHtml}</td>
+                    <td style="padding: 14px 16px;">${scopesHtml}</td>
+                    <td style="padding: 14px 16px;">
+                      <span class="status-badge ${u.is_active ? 'badge-online' : 'badge-offline'}">
+                        ${u.is_active ? 'ACTIVE' : 'DEACTIVATED'}
+                      </span>
+                    </td>
+                    <td style="padding: 14px 16px; text-align: right;">
+                      <div style="display: inline-flex; gap: 6px;">
+                        <button class="btn btn-secondary" style="padding: 4px 8px; font-size: 11.5px;" onclick="openEditUserModal(${u.id})">Edit</button>
+                        <button class="btn btn-secondary" style="padding: 4px 8px; font-size: 11.5px;" onclick="openResetPasswordModal(${u.id}, '${escapeHtml(u.username)}')">Password</button>
+                        <button class="btn btn-secondary" style="padding: 4px 8px; font-size: 11.5px;" onclick="revokeUserSessions(${u.id})">Revoke</button>
+                        ${u.username !== 'admin' ? `<button class="btn btn-danger" style="padding: 4px 8px; font-size: 11.5px;" onclick="deleteUser(${u.id}, '${escapeHtml(u.username)}')">Delete</button>` : ''}
+                      </div>
+                    </td>
+                  </tr>
+                `;
+              }).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  } catch (err) {
+    container.innerHTML = `<div class="metric-card" style="color:var(--accent-red);">Error loading user management: ${escapeHtml(err.message)}</div>`;
+  }
 }
+
+function openCreateUserModal() {
+  const rolesCheckboxes = cachedRoles.map(r => `
+    <label style="display: flex; align-items: center; gap: 6px; font-size: 12.5px; cursor: pointer;">
+      <input type="checkbox" name="user_role" value="${r.name}" ${r.name === 'OPERATOR' ? 'checked' : ''}>
+      <span>${r.name}</span>
+    </label>
+  `).join('');
+
+  const scopesOptions = cachedScopes.map(s => `
+    <option value="${s.id}">[${s.scope_type}] ${s.name} (${s.scope_identifier})</option>
+  `).join('');
+
+  openModal(`
+    <div class="modal-card" style="max-width: 520px;">
+      <div class="modal-header">
+        <h3>Create New User Account</h3>
+        <button class="modal-close-btn" onclick="closeModal()">&times;</button>
+      </div>
+      <form onsubmit="handleCreateUserSubmit(event)" style="padding: 16px 0;">
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px;">
+          <div>
+            <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Username *</label>
+            <input type="text" id="new-user-name" required class="input-field" style="width:100%;">
+          </div>
+          <div>
+            <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Initial Password *</label>
+            <input type="password" id="new-user-pwd" required minlength="6" class="input-field" style="width:100%;">
+          </div>
+        </div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px;">
+          <div>
+            <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Full Name</label>
+            <input type="text" id="new-user-fullname" class="input-field" style="width:100%;">
+          </div>
+          <div>
+            <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Email</label>
+            <input type="email" id="new-user-email" class="input-field" style="width:100%;">
+          </div>
+        </div>
+
+        <div style="margin-bottom: 14px;">
+          <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Assign Roles *</label>
+          <div style="display: flex; flex-wrap: wrap; gap: 12px; background: rgba(0,0,0,0.2); padding: 10px; border-radius: 8px;">
+            ${rolesCheckboxes}
+          </div>
+        </div>
+
+        <div style="margin-bottom: 14px;">
+          <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Assign Scope (Optional)</label>
+          <select id="new-user-scopes" multiple class="input-field" style="width:100%; height: 80px;">
+            ${scopesOptions}
+          </select>
+          <small style="color:var(--text-muted); font-size:11px;">Hold Ctrl/Cmd to select multiple scopes</small>
+        </div>
+
+        <div style="margin-bottom: 16px;">
+          <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer;">
+            <input type="checkbox" id="new-user-superuser">
+            <span>Grant Superuser / Master Ownership</span>
+          </label>
+        </div>
+
+        <div style="display: flex; justify-content: flex-end; gap: 10px;">
+          <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+          <button type="submit" class="btn btn-primary">Create User</button>
+        </div>
+      </form>
+    </div>
+  `);
+}
+
+async function handleCreateUserSubmit(e) {
+  e.preventDefault();
+  const username = document.getElementById('new-user-name').value.trim();
+  const password = document.getElementById('new-user-pwd').value;
+  const full_name = document.getElementById('new-user-fullname').value.trim();
+  const email = document.getElementById('new-user-email').value.trim();
+  const is_superuser = document.getElementById('new-user-superuser').checked;
+
+  const roleBoxes = document.querySelectorAll('input[name="user_role"]:checked');
+  const role_names = Array.from(roleBoxes).map(b => b.value);
+
+  const scopeSelect = document.getElementById('new-user-scopes');
+  const scope_ids = Array.from(scopeSelect.selectedOptions).map(o => Number(o.value));
+
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/admin/users`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password, full_name, email, is_superuser, role_names, scope_ids })
+    });
+    const data = await res.json();
+    if (data.success) {
+      closeModal();
+      showToast({ title: 'User Created', message: `User '${username}' created successfully`, severity: 'SUCCESS' });
+      loadUsers();
+    } else {
+      alert('Error creating user: ' + data.error);
+    }
+  } catch (err) {
+    alert('Server error: ' + err.message);
+  }
+}
+
+function openEditUserModal(userId) {
+  const user = cachedUsers.find(u => u.id === userId);
+  if (!user) return;
+
+  const userRoleNames = user.roles || [];
+  const userScopeIds = (user.scopes || []).map(s => s.id);
+
+  const rolesCheckboxes = cachedRoles.map(r => `
+    <label style="display: flex; align-items: center; gap: 6px; font-size: 12.5px; cursor: pointer;">
+      <input type="checkbox" name="edit_user_role" value="${r.name}" ${userRoleNames.includes(r.name) ? 'checked' : ''}>
+      <span>${r.name}</span>
+    </label>
+  `).join('');
+
+  const scopesOptions = cachedScopes.map(s => `
+    <option value="${s.id}" ${userScopeIds.includes(s.id) ? 'selected' : ''}>[${s.scope_type}] ${s.name} (${s.scope_identifier})</option>
+  `).join('');
+
+  openModal(`
+    <div class="modal-card" style="max-width: 500px;">
+      <div class="modal-header">
+        <h3>Edit User: ${escapeHtml(user.username)}</h3>
+        <button class="modal-close-btn" onclick="closeModal()">&times;</button>
+      </div>
+      <form onsubmit="handleEditUserSubmit(event, ${userId})" style="padding: 16px 0;">
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px;">
+          <div>
+            <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Full Name</label>
+            <input type="text" id="edit-user-fullname" value="${escapeHtml(user.full_name || '')}" class="input-field" style="width:100%;">
+          </div>
+          <div>
+            <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Email</label>
+            <input type="email" id="edit-user-email" value="${escapeHtml(user.email || '')}" class="input-field" style="width:100%;">
+          </div>
+        </div>
+
+        <div style="margin-bottom: 14px;">
+          <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:6px;">Assigned Roles</label>
+          <div style="display: flex; flex-wrap: wrap; gap: 12px; background: rgba(0,0,0,0.2); padding: 10px; border-radius: 8px;">
+            ${rolesCheckboxes}
+          </div>
+        </div>
+
+        <div style="margin-bottom: 14px;">
+          <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Assigned Scopes</label>
+          <select id="edit-user-scopes" multiple class="input-field" style="width:100%; height: 80px;">
+            ${scopesOptions}
+          </select>
+        </div>
+
+        <div style="margin-bottom: 16px; display: flex; gap: 20px;">
+          <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer;">
+            <input type="checkbox" id="edit-user-active" ${user.is_active ? 'checked' : ''}>
+            <span>Account Active</span>
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer;">
+            <input type="checkbox" id="edit-user-superuser" ${user.is_superuser ? 'checked' : ''}>
+            <span>Superuser Authority</span>
+          </label>
+        </div>
+
+        <div style="display: flex; justify-content: flex-end; gap: 10px;">
+          <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save Changes</button>
+        </div>
+      </form>
+    </div>
+  `);
+}
+
+async function handleEditUserSubmit(e, userId) {
+  e.preventDefault();
+  const full_name = document.getElementById('edit-user-fullname').value.trim();
+  const email = document.getElementById('edit-user-email').value.trim();
+  const is_active = document.getElementById('edit-user-active').checked;
+  const is_superuser = document.getElementById('edit-user-superuser').checked;
+
+  const roleBoxes = document.querySelectorAll('input[name="edit_user_role"]:checked');
+  const role_names = Array.from(roleBoxes).map(b => b.value);
+
+  const scopeSelect = document.getElementById('edit-user-scopes');
+  const scope_ids = Array.from(scopeSelect.selectedOptions).map(o => Number(o.value));
+
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/admin/users/${userId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ full_name, email, is_active, is_superuser, role_names, scope_ids })
+    });
+    const data = await res.json();
+    if (data.success) {
+      closeModal();
+      showToast({ title: 'User Updated', message: 'User account updated successfully', severity: 'SUCCESS' });
+      loadUsers();
+    } else {
+      alert('Error: ' + data.error);
+    }
+  } catch (err) {
+    alert('Server error: ' + err.message);
+  }
+}
+
+function openResetPasswordModal(userId, username) {
+  openModal(`
+    <div class="modal-card" style="max-width: 400px;">
+      <div class="modal-header">
+        <h3>Reset Password: ${username}</h3>
+        <button class="modal-close-btn" onclick="closeModal()">&times;</button>
+      </div>
+      <form onsubmit="handleResetPasswordSubmit(event, ${userId})" style="padding: 16px 0;">
+        <div style="margin-bottom: 16px;">
+          <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">New Password (min 6 characters)</label>
+          <input type="password" id="reset-user-pwd" required minlength="6" class="input-field" style="width:100%;">
+        </div>
+        <div style="display: flex; justify-content: flex-end; gap: 10px;">
+          <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+          <button type="submit" class="btn btn-primary">Reset Password</button>
+        </div>
+      </form>
+    </div>
+  `);
+}
+
+async function handleResetPasswordSubmit(e, userId) {
+  e.preventDefault();
+  const newPassword = document.getElementById('reset-user-pwd').value;
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/admin/users/${userId}/password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ newPassword })
+    });
+    const data = await res.json();
+    if (data.success) {
+      closeModal();
+      showToast({ title: 'Password Reset', message: 'Password updated and sessions revoked', severity: 'SUCCESS' });
+    } else {
+      alert('Error: ' + data.error);
+    }
+  } catch (err) {
+    alert('Server error: ' + err.message);
+  }
+}
+
+async function revokeUserSessions(userId) {
+  if (!confirm('Revoke all active sessions for this user? They will be forced to log in again.')) return;
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/admin/users/${userId}/revoke-sessions`, { method: 'POST' });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: 'Sessions Revoked', message: 'All active sessions terminated', severity: 'INFO' });
+    }
+  } catch (err) {
+    alert('Error: ' + err.message);
+  }
+}
+
+async function deleteUser(userId, username) {
+  if (!confirm(`Are you sure you want to permanently delete user '${username}'?`)) return;
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/admin/users/${userId}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: 'User Deleted', message: `User '${username}' removed`, severity: 'WARNING' });
+      loadUsers();
+    } else {
+      alert('Error: ' + data.error);
+    }
+  } catch (err) {
+    alert('Error: ' + err.message);
+  }
+}
+
+function openScopesModal() {
+  const scopesListHtml = cachedScopes.map(s => `
+    <tr style="border-bottom: 1px solid var(--border-color);">
+      <td style="padding: 10px 12px;"><strong>${escapeHtml(s.name)}</strong></td>
+      <td style="padding: 10px 12px;"><span class="status-badge badge-sync">${escapeHtml(s.scope_type)}</span></td>
+      <td style="padding: 10px 12px;"><code>${escapeHtml(s.scope_identifier)}</code></td>
+      <td style="padding: 10px 12px; font-size:12px; color:var(--text-secondary);">${escapeHtml(s.description || '')}</td>
+      <td style="padding: 10px 12px; text-align:right;">
+        ${s.scope_identifier !== 'global' ? `<button class="btn btn-danger" style="padding:3px 7px; font-size:11px;" onclick="deleteScope(${s.id})">Delete</button>` : '<span style="font-size:11px; color:var(--text-muted);">Master</span>'}
+      </td>
+    </tr>
+  `).join('');
+
+  openModal(`
+    <div class="modal-card" style="max-width: 650px;">
+      <div class="modal-header">
+        <h3>Hierarchical Scope Boundaries</h3>
+        <button class="modal-close-btn" onclick="closeModal()">&times;</button>
+      </div>
+      <div style="padding: 14px 0;">
+        <table class="table" style="width: 100%; border-collapse: collapse; margin-bottom: 18px;">
+          <thead>
+            <tr style="border-bottom: 1px solid var(--border-color); text-align: left; background: rgba(255,255,255,0.02);">
+              <th style="padding: 8px 12px;">Name</th>
+              <th style="padding: 8px 12px;">Type</th>
+              <th style="padding: 8px 12px;">Identifier</th>
+              <th style="padding: 8px 12px;">Description</th>
+              <th style="padding: 8px 12px; text-align: right;">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${scopesListHtml}
+          </tbody>
+        </table>
+
+        <div style="border-top: 1px solid var(--border-color); padding-top: 14px;">
+          <h4 style="font-size: 14px; margin-bottom: 10px;">+ Create New Scope</h4>
+          <form onsubmit="handleCreateScopeSubmit(event)" style="display: grid; grid-template-columns: 140px 140px 1fr auto; gap: 8px;">
+            <select id="new-scope-type" class="input-field">
+              <option value="ROOM">ROOM</option>
+              <option value="LOCATION">LOCATION</option>
+              <option value="BUILDING">BUILDING</option>
+              <option value="FLOOR">FLOOR</option>
+              <option value="DEVICE_GROUP">DEVICE_GROUP</option>
+              <option value="INDIVIDUAL_DEVICE">INDIVIDUAL_DEVICE</option>
+            </select>
+            <input type="text" id="new-scope-ident" placeholder="Identifier (e.g. kitchen)" required class="input-field">
+            <input type="text" id="new-scope-name" placeholder="Scope Name" required class="input-field">
+            <button type="submit" class="btn btn-primary" style="padding: 6px 14px;">Add</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  `);
+}
+
+async function handleCreateScopeSubmit(e) {
+  e.preventDefault();
+  const scope_type = document.getElementById('new-scope-type').value;
+  const scope_identifier = document.getElementById('new-scope-ident').value.trim();
+  const name = document.getElementById('new-scope-name').value.trim();
+
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/admin/scopes`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope_type, scope_identifier, name, description: `${scope_type} scope for ${name}` })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: 'Scope Created', message: `Scope '${name}' created`, severity: 'SUCCESS' });
+      closeModal();
+      loadUsers();
+    } else {
+      alert('Error: ' + data.error);
+    }
+  } catch (err) {
+    alert('Server error: ' + err.message);
+  }
+}
+
+async function deleteScope(scopeId) {
+  if (!confirm('Delete this scope? Any user assignments to this scope will be unlinked.')) return;
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/admin/scopes/${scopeId}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: 'Scope Deleted', message: 'Scope removed', severity: 'INFO' });
+      closeModal();
+      loadUsers();
+    } else {
+      alert('Error: ' + data.error);
+    }
+  } catch (err) {
+    alert('Server error: ' + err.message);
+  }
+}
+
+function openPermissionsModal() {
+  const rolesHtml = cachedRoles.map(r => `
+    <div style="margin-bottom: 16px; background: rgba(0,0,0,0.2); padding: 12px; border-radius: 8px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+        <strong style="color: var(--accent-blue); font-size: 14px;">${r.name}</strong>
+        <span style="font-size: 11.5px; color: var(--text-muted);">${(r.permissions || []).length} permissions</span>
+      </div>
+      <div style="font-size: 12px; color: var(--text-secondary); margin-bottom: 8px;">${escapeHtml(r.description || '')}</div>
+      <div style="display: flex; flex-wrap: wrap; gap: 4px;">
+        ${(r.permissions || []).map(p => `<span class="status-badge badge-sync" style="font-size: 10.5px;">${p}</span>`).join('')}
+      </div>
+    </div>
+  `).join('');
+
+  openModal(`
+    <div class="modal-card" style="max-width: 620px; max-height: 85vh; overflow-y: auto;">
+      <div class="modal-header">
+        <h3>Role & Permission Matrix</h3>
+        <button class="modal-close-btn" onclick="closeModal()">&times;</button>
+      </div>
+      <div style="padding: 14px 0;">
+        ${rolesHtml}
+      </div>
+    </div>
+  `);
+}
+
+// ==============================================================================
+// 12. LITTLEFS FILESYSTEM MANAGER VIEW
+// ==============================================================================
+let selectedFsNodeId = null;
+let currentFsData = null;
+
+async function loadLittlefs() {
+  const container = document.getElementById("content-area");
+  container.innerHTML = `<div style="text-align:center; padding: 40px; color: var(--text-secondary);">Loading LittleFS filesystem manager...</div>`;
+
+  try {
+    const nodesRes = await fetchWithAuth(`${API_BASE}/nodes`);
+    const nodes = await nodesRes.json();
+
+    if (!Array.isArray(nodes) || nodes.length === 0) {
+      container.innerHTML = `<div class="metric-card"><h3>No Devices Found</h3><p style="color:var(--text-muted); margin-top:8px;">No IoT nodes registered in fleet.</p></div>`;
+      return;
+    }
+
+    if (!selectedFsNodeId || !nodes.find(n => n.node_id === selectedFsNodeId)) {
+      const onlineNode = nodes.find(n => n.is_online) || nodes[0];
+      selectedFsNodeId = onlineNode.node_id;
+    }
+
+    const nodeOptions = nodes.map(n => `
+      <option value="${n.node_id}" ${n.node_id === selectedFsNodeId ? 'selected' : ''}>
+        ${escapeHtml(n.name)} (${n.ip || 'Offline'}) - ${n.is_online ? '🟢 Online' : '🔴 Offline'}
+      </option>
+    `).join('');
+
+    container.innerHTML = `
+      <div style="display: flex; flex-direction: column; gap: 20px;">
+        <!-- Top Toolbar & Node Selector -->
+        <div class="metric-card" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;">
+          <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+            <label style="font-weight: 600; font-size: 14px;">Target Device:</label>
+            <select id="littlefs-node-select" class="input-field" onchange="handleLittlefsNodeChange(this.value)" style="min-width: 280px;">
+              ${nodeOptions}
+            </select>
+          </div>
+          <div style="display: flex; gap: 8px;">
+            <button class="btn btn-primary" onclick="refreshLittlefsList()">🔄 Refresh Files</button>
+            <button class="btn btn-secondary" onclick="openUploadFsModal()">📤 Upload File</button>
+            <button class="btn btn-secondary" onclick="triggerLittlefsBackup()">💾 Backup Partition</button>
+            <button class="btn btn-secondary" onclick="openFsBackupsHistoryModal()">📜 Backups History</button>
+          </div>
+        </div>
+
+        <!-- Filesystem Storage Metrics & Files Container -->
+        <div id="littlefs-details-container">
+          <div style="text-align: center; padding: 30px; color: var(--text-secondary);">Querying node LittleFS partition...</div>
+        </div>
+      </div>
+    `;
+
+    await refreshLittlefsList();
+  } catch (err) {
+    container.innerHTML = `<div class="metric-card" style="color:var(--accent-red);">Failed to initialize LittleFS Manager: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function handleLittlefsNodeChange(val) {
+  selectedFsNodeId = val;
+  refreshLittlefsList();
+}
+
+async function refreshLittlefsList() {
+  const detailsEl = document.getElementById('littlefs-details-container');
+  if (!detailsEl || !selectedFsNodeId) return;
+
+  detailsEl.innerHTML = `<div style="text-align: center; padding: 30px; color: var(--text-secondary);">Reading filesystem structure from node...</div>`;
+
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/nodes/${selectedFsNodeId}/fs`);
+    const data = await res.json();
+
+    if (!data.success) {
+      detailsEl.innerHTML = `
+        <div class="metric-card" style="border-left: 4px solid var(--accent-red);">
+          <h3 style="color: var(--accent-red);">Filesystem Query Failed</h3>
+          <p style="margin-top: 6px; color: var(--text-secondary);">${escapeHtml(data.error || 'Microcontroller was unresponsive')}</p>
+        </div>
+      `;
+      return;
+    }
+
+    currentFsData = data;
+    const totalKb = (data.totalBytes / 1024).toFixed(1);
+    const usedKb = (data.usedBytes / 1024).toFixed(1);
+    const freeKb = (data.freeBytes / 1024).toFixed(1);
+    const usedPercent = data.usedPercent || 0;
+
+    let barColor = 'var(--accent-green)';
+    if (usedPercent > 80) barColor = 'var(--accent-red)';
+    else if (usedPercent > 60) barColor = 'var(--accent-amber)';
+
+    detailsEl.innerHTML = `
+      <!-- Storage Metrics Cards -->
+      <div class="metrics-grid" style="grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); margin-bottom: 20px;">
+        <div class="metric-card">
+          <div class="metric-label">Total LittleFS Capacity</div>
+          <div class="metric-value">${totalKb} KB</div>
+          <div class="metric-sub">${data.totalBytes} bytes allocated</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Used Space</div>
+          <div class="metric-value" style="color:${barColor}">${usedKb} KB</div>
+          <div class="metric-sub">${usedPercent}% of filesystem capacity</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Available Free Space</div>
+          <div class="metric-value">${freeKb} KB</div>
+          <div class="metric-sub">${data.files.length} active files stored</div>
+        </div>
+      </div>
+
+      <!-- Capacity Gauge -->
+      <div class="metric-card" style="margin-bottom: 20px; padding: 14px 20px;">
+        <div style="display: flex; justify-content: space-between; font-size: 12.5px; color: var(--text-secondary); margin-bottom: 6px;">
+          <span>Partition Utilization</span>
+          <span>${usedKb} KB / ${totalKb} KB (${usedPercent}%)</span>
+        </div>
+        <div style="height: 10px; background: rgba(255,255,255,0.06); border-radius: 6px; overflow: hidden;">
+          <div style="height: 100%; width: ${usedPercent}%; background: ${barColor}; border-radius: 6px; transition: width 0.3s ease;"></div>
+        </div>
+      </div>
+
+      <!-- Files Table -->
+      <div class="metric-card" style="padding: 0; overflow-x: auto;">
+        <div style="padding: 16px 20px; border-bottom: 1px solid var(--border-color); display:flex; justify-content:space-between; align-items:center;">
+          <h3 style="font-size: 15px;">Filesystem Files (${data.files.length})</h3>
+          <span style="font-size: 12px; color: var(--text-muted);">Root: /</span>
+        </div>
+        <table class="table" style="width: 100%; border-collapse: collapse;">
+          <thead>
+            <tr style="border-bottom: 1px solid var(--border-color); text-align: left; background: rgba(255,255,255,0.02);">
+              <th style="padding: 12px 18px;">File Name & Path</th>
+              <th style="padding: 12px 18px;">File Size</th>
+              <th style="padding: 12px 18px; text-align: right;">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${data.files.length === 0 ? '<tr><td colspan="3" style="text-align: center; color: var(--text-muted); padding: 30px;">LittleFS filesystem is empty.</td></tr>' : ''}
+            ${data.files.map(f => `
+              <tr style="border-bottom: 1px solid var(--border-color);">
+                <td style="padding: 12px 18px;">
+                  <span style="margin-right: 8px;">📄</span>
+                  <strong>${escapeHtml(f.path)}</strong>
+                </td>
+                <td style="padding: 12px 18px; font-size: 13px; color: var(--text-secondary);">
+                  ${(f.size / 1024).toFixed(2)} KB (${f.size} B)
+                </td>
+                <td style="padding: 12px 18px; text-align: right;">
+                  <div style="display: inline-flex; gap: 6px;">
+                    <a href="${API_BASE}/nodes/${selectedFsNodeId}/fs/download?path=${encodeURIComponent(f.path)}" download="${escapeHtml(f.name)}" class="btn btn-secondary" style="padding: 4px 10px; font-size: 12px; text-decoration: none;">Download</a>
+                    <button class="btn btn-secondary" style="padding: 4px 10px; font-size: 12px;" onclick="openRenameFsModal('${escapeHtml(f.path)}')">Rename</button>
+                    <button class="btn btn-danger" style="padding: 4px 10px; font-size: 12px;" onclick="deleteFsFile('${escapeHtml(f.path)}')">Delete</button>
+                  </div>
+                </td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    `;
+  } catch (err) {
+    detailsEl.innerHTML = `<div class="metric-card" style="color:var(--accent-red);">Error: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function openUploadFsModal() {
+  openModal(`
+    <div class="modal-card" style="max-width: 440px;">
+      <div class="modal-header">
+        <h3>Upload File to LittleFS</h3>
+        <button class="modal-close-btn" onclick="closeModal()">&times;</button>
+      </div>
+      <form onsubmit="handleFsUploadSubmit(event)" style="padding: 16px 0;">
+        <div style="margin-bottom: 14px;">
+          <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Target Directory</label>
+          <input type="text" id="fs-upload-dir" value="/" class="input-field" style="width:100%;">
+        </div>
+        <div style="margin-bottom: 16px;">
+          <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Choose File</label>
+          <input type="file" id="fs-upload-file" required class="input-field" style="width:100%;">
+        </div>
+        <div id="fs-upload-status" style="display:none; font-size:12.5px; margin-bottom:12px;"></div>
+        <div style="display: flex; justify-content: flex-end; gap: 10px;">
+          <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+          <button type="submit" id="fs-upload-btn" class="btn btn-primary">Upload</button>
+        </div>
+      </form>
+    </div>
+  `);
+}
+
+async function handleFsUploadSubmit(e) {
+  e.preventDefault();
+  const fileInput = document.getElementById('fs-upload-file');
+  const dir = document.getElementById('fs-upload-dir').value.trim();
+  const statusEl = document.getElementById('fs-upload-status');
+  const btn = document.getElementById('fs-upload-btn');
+
+  if (!fileInput.files || fileInput.files.length === 0) return;
+  const file = fileInput.files[0];
+
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('dir', dir);
+
+  btn.disabled = true;
+  statusEl.style.display = 'block';
+  statusEl.style.color = 'var(--text-secondary)';
+  statusEl.textContent = 'Streaming file to node LittleFS...';
+
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/nodes/${selectedFsNodeId}/fs/upload`, {
+      method: 'POST',
+      body: formData
+    });
+    const data = await res.json();
+    if (data.success) {
+      closeModal();
+      showToast({ title: 'Uploaded to LittleFS', message: `Successfully uploaded '${data.path}'`, severity: 'SUCCESS' });
+      refreshLittlefsList();
+    } else {
+      statusEl.style.color = 'var(--accent-red)';
+      statusEl.textContent = 'Upload failed: ' + data.error;
+      btn.disabled = false;
+    }
+  } catch (err) {
+    statusEl.style.color = 'var(--accent-red)';
+    statusEl.textContent = 'Network error: ' + err.message;
+    btn.disabled = false;
+  }
+}
+
+function openRenameFsModal(oldPath) {
+  openModal(`
+    <div class="modal-card" style="max-width: 420px;">
+      <div class="modal-header">
+        <h3>Rename File</h3>
+        <button class="modal-close-btn" onclick="closeModal()">&times;</button>
+      </div>
+      <form onsubmit="handleFsRenameSubmit(event, '${escapeHtml(oldPath)}')" style="padding: 16px 0;">
+        <div style="margin-bottom: 12px;">
+          <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Current Path</label>
+          <input type="text" value="${escapeHtml(oldPath)}" disabled class="input-field" style="width:100%;">
+        </div>
+        <div style="margin-bottom: 16px;">
+          <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">New Path</label>
+          <input type="text" id="fs-rename-new" value="${escapeHtml(oldPath)}" required class="input-field" style="width:100%;">
+        </div>
+        <div style="display: flex; justify-content: flex-end; gap: 10px;">
+          <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+          <button type="submit" class="btn btn-primary">Rename</button>
+        </div>
+      </form>
+    </div>
+  `);
+}
+
+async function handleFsRenameSubmit(e, oldPath) {
+  e.preventDefault();
+  const newPath = document.getElementById('fs-rename-new').value.trim();
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/nodes/${selectedFsNodeId}/fs/rename`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ oldPath, newPath })
+    });
+    const data = await res.json();
+    if (data.success) {
+      closeModal();
+      showToast({ title: 'File Renamed', message: `Renamed to '${newPath}'`, severity: 'SUCCESS' });
+      refreshLittlefsList();
+    } else {
+      alert('Rename failed: ' + data.error);
+    }
+  } catch (err) {
+    alert('Server error: ' + err.message);
+  }
+}
+
+async function deleteFsFile(filePath) {
+  if (!confirm(`Are you sure you want to permanently delete '${filePath}' from LittleFS?`)) return;
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/nodes/${selectedFsNodeId}/fs/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: filePath })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: 'Deleted from LittleFS', message: `Deleted '${filePath}'`, severity: 'WARNING' });
+      refreshLittlefsList();
+    } else {
+      alert('Delete failed: ' + data.error);
+    }
+  } catch (err) {
+    alert('Server error: ' + err.message);
+  }
+}
+
+async function triggerLittlefsBackup() {
+  if (!confirm('Create a complete LittleFS backup archive on the master server?')) return;
+  showToast({ title: 'Creating Backup', message: 'Downloading files & calculating SHA-256 manifest...', severity: 'INFO' });
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/nodes/${selectedFsNodeId}/fs/backup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ backupType: 'MANUAL' })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: 'Backup Complete', message: `Archived ${data.fileCount} files (${(data.totalBytes/1024).toFixed(1)} KB)`, severity: 'SUCCESS' });
+    } else {
+      alert('Backup failed: ' + data.error);
+    }
+  } catch (err) {
+    alert('Backup error: ' + err.message);
+  }
+}
+
+async function openFsBackupsHistoryModal() {
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/nodes/${selectedFsNodeId}/fs/backups`);
+    const data = await res.json();
+    const backups = data.backups || [];
+
+    const rows = backups.map(b => `
+      <tr style="border-bottom: 1px solid var(--border-color);">
+        <td style="padding: 10px 12px; font-size:12px;">${new Date(b.created_at).toLocaleString()}</td>
+        <td style="padding: 10px 12px;"><span class="status-badge badge-sync">${b.backup_type}</span></td>
+        <td style="padding: 10px 12px;">${b.file_count} files</td>
+        <td style="padding: 10px 12px; font-size:12px;">${(b.total_bytes / 1024).toFixed(1)} KB</td>
+        <td style="padding: 10px 12px; font-family:monospace; font-size:11px;">${(b.sha256_checksum || '').substring(0, 10)}...</td>
+      </tr>
+    `).join('');
+
+    openModal(`
+      <div class="modal-card" style="max-width: 600px;">
+        <div class="modal-header">
+          <h3>LittleFS Backup Archives</h3>
+          <button class="modal-close-btn" onclick="closeModal()">&times;</button>
+        </div>
+        <div style="padding: 14px 0;">
+          <table class="table" style="width: 100%; border-collapse: collapse;">
+            <thead>
+              <tr style="border-bottom: 1px solid var(--border-color); text-align: left; background: rgba(255,255,255,0.02);">
+                <th style="padding: 8px 12px;">Timestamp</th>
+                <th style="padding: 8px 12px;">Type</th>
+                <th style="padding: 8px 12px;">Files</th>
+                <th style="padding: 8px 12px;">Size</th>
+                <th style="padding: 8px 12px;">Checksum</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${backups.length === 0 ? '<tr><td colspan="5" style="text-align: center; color: var(--text-muted); padding: 20px;">No LittleFS backups created yet.</td></tr>' : rows}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `);
+  } catch (err) {
+    alert('Error fetching backups: ' + err.message);
+  }
+}
+
+// ==============================================================================
+// 13. DEVICE CONFIGURATION & SYNCHRONIZATION ENGINE VIEW
+// ==============================================================================
+let selectedConfigNodeId = null;
+let currentDeviceConfig = null;
+
+async function loadConfigSync() {
+  const container = document.getElementById("content-area");
+  container.innerHTML = `<div style="text-align:center; padding: 40px; color: var(--text-secondary);">Loading configuration & sync center...</div>`;
+
+  try {
+    const nodesRes = await fetchWithAuth(`${API_BASE}/nodes`);
+    const nodes = await nodesRes.json();
+
+    if (!Array.isArray(nodes) || nodes.length === 0) {
+      container.innerHTML = `<div class="metric-card"><h3>No Devices Found</h3></div>`;
+      return;
+    }
+
+    if (!selectedConfigNodeId || !nodes.find(n => n.node_id === selectedConfigNodeId)) {
+      const onlineNode = nodes.find(n => n.is_online) || nodes[0];
+      selectedConfigNodeId = onlineNode.node_id;
+    }
+
+    const nodeOptions = nodes.map(n => `
+      <option value="${n.node_id}" ${n.node_id === selectedConfigNodeId ? 'selected' : ''}>
+        ${escapeHtml(n.name)} (${n.ip || 'Offline'}) - ${n.is_online ? '🟢 Online' : '🔴 Offline'}
+      </option>
+    `).join('');
+
+    container.innerHTML = `
+      <div style="display: flex; flex-direction: column; gap: 20px;">
+        <!-- Top Toolbar & Node Selector -->
+        <div class="metric-card" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;">
+          <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+            <label style="font-weight: 600; font-size: 14px;">Target Device:</label>
+            <select id="config-node-select" class="input-field" onchange="handleConfigNodeChange(this.value)" style="min-width: 280px;">
+              ${nodeOptions}
+            </select>
+          </div>
+          <div style="display: flex; gap: 8px;">
+            <button class="btn btn-primary" onclick="triggerConfigPush()">🚀 Push & Sync to Node</button>
+            <button class="btn btn-secondary" onclick="saveAuthoritativeConfig()">💾 Save Changes</button>
+            <button class="btn btn-secondary" onclick="openConfigVersionsModal()">📜 Version History & Rollback</button>
+          </div>
+        </div>
+
+        <!-- Config Details Card & JSON Editor -->
+        <div id="config-details-container">
+          <div style="text-align: center; padding: 30px; color: var(--text-secondary);">Loading authoritative device configuration...</div>
+        </div>
+      </div>
+    `;
+
+    await refreshConfigDetails();
+  } catch (err) {
+    container.innerHTML = `<div class="metric-card" style="color:var(--accent-red);">Failed to initialize Config Sync: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function handleConfigNodeChange(val) {
+  selectedConfigNodeId = val;
+  refreshConfigDetails();
+}
+
+async function refreshConfigDetails() {
+  const container = document.getElementById('config-details-container');
+  if (!container || !selectedConfigNodeId) return;
+
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/nodes/${selectedConfigNodeId}/config`);
+    const data = await res.json();
+
+    if (!data.success) {
+      container.innerHTML = `<div class="metric-card" style="color:var(--accent-red);">Error: ${escapeHtml(data.error)}</div>`;
+      return;
+    }
+
+    currentDeviceConfig = data.configuration;
+    const c = currentDeviceConfig;
+
+    let statusBadge = 'badge-online';
+    if (c.sync_status === 'PENDING') statusBadge = 'badge-sync';
+    else if (c.sync_status === 'SYNCING') statusBadge = 'badge-sync';
+    else if (c.sync_status === 'FAILED') statusBadge = 'badge-offline';
+    else if (c.sync_status === 'OFFLINE') statusBadge = 'badge-offline';
+
+    container.innerHTML = `
+      <!-- Status Cards Grid -->
+      <div class="metrics-grid" style="grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); margin-bottom: 20px;">
+        <div class="metric-card">
+          <div class="metric-label">Configuration Version</div>
+          <div class="metric-value">v${c.config_version}</div>
+          <div class="metric-sub">Authoritative Master Revision</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Synchronization Status</div>
+          <div style="margin-top: 8px;">
+            <span class="status-badge ${statusBadge}" style="font-size: 13px; padding: 4px 10px;">${c.sync_status}</span>
+          </div>
+          <div class="metric-sub" style="margin-top: 8px;">Last Synced: ${c.last_synced_at ? new Date(c.last_synced_at).toLocaleTimeString() : 'Never'}</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">SHA-256 Checksum</div>
+          <div style="font-family: monospace; font-size: 13px; color: var(--accent-blue); margin-top: 10px; word-break: break-all;">
+            ${(c.sha256_checksum || '').substring(0, 16)}...
+          </div>
+          <div class="metric-sub" style="margin-top: 6px;">Integrity verified</div>
+        </div>
+      </div>
+
+      <!-- JSON Configuration Editor -->
+      <div class="metric-card" style="padding: 18px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+          <h3 style="font-size: 15px;">Authoritative Configuration Payload (JSON)</h3>
+          <span style="font-size: 12px; color: var(--text-muted);">Strict JSON schema validated</span>
+        </div>
+        <textarea id="config-json-textarea" class="input-field" style="width: 100%; height: 380px; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px; line-height: 1.5; background: #080c14; border: 1px solid var(--border-color); padding: 12px; border-radius: 8px; resize: vertical;">${JSON.stringify(c.config, null, 2)}</textarea>
+      </div>
+    `;
+  } catch (err) {
+    container.innerHTML = `<div class="metric-card" style="color:var(--accent-red);">Error loading config: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+async function saveAuthoritativeConfig() {
+  const textarea = document.getElementById('config-json-textarea');
+  if (!textarea) return;
+
+  let parsed = null;
+  try {
+    parsed = JSON.parse(textarea.value);
+  } catch (e) {
+    alert('Invalid JSON syntax: ' + e.message);
+    return;
+  }
+
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/nodes/${selectedConfigNodeId}/config`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ config: parsed, summary: 'Manual dashboard update' })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: 'Config Saved', message: `Saved version v${data.configuration.config_version}`, severity: 'SUCCESS' });
+      refreshConfigDetails();
+    } else {
+      alert('Save failed: ' + data.error);
+    }
+  } catch (err) {
+    alert('Server error: ' + err.message);
+  }
+}
+
+async function triggerConfigPush() {
+  showToast({ title: 'Pushing Configuration', message: 'Delivering config payload to microcontroller...', severity: 'INFO' });
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/nodes/${selectedConfigNodeId}/config/sync`, {
+      method: 'POST'
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: 'Config Synchronized', message: data.message || 'Config accepted by node', severity: 'SUCCESS' });
+      refreshConfigDetails();
+    } else {
+      showToast({ title: 'Sync Warning', message: data.error || 'Direct sync failed; queued in persistent command queue', severity: 'WARNING' });
+      refreshConfigDetails();
+    }
+  } catch (err) {
+    alert('Sync error: ' + err.message);
+  }
+}
+
+async function openConfigVersionsModal() {
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/nodes/${selectedConfigNodeId}/config/versions`);
+    const data = await res.json();
+    const versions = data.versions || [];
+
+    const rows = versions.map(v => `
+      <tr style="border-bottom: 1px solid var(--border-color);">
+        <td style="padding: 10px 12px; font-weight: 600;">v${v.version}</td>
+        <td style="padding: 10px 12px; font-size:12px; color:var(--text-secondary);">${escapeHtml(v.change_summary || 'Update')}</td>
+        <td style="padding: 10px 12px; font-size:12px; color:var(--text-muted);">${new Date(v.created_at).toLocaleString()}</td>
+        <td style="padding: 10px 12px; font-family:monospace; font-size:11px;">${(v.sha256_checksum || '').substring(0, 10)}...</td>
+        <td style="padding: 10px 12px; text-align: right;">
+          <button class="btn btn-secondary" style="padding: 3px 8px; font-size: 11.5px;" onclick="rollbackConfigToVersion(${v.version})">Rollback</button>
+        </td>
+      </tr>
+    `).join('');
+
+    openModal(`
+      <div class="modal-card" style="max-width: 620px;">
+        <div class="modal-header">
+          <h3>Configuration Version History</h3>
+          <button class="modal-close-btn" onclick="closeModal()">&times;</button>
+        </div>
+        <div style="padding: 14px 0;">
+          <table class="table" style="width: 100%; border-collapse: collapse;">
+            <thead>
+              <tr style="border-bottom: 1px solid var(--border-color); text-align: left; background: rgba(255,255,255,0.02);">
+                <th style="padding: 8px 12px;">Version</th>
+                <th style="padding: 8px 12px;">Summary</th>
+                <th style="padding: 8px 12px;">Created At</th>
+                <th style="padding: 8px 12px;">Checksum</th>
+                <th style="padding: 8px 12px; text-align: right;">Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${versions.length === 0 ? '<tr><td colspan="5" style="text-align: center; color: var(--text-muted); padding: 20px;">No historical versions recorded.</td></tr>' : rows}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `);
+  } catch (err) {
+    alert('Error fetching versions: ' + err.message);
+  }
+}
+
+async function rollbackConfigToVersion(version) {
+  if (!confirm(`Rollback configuration to historical revision v${version}? A new revision will be created and pushed to the node.`)) return;
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/nodes/${selectedConfigNodeId}/config/rollback/${version}`, {
+      method: 'POST'
+    });
+    const data = await res.json();
+    if (data.success) {
+      closeModal();
+      showToast({ title: 'Configuration Rolled Back', message: `Restored to v${version} (Now v${data.currentVersion})`, severity: 'SUCCESS' });
+      refreshConfigDetails();
+    } else {
+      alert('Rollback failed: ' + data.error);
+    }
+  } catch (err) {
+    alert('Rollback error: ' + err.message);
+  }
+}
+
+// ==============================================================================
+// 14. DEVICE COMMAND CENTER & ACKNOWLEDGEMENT TRACKER VIEW
+// ==============================================================================
+let cachedCommands = [];
+let commandFilterNode = 'ALL';
+let commandFilterStatus = 'ALL';
+
+async function loadCommands() {
+  const container = document.getElementById("content-area");
+  container.innerHTML = `<div style="text-align:center; padding: 40px; color: var(--text-secondary);">Loading persistent command center...</div>`;
+
+  try {
+    const [cRes, nRes] = await Promise.all([
+      fetchWithAuth(`${API_BASE}/commands?limit=100`),
+      fetchWithAuth(`${API_BASE}/nodes`)
+    ]);
+
+    const cData = await cRes.json();
+    const nData = await nRes.json();
+
+    cachedCommands = cData.commands || [];
+    const nodes = nData || [];
+
+    const nodeFilterOptions = [
+      '<option value="ALL">All Nodes</option>',
+      ...nodes.map(n => `<option value="${n.node_id}" ${commandFilterNode === n.node_id ? 'selected' : ''}>${escapeHtml(n.name)}</option>`)
+    ].join('');
+
+    const filtered = cachedCommands.filter(c => {
+      if (commandFilterNode !== 'ALL' && c.node_id !== commandFilterNode) return false;
+      if (commandFilterStatus !== 'ALL' && c.status !== commandFilterStatus) return false;
+      return true;
+    });
+
+    const pendingCount = cachedCommands.filter(c => c.status === 'PENDING').length;
+    const ackCount = cachedCommands.filter(c => c.status === 'ACKNOWLEDGED').length;
+
+    container.innerHTML = `
+      <div style="display: flex; flex-direction: column; gap: 20px;">
+        <!-- Stats Banner -->
+        <div class="metrics-grid" style="grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));">
+          <div class="metric-card">
+            <div class="metric-label">Total Persistent Commands</div>
+            <div class="metric-value">${cachedCommands.length}</div>
+            <div class="metric-sub">Recorded in SQLite Fleet Queue</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Pending Delivery / In-Flight</div>
+            <div class="metric-value" style="color:var(--accent-amber)">${pendingCount}</div>
+            <div class="metric-sub">Waiting for heartbeat or socket</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Device Application ACKs</div>
+            <div class="metric-value" style="color:var(--accent-green)">${ackCount}</div>
+            <div class="metric-sub">Execution verified by firmware</div>
+          </div>
+        </div>
+
+        <!-- Action & Filter Bar -->
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
+          <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+            <select class="input-field" onchange="commandFilterNode = this.value; loadCommands();">
+              ${nodeFilterOptions}
+            </select>
+            <select class="input-field" onchange="commandFilterStatus = this.value; loadCommands();">
+              <option value="ALL" ${commandFilterStatus === 'ALL' ? 'selected' : ''}>All Statuses</option>
+              <option value="PENDING" ${commandFilterStatus === 'PENDING' ? 'selected' : ''}>PENDING</option>
+              <option value="DELIVERED" ${commandFilterStatus === 'DELIVERED' ? 'selected' : ''}>DELIVERED</option>
+              <option value="ACKNOWLEDGED" ${commandFilterStatus === 'ACKNOWLEDGED' ? 'selected' : ''}>ACKNOWLEDGED</option>
+              <option value="FAILED" ${commandFilterStatus === 'FAILED' ? 'selected' : ''}>FAILED</option>
+            </select>
+          </div>
+          <div style="display: flex; gap: 8px;">
+            <button class="btn btn-primary" onclick="openDispatchCommandModal()">⚡ Dispatch Command</button>
+            <button class="btn btn-secondary" onclick="loadCommands()">🔄 Refresh</button>
+          </div>
+        </div>
+
+        <!-- Commands Queue Table -->
+        <div class="metric-card" style="padding: 0; overflow-x: auto;">
+          <table class="table" style="width: 100%; border-collapse: collapse;">
+            <thead>
+              <tr style="border-bottom: 1px solid var(--border-color); text-align: left; background: rgba(255,255,255,0.02);">
+                <th style="padding: 12px 16px;">UUID</th>
+                <th style="padding: 12px 16px;">Target Node</th>
+                <th style="padding: 12px 16px;">Action / Type</th>
+                <th style="padding: 12px 16px;">Payload</th>
+                <th style="padding: 12px 16px;">Status</th>
+                <th style="padding: 12px 16px;">Timestamps</th>
+                <th style="padding: 12px 16px; text-align: right;">Details</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${filtered.length === 0 ? '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 30px;">No commands matching filter.</td></tr>' : ''}
+              ${filtered.map(c => {
+                let badgeClass = 'badge-sync';
+                if (c.status === 'ACKNOWLEDGED') badgeClass = 'badge-online';
+                else if (c.status === 'FAILED') badgeClass = 'badge-offline';
+                else if (c.status === 'PENDING') badgeClass = 'badge-sync';
+
+                const shortUuid = (c.command_uuid || '').substring(0, 8);
+                const createdStr = c.created_at ? new Date(c.created_at).toLocaleTimeString() : 'N/A';
+                const ackStr = c.acknowledged_at ? new Date(c.acknowledged_at).toLocaleTimeString() : '-';
+
+                return `
+                  <tr style="border-bottom: 1px solid var(--border-color);">
+                    <td style="padding: 12px 16px; font-family: monospace; font-size: 12px; color: var(--accent-blue);">
+                      ${shortUuid}...
+                    </td>
+                    <td style="padding: 12px 16px; font-weight: 600;">
+                      <code>${escapeHtml(c.node_id)}</code>
+                    </td>
+                    <td style="padding: 12px 16px;">
+                      <span class="status-badge badge-sync">${escapeHtml(c.command_type || 'command')}</span>
+                    </td>
+                    <td style="padding: 12px 16px; font-size: 12.5px; font-family: monospace; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                      ${escapeHtml(JSON.stringify(c.payload || {}))}
+                    </td>
+                    <td style="padding: 12px 16px;">
+                      <span class="status-badge ${badgeClass}">${c.status}</span>
+                    </td>
+                    <td style="padding: 12px 16px; font-size: 12px; color: var(--text-secondary);">
+                      Sent: ${createdStr} | ACK: ${ackStr}
+                    </td>
+                    <td style="padding: 12px 16px; text-align: right;">
+                      <button class="btn btn-secondary" style="padding: 3px 8px; font-size: 11px;" onclick="viewCommandDetails('${c.command_uuid}')">Inspect</button>
+                    </td>
+                  </tr>
+                `;
+              }).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  } catch (err) {
+    container.innerHTML = `<div class="metric-card" style="color:var(--accent-red);">Error loading command center: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function openDispatchCommandModal() {
+  const nodes = fleetData.nodes || [];
+  const nodeOptions = nodes.map(n => `
+    <option value="${n.node_id}">${escapeHtml(n.name)} (${n.ip || 'Offline'})</option>
+  `).join('');
+
+  openModal(`
+    <div class="modal-card" style="max-width: 480px;">
+      <div class="modal-header">
+        <h3>Dispatch Device Command</h3>
+        <button class="modal-close-btn" onclick="closeModal()">&times;</button>
+      </div>
+      <form onsubmit="handleDispatchCommandSubmit(event)" style="padding: 16px 0;">
+        <div style="margin-bottom: 12px;">
+          <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Target Node</label>
+          <select id="dispatch-node-id" required class="input-field" style="width:100%;">
+            ${nodeOptions}
+          </select>
+        </div>
+        <div style="margin-bottom: 12px;">
+          <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Command Action</label>
+          <select id="dispatch-action" class="input-field" style="width:100%;" onchange="toggleDispatchFields(this.value)">
+            <option value="setState">setState (Switch GPIO Pin)</option>
+            <option value="toggle">toggle (Toggle GPIO State)</option>
+            <option value="pulse">pulse (Momentary Relay Pulse)</option>
+            <option value="reboot">reboot (Restart Microcontroller)</option>
+            <option value="syncConfig">syncConfig (Force Sync Configuration)</option>
+            <option value="custom">custom (Arbitrary JSON Payload)</option>
+          </select>
+        </div>
+
+        <div id="dispatch-gpio-fields">
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px;">
+            <div>
+              <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Channel / Pin ID</label>
+              <input type="number" id="dispatch-channel-id" value="1" min="1" max="16" class="input-field" style="width:100%;">
+            </div>
+            <div>
+              <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Desired State</label>
+              <select id="dispatch-state" class="input-field" style="width:100%;">
+                <option value="true">ON (High / Active)</option>
+                <option value="false">OFF (Low / Inactive)</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div id="dispatch-pulse-field" style="display:none; margin-bottom: 12px;">
+          <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Pulse Duration (ms)</label>
+          <input type="number" id="dispatch-duration" value="500" min="50" max="10000" class="input-field" style="width:100%;">
+        </div>
+
+        <div id="dispatch-custom-field" style="display:none; margin-bottom: 12px;">
+          <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Custom JSON Payload</label>
+          <textarea id="dispatch-custom-json" class="input-field" style="width:100%; height:80px; font-family:monospace; font-size:12px;">{"action": "ping"}</textarea>
+        </div>
+
+        <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px;">
+          <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+          <button type="submit" class="btn btn-primary">Dispatch Command</button>
+        </div>
+      </form>
+    </div>
+  `);
+}
+
+function toggleDispatchFields(action) {
+  const gpioFields = document.getElementById('dispatch-gpio-fields');
+  const pulseField = document.getElementById('dispatch-pulse-field');
+  const customField = document.getElementById('dispatch-custom-field');
+
+  if (gpioFields) gpioFields.style.display = (action === 'setState' || action === 'toggle' || action === 'pulse') ? 'block' : 'none';
+  if (pulseField) pulseField.style.display = (action === 'pulse') ? 'block' : 'none';
+  if (customField) customField.style.display = (action === 'custom') ? 'block' : 'none';
+}
+
+async function handleDispatchCommandSubmit(e) {
+  e.preventDefault();
+  const nodeId = document.getElementById('dispatch-node-id').value;
+  const action = document.getElementById('dispatch-action').value;
+
+  let payload = { action, node_id: nodeId };
+
+  if (action === 'setState') {
+    payload.id = Number(document.getElementById('dispatch-channel-id').value);
+    payload.gpioId = payload.id;
+    payload.state = document.getElementById('dispatch-state').value === 'true';
+  } else if (action === 'toggle') {
+    payload.id = Number(document.getElementById('dispatch-channel-id').value);
+    payload.gpioId = payload.id;
+  } else if (action === 'pulse') {
+    payload.id = Number(document.getElementById('dispatch-channel-id').value);
+    payload.gpioId = payload.id;
+    payload.duration = Number(document.getElementById('dispatch-duration').value);
+  } else if (action === 'custom') {
+    try {
+      const customObj = JSON.parse(document.getElementById('dispatch-custom-json').value);
+      payload = { ...customObj, node_id: nodeId };
+    } catch {
+      alert('Invalid JSON in custom payload');
+      return;
+    }
+  }
+
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/commands/dispatch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (data.success) {
+      closeModal();
+      showToast({
+        title: 'Command Dispatched',
+        message: `Delivery: ${data.delivery} (UUID: ${(data.command_uuid || '').substring(0, 8)})`,
+        severity: data.delivery === 'direct_lan_http' ? 'SUCCESS' : 'INFO'
+      });
+      loadCommands();
+    } else {
+      alert('Dispatch failed: ' + data.error);
+    }
+  } catch (err) {
+    alert('Server error: ' + err.message);
+  }
+}
+
+async function viewCommandDetails(uuid) {
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/commands/${uuid}`);
+    const data = await res.json();
+    if (!data.success) return alert(data.error);
+
+    const cmd = data.command;
+    const results = data.results || [];
+
+    const resultsHtml = results.map(r => `
+      <div style="background: rgba(0,0,0,0.2); padding: 10px; border-radius: 6px; margin-bottom: 8px;">
+        <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px;">
+          <span class="status-badge ${r.success ? 'badge-online' : 'badge-offline'}">${r.status}</span>
+          <span style="color:var(--text-muted);">${r.execution_time_ms} ms</span>
+        </div>
+        <div style="font-family:monospace; font-size:11.5px; color:var(--text-secondary); word-break:break-all;">
+          ${escapeHtml(r.response_payload_json || '{}')}
+        </div>
+      </div>
+    `).join('') || '<div style="color:var(--text-muted); font-size:12px;">No execution response packet received yet.</div>';
+
+    openModal(`
+      <div class="modal-card" style="max-width: 520px;">
+        <div class="modal-header">
+          <h3>Command Diagnostics</h3>
+          <button class="modal-close-btn" onclick="closeModal()">&times;</button>
+        </div>
+        <div style="padding: 14px 0;">
+          <div style="margin-bottom: 12px;">
+            <div style="font-size: 11px; color: var(--text-muted);">UUID</div>
+            <code style="color: var(--accent-blue);">${cmd.command_uuid}</code>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px;">
+            <div>
+              <div style="font-size: 11px; color: var(--text-muted);">Target Node</div>
+              <strong>${escapeHtml(cmd.node_id)}</strong>
+            </div>
+            <div>
+              <div style="font-size: 11px; color: var(--text-muted);">Delivery Status</div>
+              <span class="status-badge ${cmd.status === 'ACKNOWLEDGED' ? 'badge-online' : 'badge-sync'}">${cmd.status}</span>
+            </div>
+          </div>
+          <div style="margin-bottom: 14px;">
+            <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px;">Command Payload</div>
+            <pre style="background: #080c14; padding: 10px; border-radius: 6px; font-size: 12px; overflow-x: auto;">${JSON.stringify(cmd.payload, null, 2)}</pre>
+          </div>
+          <div>
+            <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 6px;">Microcontroller Application ACK Results (${results.length})</div>
+            ${resultsHtml}
+          </div>
+        </div>
+      </div>
+    `);
+  } catch (err) {
+    alert('Error: ' + err.message);
+  }
+}
+
 
 // --- 12. DATABASE ---
 async function loadDatabase() {

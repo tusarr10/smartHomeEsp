@@ -8,7 +8,7 @@
   <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
-  <!-- SIDEBAR NAVIGATION (14 MAIN SECTIONS) -->
+  <!-- SIDEBAR NAVIGATION (RBAC, LittleFS, Config Sync, Commands, Fleet) -->
   <aside class="sidebar">
     <div class="sidebar-header">
       <div class="brand-icon">
@@ -45,6 +45,18 @@
         <span class="nav-icon">📦</span>
         <span>Firmware / OTA</span>
       </li>
+      <li class="nav-item" data-view="littlefs">
+        <span class="nav-icon">📁</span>
+        <span>LittleFS Manager</span>
+      </li>
+      <li class="nav-item" data-view="config-sync">
+        <span class="nav-icon">🔄</span>
+        <span>Config & Sync</span>
+      </li>
+      <li class="nav-item" data-view="commands">
+        <span class="nav-icon">⚡</span>
+        <span>Command Center</span>
+      </li>
       <li class="nav-item" data-view="telemetry">
         <span class="nav-icon">📡</span>
         <span>Telemetry</span>
@@ -64,7 +76,7 @@
       </li>
       <li class="nav-item" data-view="users">
         <span class="nav-icon">👥</span>
-        <span>Users</span>
+        <span>RBAC & Users</span>
       </li>
       <li class="nav-item" data-view="database">
         <span class="nav-icon">🗄️</span>
@@ -101,7 +113,12 @@
           <span style="font-size: 12.5px; font-weight: 600; color: var(--text-primary);">Alerts</span>
           <span id="topbar-notif-count" class="badge-count" style="display:none;">0</span>
         </div>
-        <span style="font-size: 13px; color: var(--text-secondary);">Windows Central Server v1.6.0</span>
+        <!-- Active User & Session Profile Pill -->
+        <div id="topbar-user-badge" onclick="handleUserBadgeClick()" title="Active Session | Click to manage account or sign out" style="cursor: pointer; padding: 6px 12px; border-radius: 8px; background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.3); display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 500; color: #a7f3d0; transition: all 0.2s ease;">
+          <span>👤</span>
+          <span id="topbar-username">admin</span>
+          <span id="topbar-role" class="status-badge badge-online" style="font-size: 10px; padding: 2px 6px;">SUPER_ADMIN</span>
+        </div>
       </div>
     </header>
 
@@ -109,6 +126,9 @@
       <!-- Dynamic View Injected Here -->
     </main>
   </div>
+
+  <!-- Modal Container -->
+  <div id="app-modal-container"></div>
 
   <!-- Floating Toast Notification Container -->
   <div id="toast-container" class="toast-container"></div>
