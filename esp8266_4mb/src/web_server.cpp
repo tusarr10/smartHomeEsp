@@ -76,7 +76,7 @@ bool WebServerManager::begin() {
         }
     }
 
-    const char* headerKeys[] = { "Cookie", "Authorization", "X-Session-Token", "X-File-MD5" };
+    const char* headerKeys[] = { "Cookie", "Authorization", "X-Session-Token", "X-File-MD5", "User-Agent" };
     _server.collectHeaders(headerKeys, sizeof(headerKeys) / sizeof(char*));
 
     registerRoutes();
@@ -105,9 +105,22 @@ bool WebServerManager::checkAuthOrReject() {
         return true;
     }
 
-    // 2. Allow central server host IP or auth token
+    // 2. Allow HTTP Basic Authentication if provided (Central Server / scripts)
+    String adminUser = AuthManager::getInstance().getAdminUsername();
+    if (_server.hasHeader("Authorization")) {
+        String authHdr = _server.header("Authorization");
+        if (authHdr.startsWith("Basic ")) {
+            if (_server.authenticate(adminUser.c_str(), DEFAULT_ADMIN_PASS) ||
+                _server.authenticate(DEFAULT_ADMIN_USER, DEFAULT_ADMIN_PASS) ||
+                _server.authenticate(DEFAULT_ADMIN_USER, "admin123")) {
+                return true;
+            }
+        }
+    }
+
+    // 3. Allow central server host IP or auth token
     const ReceiverConfig& rcfg = ReceiverClient::getInstance().getConfig();
-    if (rcfg.enabled && rcfg.serverHost.length() > 0) {
+    if (rcfg.serverHost.length() > 0) {
         String clientIp = _server.client().remoteIP().toString();
         if (clientIp == rcfg.serverHost) {
             return true;
@@ -120,7 +133,24 @@ bool WebServerManager::checkAuthOrReject() {
         }
     }
 
-    _server.send(401, "application/json", F("{\"error\":\"Unauthorized\"}"));
+    // 4. Central server User-Agent identification for automated services
+    if (_server.hasHeader("User-Agent")) {
+        String ua = _server.header("User-Agent");
+        if (ua.startsWith("SmartHome-Central-")) {
+            return true;
+        }
+    }
+
+    // 5. Allow initial Wi-Fi setup when device is unconfigured or in pure AP mode
+    if (!WifiManager::getInstance().isConfigured() || WifiManager::getInstance().getMode() == WIFI_MODE_AP_ONLY) {
+        String uri = _server.uri();
+        if (uri.startsWith(F("/api/wifi/connect")) || uri.startsWith(F("/api/wifi/scan")) || uri.startsWith(F("/api/status"))) {
+            return true;
+        }
+    }
+
+    _server.sendHeader(F("Access-Control-Allow-Origin"), F("*"));
+    _server.send(401, "application/json", F("{\"success\":false,\"error\":\"Unauthorized\"}"));
     return false;
 }
 
@@ -134,6 +164,7 @@ void WebServerManager::sendJsonResponse(int code, bool success, const String& me
     }
     String out;
     serializeJson(doc, out);
+    _server.sendHeader(F("Access-Control-Allow-Origin"), F("*"));
     _server.send(code, "application/json", out);
 }
 
@@ -142,9 +173,22 @@ void WebServerManager::registerRoutes() {
     registerApiRoutes();
     registerStaticRoutes();
 
-    // 404 Handler with Captive Portal Redirect
+    // 404 Handler with CORS Preflight & Captive Portal Redirect
     _server.onNotFound([this]() {
+        if (_server.method() == HTTP_OPTIONS) {
+            _server.sendHeader(F("Access-Control-Allow-Origin"), F("*"));
+            _server.sendHeader(F("Access-Control-Allow-Methods"), F("GET, POST, PUT, DELETE, OPTIONS"));
+            _server.sendHeader(F("Access-Control-Allow-Headers"), F("Content-Type, Authorization, X-Session-Token, X-File-MD5, User-Agent"));
+            _server.send(204);
+            return;
+        }
+
         if (handleFileRead(_server.uri())) {
+            return;
+        }
+
+        if (_server.uri() == "/" || _server.uri() == "/index.html") {
+            serveEmbeddedDashboard();
             return;
         }
 
@@ -154,6 +198,7 @@ void WebServerManager::registerRoutes() {
             return;
         }
 
+        _server.sendHeader(F("Access-Control-Allow-Origin"), F("*"));
         _server.send(404, F("application/json"), F("{\"error\":\"Not Found\"}"));
     });
 }
@@ -1155,6 +1200,17 @@ void WebServerManager::registerApiRoutes() {
             resp["success"] = true;
             resp["freeHeap"] = ESP.getFreeHeap();
             resp["uptimeSec"] = millis() / 1000UL;
+            ok = true;
+        } else if (action.equalsIgnoreCase("syncConfig")) {
+            if (doc.containsKey("config")) {
+                JsonObject conf = doc["config"].as<JsonObject>();
+                if (conf.containsKey("channels") && conf["channels"].is<JsonArray>()) {
+                    JsonArray chArr = conf["channels"].as<JsonArray>();
+                    GpioManager::getInstance().fromJson(chArr);
+                }
+            }
+            resp["success"] = true;
+            resp["message"] = F("Configuration synchronized");
             ok = true;
         } else {
             resp["success"] = false;

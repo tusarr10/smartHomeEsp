@@ -394,6 +394,16 @@ void ReceiverClient::processServerCommands(const char* response) {
             success = true;
             delay(500);
             ESP.restart();
+        } else if (action.equalsIgnoreCase("syncConfig")) {
+            if (cmd.containsKey("config")) {
+                JsonObject conf = cmd["config"].as<JsonObject>();
+                if (conf.containsKey("channels") && conf["channels"].is<JsonArray>()) {
+                    JsonArray chArr = conf["channels"].as<JsonArray>();
+                    GpioManager::getInstance().fromJson(chArr);
+                }
+            }
+            success = true;
+            Logger::log(F("[RECEIVER] Remote cmd syncConfig processed"));
         }
 
         if (cmdUuid.length() > 0 && _ackCount < MAX_PENDING_ACKS) {

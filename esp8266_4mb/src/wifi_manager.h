@@ -56,6 +56,7 @@ public:
     bool isSTAConnected() const;
     bool isAPActive() const { return _apActive; }
     bool isStaticIp() const { return _config.useStaticIp; }
+    bool isConfigured() const { return _config.isConfigured; }
 
     String getSTAIP() const;
     String getAPIP() const;

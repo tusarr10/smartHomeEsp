@@ -32,6 +32,8 @@ bool WifiManager::begin() {
     loadFromStorage();
 
     WiFi.persistent(false);
+    WiFi.setAutoConnect(false);
+    WiFi.setAutoReconnect(false);
     WiFi.disconnect(true);
     delay(100);
 
@@ -199,7 +201,8 @@ void WifiManager::loop() {
             }
         } else if (now - _connectStartTime >= STA_CONNECT_TIMEOUT_MS) {
             _isConnecting = false;
-            Serial.println(F("[WIFI] Connection to router timed out."));
+            WiFi.disconnect(false);
+            Serial.println(F("[WIFI] Connection to router timed out. SoftAP channel stabilized."));
 
             // Recovery: Ensure AP is running so user can access dashboard
             if (!_apActive) {
@@ -209,20 +212,25 @@ void WifiManager::loop() {
         }
     }
 
-    // Periodic watchdog check (every 10 seconds)
-    if (now - _lastWatchdogCheck >= 10000) {
+    // Periodic watchdog check (every 30 seconds)
+    if (now - _lastWatchdogCheck >= 30000) {
         _lastWatchdogCheck = now;
 
         if (_config.isConfigured && _config.mode != WIFI_MODE_AP_ONLY) {
             if (WiFi.status() != WL_CONNECTED && !_isConnecting) {
-                Serial.println(F("[WIFI] Connection lost, fallback AP active. Attempting reconnect..."));
-                if (!_apActive) {
-                    WiFi.mode(WIFI_AP_STA);
-                    startAP();
+                // If a client (phone/laptop) is connected to SoftAP, do not disrupt them with channel-hopping!
+                if (_apActive && WiFi.softAPgetStationNum() > 0) {
+                    Serial.println(F("[WIFI] Client connected to SoftAP. Deferring router reconnect."));
+                } else {
+                    Serial.println(F("[WIFI] Connection lost, fallback AP active. Attempting reconnect..."));
+                    if (!_apActive) {
+                        WiFi.mode(WIFI_AP_STA);
+                        startAP();
+                    }
+                    WiFi.begin(_config.staSsid.c_str(), _config.staPassword.c_str());
+                    _isConnecting = true;
+                    _connectStartTime = now;
                 }
-                WiFi.begin(_config.staSsid.c_str(), _config.staPassword.c_str());
-                _isConnecting = true;
-                _connectStartTime = now;
             }
         }
     }
@@ -394,17 +402,17 @@ void WifiManager::loadFromStorage() {
         _config.mode = doc["mode"] | (uint8_t)WIFI_MODE_AP_ROUTER;
         _config.apSsid = doc["apSsid"].as<String>();
         if (_config.apSsid.length() == 0) _config.apSsid = DEFAULT_AP_SSID;
-        _config.apPassword = doc["apPassword"].as<String>();
+        _config.apPassword = doc.containsKey("apPassword") ? doc["apPassword"].as<String>() : (doc.containsKey("apPass") ? doc["apPass"].as<String>() : "");
         _config.staSsid = doc["staSsid"].as<String>();
-        _config.staPassword = doc["staPassword"].as<String>();
-        _config.isConfigured = doc["isConfigured"] | false;
+        _config.staPassword = doc.containsKey("staPassword") ? doc["staPassword"].as<String>() : (doc.containsKey("staPass") ? doc["staPass"].as<String>() : "");
+        _config.isConfigured = doc.containsKey("isConfigured") ? doc["isConfigured"].as<bool>() : (_config.staSsid.length() > 0);
 
         _config.useStaticIp = doc["useStaticIp"] | false;
-        _config.staticIp = doc["staticIp"] | "";
-        _config.staticGateway = doc["staticGateway"] | "";
-        _config.staticSubnet = doc["staticSubnet"] | "255.255.255.0";
-        _config.staticDns1 = doc["staticDns1"] | "8.8.8.8";
-        _config.staticDns2 = doc["staticDns2"] | "1.1.1.1";
+        _config.staticIp = doc.containsKey("staticIp") ? doc["staticIp"].as<String>() : "";
+        _config.staticGateway = doc.containsKey("staticGateway") ? doc["staticGateway"].as<String>() : (doc.containsKey("gateway") ? doc["gateway"].as<String>() : "");
+        _config.staticSubnet = doc.containsKey("staticSubnet") ? doc["staticSubnet"].as<String>() : (doc.containsKey("subnet") ? doc["subnet"].as<String>() : "255.255.255.0");
+        _config.staticDns1 = doc.containsKey("staticDns1") ? doc["staticDns1"].as<String>() : (doc.containsKey("dns1") ? doc["dns1"].as<String>() : "8.8.8.8");
+        _config.staticDns2 = doc.containsKey("staticDns2") ? doc["staticDns2"].as<String>() : (doc.containsKey("dns2") ? doc["dns2"].as<String>() : "1.1.1.1");
     }
 }
 
