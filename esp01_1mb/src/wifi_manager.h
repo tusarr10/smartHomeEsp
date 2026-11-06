@@ -5,16 +5,7 @@
 #include <ESP8266WiFi.h>
 #include <DNSServer.h>
 #include <ArduinoJson.h>
-#include <vector>
 #include "config.h"
-
-struct ScannedNetwork {
-    String ssid;
-    int32_t rssi;
-    uint8_t encryptionType;
-    int32_t channel;
-    bool isHidden;
-};
 
 struct WifiConfig {
     uint8_t mode;               // WifiSystemMode (AP_ONLY, ROUTER_ONLY, AP_ROUTER)
@@ -49,7 +40,6 @@ public:
     void applyIpConfig();
     void disconnectRouter();
 
-    void scanNetworks(std::vector<ScannedNetwork>& outList);
     void setMode(uint8_t mode);
     uint8_t getMode() const { return _config.mode; }
 

@@ -229,57 +229,7 @@ void ReceiverClient::fillTelemetryDoc(DynamicJsonDocument& doc, const char* even
 }
 
 bool ReceiverClient::sendHttp(const char* eventType, String& outResponse, int& outCode) {
-    WiFiClient client;
-    client.setTimeout(2500);
-
-    if (!client.connect(_config.serverHost.c_str(), _config.serverPort)) {
-        outCode = -1;
-        outResponse = F("Connection failed to central server");
-        return false;
-    }
-
-    String path = _config.httpPath;
-    if (!path.startsWith("/")) path = "/" + path;
-
-    DynamicJsonDocument doc(1536);
-    fillTelemetryDoc(doc, eventType);
-    String payload;
-    serializeJson(doc, payload);
-
-    String req = String(F("POST ")) + path + F(" HTTP/1.1\r\n") +
-                 F("Host: ") + _config.serverHost + F(":") + String(_config.serverPort) + F("\r\n") +
-                 F("Content-Type: application/json\r\n") +
-                 F("X-Node-ID: ") + _config.nodeId + F("\r\n");
-    if (_config.authToken.length() > 0) {
-        req += String(F("Authorization: Bearer ")) + _config.authToken + F("\r\n");
-    }
-    req += String(F("Content-Length: ")) + String(payload.length()) + F("\r\n") +
-           F("Connection: close\r\n\r\n") +
-           payload;
-
-    client.print(req);
-    client.flush();
-
-    // Read HTTP response status
-    String statusLine = client.readStringUntil('\n');
-    outCode = 500;
-    if (statusLine.startsWith("HTTP/1.")) {
-        int spaceIdx = statusLine.indexOf(' ');
-        if (spaceIdx > 0) {
-            outCode = statusLine.substring(spaceIdx + 1, spaceIdx + 4).toInt();
-        }
-    }
-
-    // Skip headers
-    while (client.connected() || client.available()) {
-        String line = client.readStringUntil('\n');
-        if (line == "\r" || line.length() == 0) break;
-    }
-
-    // Read body
-    outResponse = client.readString();
-    client.stop();
-    return (outCode >= 200 && outCode < 300);
+    return sendTcpSync(eventType, outResponse, outCode);
 }
 
 bool ReceiverClient::sendTcpSync(const char* eventType, String& outResponse, int& outCode) {
