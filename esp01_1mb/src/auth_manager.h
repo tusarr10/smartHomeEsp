@@ -23,6 +23,8 @@ public:
     bool changePassword(const String& currentPassword, const String& newPassword);
     
     String getAdminUsername() const { return _adminUser; }
+    String getAdminPassword() const { return _adminPasswordHash; }
+    bool checkCredentials(const String& username, const String& password) const;
     void setAdminCredentials(const String& username, const String& passwordHash);
 
     static String sha256(const String& input);

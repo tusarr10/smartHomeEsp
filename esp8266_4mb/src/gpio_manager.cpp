@@ -279,3 +279,33 @@ void GpioManager::saveToStorage() {
     toJson(arr);
     StorageManager::getInstance().saveJsonFile(FILE_GPIO_CONFIG, doc);
 }
+
+bool GpioManager::fromJson(JsonArray& arr) {
+    _channels.clear();
+    uint8_t maxId = 0;
+    for (JsonObject obj : arr) {
+        GpioChannel ch;
+        ch.id = obj["id"] | (uint8_t)(obj["channel_id"] | (maxId + 1));
+        ch.pin = obj["pin"] | D1;
+        String loadedName = obj["name"] | "";
+        ch.name = (loadedName.length() > 0) ? loadedName : String(F("Output ")) + String(ch.id);
+        String loadedRoom = obj["room"] | "";
+        ch.room = (loadedRoom.length() > 0) ? loadedRoom : F("General");
+        String loadedFunc = obj["function"] | "";
+        ch.function = (loadedFunc.length() > 0) ? loadedFunc : F("Relay");
+        ch.activeLow = obj.containsKey("activeLow") ? obj["activeLow"].as<bool>() : (obj.containsKey("active_low") ? obj["active_low"].as<bool>() : true);
+        ch.initialMode = obj.containsKey("initialMode") ? obj["initialMode"].as<uint8_t>() : (obj.containsKey("initial_mode") ? obj["initial_mode"].as<uint8_t>() : 0);
+        ch.enabled = obj.containsKey("enabled") ? obj["enabled"].as<bool>() : true;
+        ch.currentState = obj.containsKey("state") ? obj["state"].as<bool>() : false;
+        ch.pulseEndTime = 0;
+
+        pinMode(ch.pin, OUTPUT);
+        applyPhysicalPin(ch);
+
+        if (ch.id > maxId) maxId = ch.id;
+        _channels.push_back(ch);
+    }
+    _nextId = maxId + 1;
+    saveToStorage();
+    return true;
+}

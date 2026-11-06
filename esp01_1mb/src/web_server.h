@@ -22,6 +22,9 @@ public:
     String getDeviceName() const { return _deviceName; }
     void setDeviceName(const String& name);
 
+    // Authentication verification helper
+    bool isAuthorized(bool allowUnauthenticatedDiscovery = false);
+
 private:
     WebServerManager();
     ESP8266WebServer _server;
@@ -33,7 +36,11 @@ private:
     void registerStaticRoutes();
 
     void sendJsonResponse(int code, bool success, const String& message);
-    bool checkAuthOrReject();
+
+    // HTTP Handlers
+    void handleStatus();
+    void handleCommand();
+    void handleSaveGpioConfig();
 
     // Built-in minimalist ESP-01 setup portal (Login, Wi-Fi Setup, Firmware Upload)
     void serveEmbeddedDashboard();

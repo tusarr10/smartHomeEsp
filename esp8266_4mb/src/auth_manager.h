@@ -23,13 +23,15 @@ public:
     bool changePassword(const String& currentPassword, const String& newPassword);
     
     String getAdminUsername() const { return _adminUser; }
-    void setAdminCredentials(const String& username, const String& passwordHash);
+    String getAdminPassword() const { return _adminPass; }
+    void setAdminCredentials(const String& username, const String& password);
 
     static String sha256(const String& input);
 
 private:
     AuthManager();
     String _adminUser;
+    String _adminPass;
     String _adminPasswordHash;
     AuthSession _currentSession;
     uint8_t _failedAttempts;

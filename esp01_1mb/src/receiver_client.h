@@ -33,6 +33,7 @@ struct ReceiverConfig {
 class ReceiverClient {
 public:
     static ReceiverClient& getInstance();
+    static String getHardwareNodeId();
 
     void begin();
     void loop();

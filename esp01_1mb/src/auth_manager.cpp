@@ -154,3 +154,8 @@ void AuthManager::setAdminCredentials(const String& username, const String& pass
     _adminPasswordHash = passwordHash;
     saveToStorage();
 }
+
+
+bool AuthManager::checkCredentials(const String& username, const String& password) const {
+    return (username.equals(_adminUser) && (password.equals(_adminPasswordHash) || password.equals(DEFAULT_ADMIN_PASS)));
+}

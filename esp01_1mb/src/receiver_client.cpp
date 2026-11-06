@@ -28,11 +28,18 @@ ReceiverClient& ReceiverClient::getInstance() {
     return instance;
 }
 
+String ReceiverClient::getHardwareNodeId() {
+    String mac = WiFi.macAddress();
+    mac.replace(":", "");
+    mac.toUpperCase();
+    return "NODE-" + mac;
+}
+
 void ReceiverClient::begin() {
     // Generate default Node ID from MAC if not set
     String mac = WiFi.macAddress();
     mac.replace(":", "");
-    _config.nodeId = "NODE-" + mac;
+    _config.nodeId = getHardwareNodeId();
 
     loadFromStorage();
     _lastReportTime = millis();
@@ -422,8 +429,12 @@ bool ReceiverClient::loadFromStorage() {
     _config.nodeName = doc["nodeName"] | "SmartHome-Node";
     _config.authToken = doc["authToken"] | "";
 
-    if (doc.containsKey("nodeId") && doc["nodeId"].as<String>().length() > 0) {
-        _config.nodeId = doc["nodeId"].as<String>();
+    if (doc.containsKey("nodeId")) {
+        String savedId = doc["nodeId"].as<String>();
+        savedId.trim();
+        if (savedId.length() > 0 && !savedId.equalsIgnoreCase("NODE-ESP01") && !savedId.equalsIgnoreCase("NODE-DEFAULT") && !savedId.equalsIgnoreCase("NODE-ESP8266-4MB")) {
+            _config.nodeId = savedId;
+        }
     }
 
     return true;

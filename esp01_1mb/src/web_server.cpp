@@ -27,7 +27,7 @@ bool WebServerManager::begin() {
 
     registerRoutes();
     _server.begin();
-    Logger::log(F("[HTTP] Minimal Satellite Web Server active on port 80"));
+    Logger::log(F("[HTTP] SmartHome ESP-01 Web Server active on port 80"));
     return true;
 }
 
@@ -45,12 +45,45 @@ void WebServerManager::setDeviceName(const String& name) {
     }
 }
 
-bool WebServerManager::checkAuthOrReject() {
-    const ReceiverConfig& rcfg = ReceiverClient::getInstance().getConfig();
-    if (rcfg.authToken.length() == 0) return true; // Direct LAN trust if no token set
+bool WebServerManager::isAuthorized(bool allowUnauthenticatedDiscovery) {
+    String user = AuthManager::getInstance().getAdminUsername();
+    String pass = AuthManager::getInstance().getAdminPassword();
 
-    // AP connection is trusted for local onboarding
-    if (WifiManager::getInstance().isAPActive()) {
+    // 1. HTTP Basic Authentication check (e.g. from Central Server / Test Auth)
+    if (_server.hasHeader("Authorization")) {
+        String authHeader = _server.header("Authorization");
+        if (authHeader.startsWith("Basic ")) {
+            if (_server.authenticate(user.c_str(), pass.c_str())) {
+                return true;
+            }
+            // Explicit Basic Auth credentials provided but failed
+            _server.requestAuthentication(BASIC_AUTH, "SmartHome", "Authentication Required");
+            return false;
+        } else if (authHeader.startsWith("Bearer ")) {
+            String token = authHeader.substring(7);
+            token.trim();
+            const ReceiverConfig& rcfg = ReceiverClient::getInstance().getConfig();
+            if (rcfg.authToken.length() > 0 && token == rcfg.authToken) {
+                return true;
+            }
+        }
+    }
+
+    // 2. Web session token authentication (Cookie or X-Session-Token)
+    if (AuthManager::getInstance().authenticate(_server)) {
+        return true;
+    }
+
+    // 3. Central receiver host IP trust (if configured)
+    const ReceiverConfig& rcfg = ReceiverClient::getInstance().getConfig();
+    if (rcfg.enabled && rcfg.serverHost.length() > 0) {
+        if (_server.client().remoteIP().toString() == rcfg.serverHost) {
+            return true;
+        }
+    }
+
+    // 4. Local AP trust for captive portal onboarding
+    if (WifiManager::getInstance().isAPActive() && !WifiManager::getInstance().isSTAConnected()) {
         IPAddress clientIp = _server.client().remoteIP();
         IPAddress apIp = WiFi.softAPIP();
         if (clientIp[0] == apIp[0] && clientIp[1] == apIp[1] && clientIp[2] == apIp[2]) {
@@ -58,26 +91,19 @@ bool WebServerManager::checkAuthOrReject() {
         }
     }
 
-    if (_server.hasHeader("Authorization")) {
-        String authHeader = _server.header("Authorization");
-        if (authHeader == ("Bearer " + rcfg.authToken)) return true;
-    }
-    if (_server.hasArg("token") && _server.arg("token") == rcfg.authToken) return true;
-    if (_server.hasHeader("Cookie") && _server.header("Cookie").indexOf(rcfg.authToken) >= 0) return true;
-
-    if (rcfg.enabled && rcfg.serverHost.length() > 0) {
-        if (_server.client().remoteIP().toString() == rcfg.serverHost) return true;
+    // 5. Unauthenticated discovery allowance (for /api/status network scanner probing)
+    if (allowUnauthenticatedDiscovery && !_server.hasHeader("Authorization")) {
+        return true;
     }
 
-    if (AuthManager::getInstance().authenticate(_server)) return true;
-
-    _server.send(401, "application/json", F("{\"error\":\"Unauthorized\"}"));
+    // Reject unauthenticated access
+    _server.requestAuthentication(BASIC_AUTH, "SmartHome", "Authentication Required");
     return false;
 }
 
 void WebServerManager::sendJsonResponse(int code, bool success, const String& message) {
-    String out = String(F("{\"success\":")) + (success ? F("true") : F("false")) +
-                 F(",\"") + (success ? F("message") : F("error")) + F("\":\"") + message + F("\"}");
+    String out = String(F("{"success":")) + (success ? F("true") : F("false")) +
+                 F(","") + (success ? F("message") : F("error")) + F("":"") + message + F(""}");
     _server.send(code, "application/json", out);
 }
 
@@ -93,7 +119,7 @@ void WebServerManager::registerRoutes() {
             _server.send(302, F("text/plain"), F(""));
             return;
         }
-        _server.send(404, F("application/json"), F("{\"error\":\"Not Found\"}"));
+        _server.send(404, F("application/json"), F("{"error":"Not Found"}"));
     });
 }
 
@@ -112,6 +138,126 @@ void WebServerManager::registerCaptiveRoutes() {
     _server.on("/connecttest.txt", captiveRedirect);
     _server.on("/redirect", captiveRedirect);
     _server.on("/success.txt", captiveRedirect);
+}
+
+void WebServerManager::handleStatus() {
+    // If Authorization header was provided, strictly enforce authentication
+    if (!isAuthorized(true)) return;
+
+    DynamicJsonDocument doc(1024);
+    doc["deviceName"] = _deviceName;
+    doc["hardware"] = HARDWARE_TARGET;
+    doc["firmwareVersion"] = FIRMWARE_VERSION;
+    doc["mac"] = WiFi.macAddress();
+    doc["nodeId"] = ReceiverClient::getInstance().getConfig().nodeId;
+    doc["chipId"] = String(ESP.getChipId(), HEX);
+    doc["rssi"] = WifiManager::getInstance().getSTARSSI();
+    doc["freeHeap"] = ESP.getFreeHeap();
+    doc["uptimeSec"] = millis() / 1000UL;
+    doc["sketchSize"] = ESP.getSketchSize();
+    doc["freeSketchSpace"] = ESP.getFreeSketchSpace();
+    doc["staConnected"] = WifiManager::getInstance().isSTAConnected();
+    doc["ip"] = WifiManager::getInstance().isSTAConnected() ? WifiManager::getInstance().getSTAIP() : WifiManager::getInstance().getAPIP();
+    doc["ssid"] = WifiManager::getInstance().getConnectedSSID();
+    doc["receiverEnabled"] = ReceiverClient::getInstance().getConfig().enabled;
+    doc["receiverServer"] = ReceiverClient::getInstance().getConfig().serverHost + ":" + String(ReceiverClient::getInstance().getConfig().serverPort);
+
+    // Relay channels list
+    JsonArray channels = doc.createNestedArray("channels");
+    GpioManager::getInstance().toJson(channels);
+
+    String output;
+    serializeJson(doc, output);
+    _server.send(200, "application/json", output);
+}
+
+void WebServerManager::handleCommand() {
+    if (!isAuthorized(false)) return;
+
+    DynamicJsonDocument doc(512);
+    if (deserializeJson(doc, _server.arg("plain"))) {
+        sendJsonResponse(400, false, F("Invalid JSON"));
+        return;
+    }
+
+    String cmdId = doc["commandId"] | doc["command_uuid"] | "";
+    String action = doc["action"] | doc["command_type"] | "";
+    uint8_t gpioId = doc["id"] | (uint8_t)(doc["channel_id"] | 0);
+
+    bool ok = false;
+    if (action.equalsIgnoreCase("reboot")) {
+        sendJsonResponse(200, true, F("Rebooting ESP-01..."));
+        delay(500);
+        ESP.restart();
+        return;
+    } else if (action.equalsIgnoreCase("setState")) {
+        bool state = doc["state"] | false;
+        ok = GpioManager::getInstance().setState(gpioId, state);
+    } else if (action.equalsIgnoreCase("toggle")) {
+        ok = GpioManager::getInstance().toggle(gpioId);
+    } else if (action.equalsIgnoreCase("pulse")) {
+        unsigned long dur = doc["duration"] | 500;
+        ok = GpioManager::getInstance().pulse(gpioId, dur);
+    } else if (action.equalsIgnoreCase("readInfo")) {
+        ok = true;
+    }
+
+    DynamicJsonDocument resp(256);
+    resp["success"] = ok;
+    if (cmdId.length() > 0) resp["commandId"] = cmdId;
+    resp["status"] = ok ? "ACKNOWLEDGED" : "FAILED";
+    String out;
+    serializeJson(resp, out);
+    _server.send(ok ? 200 : 400, "application/json", out);
+}
+
+void WebServerManager::handleSaveGpioConfig() {
+    if (!isAuthorized(false)) return;
+
+    if (!_server.hasArg("plain")) {
+        sendJsonResponse(400, false, F("No body received"));
+        return;
+    }
+
+    DynamicJsonDocument doc(2048);
+    DeserializationError err = deserializeJson(doc, _server.arg("plain"));
+    if (err) {
+        sendJsonResponse(400, false, F("JSON parse failed"));
+        return;
+    }
+
+    // 1. Process relay channels list if provided
+    if (doc.containsKey("channels") && doc["channels"].is<JsonArray>()) {
+        JsonArray channels = doc["channels"].as<JsonArray>();
+        GpioManager::getInstance().saveChannels(channels);
+    } else if (doc.containsKey("pin")) {
+        uint8_t id = doc["id"] | 1;
+        uint8_t pin = doc["pin"];
+        String name = doc["name"] | ("Relay " + String(id));
+        String room = doc["room"] | "General";
+        String func = doc["function"] | "Relay";
+        bool activeLow = doc.containsKey("activeLow") ? doc["activeLow"].as<bool>() : (doc.containsKey("active_low") ? doc["active_low"].as<bool>() : true);
+        uint8_t initMode = doc["initialMode"] | doc["initial_mode"] | 0;
+        bool enabled = doc.containsKey("enabled") ? doc["enabled"].as<bool>() : true;
+        GpioManager::getInstance().addOrUpdateChannel(id, pin, name, room, func, activeLow, initMode, enabled);
+    }
+
+    // 2. Process receiverServer if pushed with configuration
+    if (doc.containsKey("receiverServer")) {
+        String srv = doc["receiverServer"].as<String>();
+        int colonIdx = srv.indexOf(':');
+        ReceiverConfig rcfg = ReceiverClient::getInstance().getConfig();
+        rcfg.enabled = true;
+        if (colonIdx > 0) {
+            rcfg.serverHost = srv.substring(0, colonIdx);
+            rcfg.serverPort = srv.substring(colonIdx + 1).toInt();
+        } else {
+            rcfg.serverHost = srv;
+        }
+        ReceiverClient::getInstance().setConfig(rcfg);
+    }
+
+    sendJsonResponse(200, true, F("Configuration saved and applied!"));
 }
 
 void WebServerManager::registerApiRoutes() {
@@ -158,7 +304,7 @@ void WebServerManager::registerApiRoutes() {
     });
 
     _server.on("/api/auth/password", HTTP_POST, [this]() {
-        if (!checkAuthOrReject()) return;
+        if (!isAuthorized(false)) return;
         StaticJsonDocument<256> doc;
         if (deserializeJson(doc, _server.arg("plain"))) {
             sendJsonResponse(400, false, F("Invalid JSON"));
@@ -173,32 +319,65 @@ void WebServerManager::registerApiRoutes() {
         }
     });
 
-    // === STATUS (Compact for Central Server & Dashboard) ===
+    // === STATUS (Discovery & Health Polling) ===
     _server.on("/api/status", HTTP_GET, [this]() {
-        DynamicJsonDocument doc(512);
-        doc["deviceName"] = _deviceName;
-        doc["firmwareVersion"] = FIRMWARE_VERSION;
-        doc["hardware"] = HARDWARE_TARGET;
-        doc["uptimeSec"] = millis() / 1000UL;
-        doc["freeHeap"] = ESP.getFreeHeap();
-        doc["sketchSize"] = ESP.getSketchSize();
-        doc["freeSketchSpace"] = ESP.getFreeSketchSpace();
-        doc["mac"] = WiFi.macAddress();
-        doc["staConnected"] = WifiManager::getInstance().isSTAConnected();
-        doc["ip"] = WifiManager::getInstance().isSTAConnected() ? WifiManager::getInstance().getSTAIP() : WifiManager::getInstance().getAPIP();
-        doc["ssid"] = WifiManager::getInstance().getConnectedSSID();
-        doc["rssi"] = WifiManager::getInstance().getSTARSSI();
-        doc["receiverEnabled"] = ReceiverClient::getInstance().getConfig().enabled;
-        doc["receiverServer"] = ReceiverClient::getInstance().getConfig().serverHost + ":" + String(ReceiverClient::getInstance().getConfig().serverPort);
+        handleStatus();
+    });
 
+    // === UNIFIED DIRECT COMMAND DISPATCHER ===
+    _server.on("/api/command", HTTP_POST, [this]() {
+        handleCommand();
+    });
+    _server.on("/api/commands/execute", HTTP_POST, [this]() {
+        handleCommand();
+    });
+
+    // === GPIO CONFIGURATION PUSH & RETRIEVAL ===
+    _server.on("/api/gpio/save", HTTP_POST, [this]() {
+        handleSaveGpioConfig();
+    });
+    _server.on("/api/gpio", HTTP_POST, [this]() {
+        handleSaveGpioConfig();
+    });
+    _server.on("/api/gpio", HTTP_GET, [this]() {
+        _server.sendHeader(F("Cache-Control"), F("no-cache"));
+        DynamicJsonDocument doc(512);
+        JsonArray arr = doc.to<JsonArray>();
+        GpioManager::getInstance().toJson(arr);
         String out;
         serializeJson(doc, out);
         _server.send(200, "application/json", out);
     });
 
+    _server.on("/api/gpio/state", HTTP_POST, [this]() {
+        if (!isAuthorized(false)) return;
+
+        StaticJsonDocument<256> doc;
+        if (deserializeJson(doc, _server.arg("plain"))) {
+            sendJsonResponse(400, false, F("Invalid JSON"));
+            return;
+        }
+
+        uint8_t id = doc["id"] | 0;
+        String action = doc["action"] | "";
+        bool ok = false;
+
+        if (action.equalsIgnoreCase("toggle")) {
+            ok = GpioManager::getInstance().toggle(id);
+        } else if (action.equalsIgnoreCase("pulse")) {
+            unsigned long dur = doc["duration"] | 500;
+            ok = GpioManager::getInstance().pulse(id, dur);
+        } else if (doc.containsKey("state")) {
+            bool state = doc["state"].as<bool>();
+            ok = GpioManager::getInstance().setState(id, state);
+        }
+
+        sendJsonResponse(ok ? 200 : 400, ok, ok ? F("State updated") : F("Failed to set state"));
+    });
+
     // === WI-FI & CENTRAL SERVER SETUP ===
     _server.on("/api/wifi/connect", HTTP_POST, [this]() {
-        if (!checkAuthOrReject()) return;
+        if (!isAuthorized(false)) return;
 
         DynamicJsonDocument doc(512);
         if (deserializeJson(doc, _server.arg("plain"))) {
@@ -230,7 +409,7 @@ void WebServerManager::registerApiRoutes() {
     });
 
     _server.on("/api/wifi/scan", HTTP_GET, [this]() {
-        if (!checkAuthOrReject()) return;
+        if (!isAuthorized(false)) return;
         int n = WiFi.scanNetworks(false, false);
         DynamicJsonDocument doc(1024);
         JsonArray arr = doc.to<JsonArray>();
@@ -250,81 +429,6 @@ void WebServerManager::registerApiRoutes() {
         _server.send(200, "application/json", out);
     });
 
-    // === GPIO / RELAY REST ENDPOINTS (Central Server Access) ===
-    _server.on("/api/gpio", HTTP_GET, [this]() {
-        _server.sendHeader(F("Cache-Control"), F("no-cache"));
-        DynamicJsonDocument doc(512);
-        JsonArray arr = doc.to<JsonArray>();
-        GpioManager::getInstance().toJson(arr);
-        String out;
-        serializeJson(doc, out);
-        _server.send(200, "application/json", out);
-    });
-
-    _server.on("/api/gpio/state", HTTP_POST, [this]() {
-        if (!checkAuthOrReject()) return;
-
-        StaticJsonDocument<256> doc;
-        if (deserializeJson(doc, _server.arg("plain"))) {
-            sendJsonResponse(400, false, F("Invalid JSON"));
-            return;
-        }
-
-        uint8_t id = doc["id"] | 0;
-        String action = doc["action"] | "";
-        bool ok = false;
-
-        if (action.equalsIgnoreCase("toggle")) {
-            ok = GpioManager::getInstance().toggle(id);
-        } else if (action.equalsIgnoreCase("pulse")) {
-            unsigned long dur = doc["duration"] | 500;
-            ok = GpioManager::getInstance().pulse(id, dur);
-        } else if (doc.containsKey("state")) {
-            bool state = doc["state"].as<bool>();
-            ok = GpioManager::getInstance().setState(id, state);
-        }
-
-        sendJsonResponse(ok ? 200 : 400, ok, ok ? F("State updated") : F("Failed to set state"));
-    });
-
-    // === UNIFIED DIRECT COMMAND DISPATCHER (Central Server) ===
-    _server.on("/api/commands/execute", HTTP_POST, [this]() {
-        if (!checkAuthOrReject()) return;
-
-        StaticJsonDocument<256> doc;
-        if (deserializeJson(doc, _server.arg("plain"))) {
-            sendJsonResponse(400, false, F("Invalid JSON"));
-            return;
-        }
-
-        String cmdId = doc["commandId"] | doc["command_uuid"] | "";
-        String action = doc["action"] | doc["command_type"] | "";
-        uint8_t gpioId = doc["id"] | (uint8_t)(doc["channel_id"] | 0);
-
-        bool ok = false;
-        if (action.equalsIgnoreCase("reboot")) {
-            sendJsonResponse(200, true, F("Rebooting ESP-01..."));
-            delay(500);
-            ESP.restart();
-            return;
-        } else if (action.equalsIgnoreCase("setState")) {
-            bool state = doc["state"] | false;
-            ok = GpioManager::getInstance().setState(gpioId, state);
-        } else if (action.equalsIgnoreCase("toggle")) {
-            ok = GpioManager::getInstance().toggle(gpioId);
-        } else if (action.equalsIgnoreCase("pulse")) {
-            unsigned long dur = doc["duration"] | 500;
-            ok = GpioManager::getInstance().pulse(gpioId, dur);
-        } else if (action.equalsIgnoreCase("readInfo")) {
-            ok = true;
-        }
-
-        String out = String(F("{\"success\":")) + (ok ? F("true") : F("false")) +
-                     F(",\"commandId\":\"") + cmdId +
-                     F("\",\"status\":\"") + (ok ? F("ACKNOWLEDGED") : F("FAILED")) + F("\"}");
-        _server.send(ok ? 200 : 400, "application/json", out);
-    });
-
     // === RECEIVER CONFIG ===
     _server.on("/api/receiver", HTTP_GET, [this]() {
         DynamicJsonDocument doc(512);
@@ -336,7 +440,7 @@ void WebServerManager::registerApiRoutes() {
     });
 
     _server.on("/api/receiver", HTTP_POST, [this]() {
-        if (!checkAuthOrReject()) return;
+        if (!isAuthorized(false)) return;
 
         DynamicJsonDocument doc(512);
         if (deserializeJson(doc, _server.arg("plain"))) {
@@ -346,6 +450,16 @@ void WebServerManager::registerApiRoutes() {
 
         ReceiverConfig cfg = ReceiverClient::getInstance().getConfig();
         if (doc.containsKey("enabled")) cfg.enabled = doc["enabled"].as<bool>();
+        if (doc.containsKey("server")) {
+            String srv = doc["server"].as<String>();
+            int idx = srv.indexOf(':');
+            if (idx > 0) {
+                cfg.serverHost = srv.substring(0, idx);
+                cfg.serverPort = srv.substring(idx + 1).toInt();
+            } else {
+                cfg.serverHost = srv;
+            }
+        }
         if (doc.containsKey("serverHost")) cfg.serverHost = doc["serverHost"].as<String>();
         if (doc.containsKey("serverPort")) cfg.serverPort = doc["serverPort"].as<uint16_t>();
         if (doc.containsKey("authToken")) cfg.authToken = doc["authToken"].as<String>();
@@ -356,7 +470,7 @@ void WebServerManager::registerApiRoutes() {
 
     // === SYSTEM REBOOT ===
     _server.on("/api/system/reboot", HTTP_POST, [this]() {
-        if (!checkAuthOrReject()) return;
+        if (!isAuthorized(false)) return;
         sendJsonResponse(200, true, F("Rebooting..."));
         delay(500);
         ESP.restart();
@@ -392,7 +506,6 @@ void WebServerManager::registerStaticRoutes() {
     });
 }
 
-// Built-in minimalist ESP-01 setup portal (Login, Wi-Fi Setup, Firmware Upload)
 void WebServerManager::serveEmbeddedDashboard() {
     _server.sendHeader(F("Content-Encoding"), F("gzip"));
     _server.send_P(200, "text/html; charset=UTF-8", (const char*)DASHBOARD_HTML_GZ, DASHBOARD_HTML_GZ_LEN);

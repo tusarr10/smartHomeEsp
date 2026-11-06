@@ -8,7 +8,12 @@
 struct GpioChannel {
     uint8_t id;
     uint8_t pin;
-    const char* name;
+    String name;
+    String room;
+    String function;
+    bool activeLow;
+    uint8_t initialMode;
+    bool enabled;
     bool currentState;
     unsigned long pulseEndTime;
 };
@@ -26,16 +31,24 @@ public:
     bool toggle(uint8_t id);
     bool pulse(uint8_t id, unsigned long durationMs);
 
+    bool saveChannels(const JsonArrayConst& channels);
+    bool addOrUpdateChannel(uint8_t id, uint8_t pin, const String& name, const String& room,
+                            const String& function, bool activeLow, uint8_t initialMode, bool enabled);
+    bool removeChannel(uint8_t id);
+    size_t getChannelCount() const { return _channelCount; }
+
     void registerStateChangeCallback(GpioStateChangeCallback cb) { _stateCallback = cb; }
     void toJson(JsonArray& arr);
 
 private:
     GpioManager();
     GpioStateChangeCallback _stateCallback;
-    GpioChannel _channels[2];
+    GpioChannel _channels[MAX_GPIO_CHANNELS];
+    size_t _channelCount;
 
     void applyPhysicalPin(size_t index);
     void saveStates();
+    void saveConfiguration();
 };
 
 #endif // GPIO_MANAGER_H
