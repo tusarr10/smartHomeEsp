@@ -9,6 +9,6 @@
     "username": "admin",
     "password": "admin"
   },
-  "poll_interval_sec": 15,
+  "poll_interval_sec": 5,
   "poll_enabled": true
 }

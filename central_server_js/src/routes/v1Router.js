@@ -74,6 +74,7 @@ function createV1Router(nodeManager, db) {
     const scopes = db.getUserScopes(user.id);
 
     db.logAudit('USER_LOGIN', 'System', `User '${user.username}' signed in successfully`);
+    res.setHeader('Set-Cookie', `session=${session.token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`);
 
     res.json({
       success: true,

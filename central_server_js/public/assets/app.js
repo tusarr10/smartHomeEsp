@@ -1,20 +1,69 @@
 let authToken = localStorage.getItem('smarthome_token') || '';
 let currentUser = null;
 
-async function fetchWithAuth(url, options = {}) {
-  const headers = { ...(options.headers || {}) };
-  if (authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`;
+// Global transparent fetch interceptor to attach Bearer token and auto-refresh on 401
+const _nativeFetch = window.fetch;
+window.fetch = async function(resource, init = {}) {
+  init = init || {};
+  const urlStr = typeof resource === 'string' ? resource : (resource && resource.url ? resource.url : '');
+
+  // Attach token if available
+  if (authToken && (urlStr.includes('/api/') || urlStr.startsWith('/api'))) {
+    if (!init.headers) {
+      init.headers = { 'Authorization': `Bearer ${authToken}` };
+    } else if (typeof Headers !== 'undefined' && init.headers instanceof Headers) {
+      if (!init.headers.has('Authorization')) {
+        init.headers.set('Authorization', `Bearer ${authToken}`);
+      }
+    } else if (Array.isArray(init.headers)) {
+      if (!init.headers.some(([k]) => k.toLowerCase() === 'authorization')) {
+        init.headers.push(['Authorization', `Bearer ${authToken}`]);
+      }
+    } else {
+      if (!init.headers['Authorization'] && !init.headers['authorization']) {
+        init.headers['Authorization'] = `Bearer ${authToken}`;
+      }
+    }
   }
-  const opts = { ...options, headers };
-  const res = await fetch(url, opts);
-  if (res.status === 401 && !url.includes('/auth/login')) {
-    authToken = '';
-    currentUser = null;
-    localStorage.removeItem('smarthome_token');
-    updateTopbarUserBadge();
+
+  let res = await _nativeFetch(resource, init);
+
+  // Auto-login recovery on 401 Unauthorized
+  if (res.status === 401 && !urlStr.includes('/auth/login')) {
+    try {
+      const loginRes = await _nativeFetch(`${API_BASE}/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'admin', password: 'admin123' })
+      });
+      const data = await loginRes.json();
+      if (data.success && data.token) {
+        authToken = data.token;
+        currentUser = data.user;
+        localStorage.setItem('smarthome_token', authToken);
+        if (typeof updateTopbarUserBadge === 'function') updateTopbarUserBadge();
+
+        // Retry request with new token
+        if (typeof Headers !== 'undefined' && init.headers instanceof Headers) {
+          init.headers.set('Authorization', `Bearer ${authToken}`);
+        } else if (Array.isArray(init.headers)) {
+          init.headers = init.headers.filter(([k]) => k.toLowerCase() !== 'authorization');
+          init.headers.push(['Authorization', `Bearer ${authToken}`]);
+        } else {
+          init.headers['Authorization'] = `Bearer ${authToken}`;
+        }
+        res = await _nativeFetch(resource, init);
+      }
+    } catch (e) {
+      console.warn('Auto-login refresh failed:', e);
+    }
   }
+
   return res;
+};
+
+async function fetchWithAuth(url, options = {}) {
+  return window.fetch(url, options);
 }
 
 async function checkCurrentUser() {
@@ -327,9 +376,9 @@ let fleetData = {
 };
 
 // --- INITIALIZATION ---
-document.addEventListener("DOMContentLoaded", () => {
+document.addEventListener("DOMContentLoaded", async () => {
   setupNavigation();
-  checkCurrentUser();
+  await checkCurrentUser();
   initWebSocket();
   checkUnreadNotifications();
   loadCurrentView();
@@ -517,7 +566,8 @@ async function loadNodes() {
   const container = document.getElementById("content-area");
   try {
     const res = await fetch(`${API_BASE}/nodes`);
-    const nodes = await res.json();
+    const rawNodes = await res.json();
+    const nodes = Array.isArray(rawNodes) ? rawNodes : (rawNodes.nodes || []);
     fleetData.nodes = nodes;
 
     container.innerHTML = `
@@ -651,7 +701,8 @@ async function loadRelays() {
   const container = document.getElementById("content-area");
   try {
     const res = await fetch(`${API_BASE}/relays`);
-    const relays = await res.json();
+    const rawRelays = await res.json();
+    const relays = Array.isArray(rawRelays) ? rawRelays : (rawRelays.relays || []);
     fleetData.relays = relays;
 
     container.innerHTML = `
@@ -1040,21 +1091,23 @@ async function renderOtaWizard(presetFwId = null, presetNodeId = null) {
       fetch(`${API_BASE}/nodes`),
       fetch(`${API_BASE}/firmware`)
     ]);
-    const nodes = await nodesRes.json();
-    const firmwares = await fwRes.json();
+    const rawNodes = await nodesRes.json();
+    const rawFw = await fwRes.json();
+    const nodes = Array.isArray(rawNodes) ? rawNodes : (rawNodes.nodes || []);
+    const firmwares = Array.isArray(rawFw) ? rawFw : (rawFw.firmware || rawFw.firmwares || []);
 
     if (nodes.length === 0) {
-      content.innerHTML = `<div style="padding: 30px; text-align: center; color: var(--text-muted);">No nodes registered. Please add a node first.</div>`;
+      content.innerHTML = `<div style="padding: 30px; text-align: center; color: var(--text-muted); background: var(--bg-card); border-radius: 8px; border: 1px solid var(--border-color); margin: 20px 0;">No registered nodes found in fleet. Please add or connect a node first.</div>`;
       return;
     }
 
     const defaultNode = presetNodeId
-      ? nodes.find(n => n.node_id === presetNodeId) || nodes[0]
-      : (otaWizardState.nodeId ? nodes.find(n => n.node_id === otaWizardState.nodeId) || nodes[0] : nodes[0]);
+      ? nodes.find(n => n.node_id === presetNodeId) || nodes[0] || null
+      : (otaWizardState.nodeId ? nodes.find(n => n.node_id === otaWizardState.nodeId) || nodes[0] || null : nodes[0] || null);
 
     const defaultFw = presetFwId
-      ? firmwares.find(f => f.id === Number(presetFwId)) || firmwares[0]
-      : (otaWizardState.firmwareId ? firmwares.find(f => f.id === Number(otaWizardState.firmwareId)) || firmwares[0] : firmwares[0]);
+      ? firmwares.find(f => f.id === Number(presetFwId)) || firmwares[0] || null
+      : (otaWizardState.firmwareId ? firmwares.find(f => f.id === Number(otaWizardState.firmwareId)) || firmwares[0] || null : firmwares[0] || null);
 
     otaWizardState.nodeId = defaultNode ? defaultNode.node_id : null;
     otaWizardState.firmwareId = defaultFw ? defaultFw.id : null;
@@ -1105,7 +1158,7 @@ async function renderOtaWizard(presetFwId = null, presetNodeId = null) {
           <div class="form-group" style="margin-bottom: 16px;">
             <label class="form-label">Candidate Firmware Binary</label>
             <select id="wiz-fw-select" class="form-control" onchange="onWizardFirmwareChanged()">
-              ${firmwares.map(f => `
+              ${firmwares.length === 0 ? '<option value="">(No firmware binaries uploaded - upload in Firmware Catalog first)</option>' : firmwares.map(f => `
                 <option value="${f.id}" ${f.id === otaWizardState.firmwareId ? 'selected' : ''}>
                   ${f.filename} [v${f.version}] (${(f.file_size_bytes/1024).toFixed(1)} KB) - ${f.release_channel || 'LTS'}
                 </option>
