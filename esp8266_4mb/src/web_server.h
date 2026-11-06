@@ -38,12 +38,6 @@ public:
     String getDeviceName() const { return _deviceName; }
     void setDeviceName(const String& name);
 
-    // Authentication and endpoint handlers
-    bool isAuthorized(bool rejectIfNoAuth = true);
-    void handleStatus();
-    void handleCommand();
-    void handleSaveGpioConfig();
-
 private:
     WebServerManager();
     ESP8266WebServer _server;

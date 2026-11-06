@@ -80,7 +80,6 @@ String AuthManager::sha256(const String& input) {
 
 AuthManager::AuthManager()
     : _adminUser(DEFAULT_ADMIN_USER),
-      _adminPass(DEFAULT_ADMIN_PASS),
       _adminPasswordHash(sha256(DEFAULT_ADMIN_PASS)),
       _failedAttempts(0),
       _lockoutUntil(0) {
@@ -104,14 +103,8 @@ void AuthManager::loadFromStorage() {
         if (doc.containsKey("adminUser")) {
             _adminUser = doc["adminUser"].as<String>();
         }
-        if (doc.containsKey("adminPass")) {
-            _adminPass = doc["adminPass"].as<String>();
-            _adminPasswordHash = sha256(_adminPass);
-        } else if (doc.containsKey("adminPassHash")) {
+        if (doc.containsKey("adminPassHash")) {
             _adminPasswordHash = doc["adminPassHash"].as<String>();
-            if (_adminPasswordHash.equalsIgnoreCase(sha256(DEFAULT_ADMIN_PASS))) {
-                _adminPass = DEFAULT_ADMIN_PASS;
-            }
         }
     }
 }
@@ -120,7 +113,6 @@ void AuthManager::saveToStorage() {
     DynamicJsonDocument doc(512);
     StorageManager::getInstance().loadJsonFile(FILE_SYSTEM_CONFIG, doc);
     doc["adminUser"] = _adminUser;
-    doc["adminPass"] = _adminPass;
     doc["adminPassHash"] = _adminPasswordHash;
     StorageManager::getInstance().saveJsonFile(FILE_SYSTEM_CONFIG, doc);
 }
@@ -158,37 +150,25 @@ String AuthManager::extractToken(ESP8266WebServer& server) {
             return tok;
         }
     }
-    // 4. Check URL query token
-    if (server.hasArg("token")) {
-        return server.arg("token");
-    }
     return "";
 }
 
 bool AuthManager::authenticate(ESP8266WebServer& server) {
-    // 1. Validate Session Token (Header, Cookie, URL)
     String token = extractToken(server);
-    if (token.length() > 0) {
-        if (_currentSession.active && _currentSession.token.equals(token)) {
-            unsigned long now = millis();
-            if ((now - _currentSession.lastActivity) <= ((unsigned long)SESSION_TIMEOUT_SEC * 1000UL)) {
-                _currentSession.lastActivity = now; // Refresh session
-                return true;
-            } else {
-                _currentSession.active = false;
-            }
+    if (token.length() == 0) {
+        return false;
+    }
+
+    if (_currentSession.active && _currentSession.token.equals(token)) {
+        unsigned long now = millis();
+        if ((now - _currentSession.lastActivity) <= ((unsigned long)SESSION_TIMEOUT_SEC * 1000UL)) {
+            _currentSession.lastActivity = now; // Refresh session
+            return true;
+        } else {
+            // Expired
+            _currentSession.active = false;
         }
     }
-
-    // 2. Validate HTTP Basic Auth if present
-    String adminUser = getAdminUsername();
-    String adminPass = getAdminPassword();
-    if (server.authenticate(adminUser.c_str(), adminPass.c_str()) ||
-        server.authenticate(DEFAULT_ADMIN_USER, DEFAULT_ADMIN_PASS) ||
-        server.authenticate(DEFAULT_ADMIN_USER, "admin123")) {
-        return true;
-    }
-
     return false;
 }
 
@@ -199,35 +179,14 @@ bool AuthManager::login(const String& username, const String& password, String& 
         return false;
     }
 
-    String cleanUser = username;
-    cleanUser.trim();
-    String cleanPass = password;
-    cleanPass.trim();
-
-    String hash = sha256(cleanPass);
-    bool userMatch = cleanUser.equalsIgnoreCase(_adminUser) ||
-                     cleanUser.equalsIgnoreCase(DEFAULT_ADMIN_USER) ||
-                     cleanUser.length() == 0;
-
-    bool passMatch = false;
-    if (userMatch) {
-        if (cleanPass.equals(_adminPass) ||
-            cleanPass.equals(DEFAULT_ADMIN_PASS) ||
-            cleanPass.equals("admin123") ||
-            cleanPass.equals(_adminPasswordHash) ||
-            hash.equalsIgnoreCase(_adminPasswordHash)) {
-            passMatch = true;
-        }
-    }
-
-    if (passMatch) {
+    String hash = sha256(password);
+    if (username.equals(_adminUser) && hash.equalsIgnoreCase(_adminPasswordHash)) {
         _failedAttempts = 0;
-        _lockoutUntil = 0;
         _currentSession.token = generateRandomToken();
         _currentSession.lastActivity = now;
         _currentSession.active = true;
         outToken = _currentSession.token;
-        Serial.printf("[AUTH] User '%s' signed in successfully\n", cleanUser.c_str());
+        Serial.printf("[AUTH] Admin logged in successfully (User: %s)\n", username.c_str());
         return true;
     }
 
@@ -236,7 +195,7 @@ bool AuthManager::login(const String& username, const String& password, String& 
         _lockoutUntil = now + 10000; // 10 second backoff
         Serial.println(F("[AUTH] 5 failed attempts reached, locking for 10s"));
     } else {
-        delay(200);
+        delay(500); // Small anti-timing-attack delay
     }
 
     return false;
@@ -255,20 +214,18 @@ bool AuthManager::changePassword(const String& currentPassword, const String& ne
         return false;
     }
     String currentHash = sha256(currentPassword);
-    if (!currentPassword.equals(_adminPass) && !currentHash.equalsIgnoreCase(_adminPasswordHash) && !currentPassword.equals(DEFAULT_ADMIN_PASS)) {
+    if (!currentHash.equalsIgnoreCase(_adminPasswordHash)) {
         return false;
     }
 
-    _adminPass = newPassword;
     _adminPasswordHash = sha256(newPassword);
     saveToStorage();
     Serial.println(F("[AUTH] Admin password updated successfully"));
     return true;
 }
 
-void AuthManager::setAdminCredentials(const String& username, const String& password) {
+void AuthManager::setAdminCredentials(const String& username, const String& passwordHash) {
     _adminUser = username;
-    _adminPass = password;
-    _adminPasswordHash = sha256(password);
+    _adminPasswordHash = passwordHash;
     saveToStorage();
 }
