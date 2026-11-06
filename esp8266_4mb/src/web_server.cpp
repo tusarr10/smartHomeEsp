@@ -240,6 +240,8 @@ void WebServerManager::registerApiRoutes() {
         doc["bootCount"] = StorageManager::getInstance().getBootCount();
         doc["cpuFreq"] = ESP.getCpuFreqMHz();
         doc["mac"] = WiFi.macAddress();
+        doc["nodeId"] = ReceiverClient::getInstance().getConfig().nodeId;
+        doc["chipId"] = String(ESP.getChipId(), HEX);
         doc["formattedTime"] = AutomationEngine::getInstance().getFormattedTime();
 
         // Reset Diagnostics
