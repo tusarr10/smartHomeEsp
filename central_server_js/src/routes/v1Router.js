@@ -14,12 +14,14 @@ const {
 const OtaService = require('../otaService');
 const LittlefsService = require('../littlefsService');
 const ConfigSyncService = require('../configSyncService');
+const DiscoveryService = require('../discoveryService');
 
 function createV1Router(nodeManager, db) {
   const router = express.Router();
   const otaService = new OtaService(db, nodeManager);
   const littlefsService = new LittlefsService(db, nodeManager);
   const configSyncService = new ConfigSyncService(db, nodeManager);
+  const discoveryService = new DiscoveryService(db, nodeManager);
 
   // Configure Multer for Firmware Uploads (Disk Storage)
   const firmwareDir = path.join(__dirname, '..', '..', 'data', 'firmware');
@@ -345,7 +347,16 @@ function createV1Router(nodeManager, db) {
     };
 
     await nodeManager.processTelemetry(nodePayload, ip, 'MANUAL_ADD');
-    db.logAudit('NODE_ADDED', nodeId, `Manually registered node '${nodeName}' (${ip}) into fleet`);
+
+    // Save per-node credentials if provided
+    const authUsername = (req.body.auth_username || req.body.username || 'admin').trim();
+    const authPassword = req.body.auth_password || req.body.password || 'admin';
+    db.updateNodeSettings(nodeId, {
+      auth_username: authUsername,
+      auth_password: authPassword
+    });
+
+    db.logAudit('NODE_ADDED', nodeId, `Manually registered node '${nodeName}' (${ip}) into fleet [Auth User: ${authUsername}]`);
     nodeManager.broadcast('node_added', { nodeId, name: nodeName, ip });
 
     res.json({
@@ -387,6 +398,183 @@ function createV1Router(nodeManager, db) {
       res.status(404).json({ success: false, error: 'Node not found' });
     }
   });
+
+  // === LOCAL NETWORK DISCOVERY ROUTES ===
+  router.get('/nodes/discovery/subnets', authenticateUser(db), (req, res) => {
+    res.json({
+      success: true,
+      subnets: discoveryService.getLocalSubnets(),
+      primarySubnet: discoveryService.getPrimarySubnet()
+    });
+  });
+
+  router.post('/nodes/discovery/scan', requirePermission(db, 'devices:manage'), async (req, res) => {
+    try {
+      const results = await discoveryService.scanNetwork(req.body);
+      res.json(results);
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  // === PER-NODE SETTINGS & AUTHENTICATION ===
+  const updateSettingsHandler = (req, res) => {
+    const { nodeId } = req.params;
+    const existing = db.getNode(nodeId);
+    if (!existing) {
+      return res.status(404).json({ success: false, error: `Node '${nodeId}' not found` });
+    }
+
+    const updated = db.updateNodeSettings(nodeId, req.body);
+    db.logAudit('NODE_CONFIG_UPDATE', nodeId, `Updated configuration settings for node '${updated.name}'`);
+    nodeManager.broadcast('node_status', {
+      node_id: nodeId,
+      nodeId: nodeId,
+      name: updated.name,
+      is_online: updated.is_online,
+      status: updated.status
+    });
+
+    res.json({
+      success: true,
+      message: `Node '${updated.name}' settings saved successfully`,
+      node: updated
+    });
+  };
+
+  router.put('/nodes/:nodeId/settings', requirePermission(db, 'devices:manage'), updateSettingsHandler);
+  router.put('/nodes/:nodeId', requirePermission(db, 'devices:manage'), updateSettingsHandler);
+  router.post('/nodes/:nodeId/settings', requirePermission(db, 'devices:manage'), updateSettingsHandler);
+
+  // Test per-node credentials against live hardware
+  router.post('/nodes/:nodeId/test-auth', requirePermission(db, 'devices:manage'), async (req, res) => {
+    const { nodeId } = req.params;
+    const node = db.getNode(nodeId);
+    if (!node || !node.ip) {
+      return res.status(404).json({ success: false, error: 'Node not found or has no IP address' });
+    }
+
+    const user = (req.body.auth_username || node.auth_username || 'admin').trim();
+    const pass = req.body.auth_password !== undefined ? req.body.auth_password : (node.auth_password || 'admin');
+
+    const t0 = Date.now();
+    const headers = {
+      'Accept': 'application/json',
+      'Authorization': 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64')
+    };
+
+    try {
+      const response = await fetch(`http://${node.ip}/api/status`, {
+        headers,
+        signal: AbortSignal.timeout(3000)
+      });
+      const latencyMs = Date.now() - t0;
+
+      if (response.status === 401) {
+        return res.json({
+          success: false,
+          statusCode: 401,
+          latencyMs,
+          message: 'Authentication failed: Invalid User ID or Password on node'
+        });
+      }
+
+      if (response.ok) {
+        let nodeData = {};
+        try { nodeData = await response.json(); } catch {}
+        return res.json({
+          success: true,
+          statusCode: response.status,
+          latencyMs,
+          message: `Successfully authenticated with ${node.name} (${node.ip})!`,
+          nodeData
+        });
+      }
+
+      return res.json({
+        success: false,
+        statusCode: response.status,
+        latencyMs,
+        message: `Node responded with HTTP status ${response.status}: ${response.statusText}`
+      });
+    } catch (err) {
+      return res.json({
+        success: false,
+        error: err.message,
+        message: `Failed to connect to node at http://${node.ip}: ${err.message}`
+      });
+    }
+  });
+
+  // Push full configuration to node
+  router.post('/nodes/:nodeId/push-config', requirePermission(db, 'devices:manage'), async (req, res) => {
+    try {
+      const result = await nodeManager.pushNodeConfig(req.params.nodeId);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // === PER-NODE RELAY CONFIGURATION ===
+  router.post('/nodes/:nodeId/relays', requirePermission(db, 'devices:manage'), (req, res) => {
+    const { nodeId } = req.params;
+    const node = db.getNode(nodeId);
+    if (!node) {
+      return res.status(404).json({ success: false, error: `Node '${nodeId}' not found` });
+    }
+
+    try {
+      const relay = db.addOrUpdateRelay(nodeId, req.body);
+      db.logAudit('RELAY_ADDED', nodeId, `Configured channel ${relay.channel_id} ('${relay.name}', Pin D${relay.pin}) on node '${node.name}'`);
+      nodeManager.broadcast('relay_sync', { nodeId, channel_id: relay.channel_id, relay });
+      res.json({
+        success: true,
+        message: `Relay channel ${relay.channel_id} ('${relay.name}') configured successfully`,
+        relay
+      });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  router.put('/nodes/:nodeId/relays/:channelId', requirePermission(db, 'devices:manage'), (req, res) => {
+    const { nodeId, channelId } = req.params;
+    const node = db.getNode(nodeId);
+    if (!node) {
+      return res.status(404).json({ success: false, error: `Node '${nodeId}' not found` });
+    }
+
+    try {
+      const relay = db.addOrUpdateRelay(nodeId, { ...req.body, channel_id: Number(channelId) });
+      db.logAudit('RELAY_UPDATED', nodeId, `Updated channel ${channelId} ('${relay.name}', Pin D${relay.pin}) on node '${node.name}'`);
+      nodeManager.broadcast('relay_sync', { nodeId, channel_id: relay.channel_id, relay });
+      res.json({
+        success: true,
+        message: `Relay channel ${channelId} updated`,
+        relay
+      });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  router.delete('/nodes/:nodeId/relays/:channelId', requirePermission(db, 'devices:manage'), (req, res) => {
+    const { nodeId, channelId } = req.params;
+    const node = db.getNode(nodeId);
+    if (!node) {
+      return res.status(404).json({ success: false, error: `Node '${nodeId}' not found` });
+    }
+
+    db.deleteRelay(nodeId, Number(channelId));
+    db.logAudit('RELAY_DELETED', nodeId, `Removed relay channel ${channelId} from node '${node.name}'`);
+    nodeManager.broadcast('relay_sync', { nodeId, channel_id: Number(channelId), deleted: true });
+    res.json({
+      success: true,
+      message: `Relay channel ${channelId} deleted from node '${node.name}'`
+    });
+  });
+
 
   router.post('/nodes/:nodeId/restart', requirePermission(db, 'devices:reboot'), async (req, res) => {
     const node = db.getNode(req.params.nodeId);

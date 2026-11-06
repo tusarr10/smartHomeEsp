@@ -158,10 +158,20 @@ class NodeManager {
     const ip = node.ip || node.ip_address;
     const nodeId = node.node_id;
 
+    const user = node.auth_username || this.config.node_auth?.username || 'admin';
+    const pass = node.auth_password || this.config.node_auth?.password || 'admin';
+    const headers = { 'Accept': 'application/json' };
+    if (user && pass) {
+      headers['Authorization'] = 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
+    }
+    if (this.nodeAuthTokens.has(ip)) {
+      headers['X-Session-Token'] = this.nodeAuthTokens.get(ip);
+    }
+
     // Concurrently fetch GPIO channels and status diagnostics
     const [gpioRes, statusRes] = await Promise.allSettled([
-      fetch(`http://${ip}/api/gpio`, { signal: AbortSignal.timeout(2500) }).then(r => r.json()),
-      fetch(`http://${ip}/api/status`, { signal: AbortSignal.timeout(2500) }).then(r => r.json())
+      fetch(`http://${ip}/api/gpio`, { headers, signal: AbortSignal.timeout(2500) }).then(r => r.json()),
+      fetch(`http://${ip}/api/status`, { headers, signal: AbortSignal.timeout(2500) }).then(r => r.json())
     ]);
 
     // If both failed, node is unreachable via HTTP
@@ -426,7 +436,7 @@ class NodeManager {
     let directMsg = '';
 
     if (ip && ip.trim()) {
-      const res = await this.sendDirectLanHttp(ip, command);
+      const res = await this.sendDirectLanHttp(ip, command, nodeId);
       directOk = res.success;
       directMsg = res.message;
     }
@@ -500,8 +510,12 @@ class NodeManager {
     };
   }
 
-  async sendDirectLanHttp(ip, command) {
+  async sendDirectLanHttp(ip, command, nodeId = null) {
     const timeoutMs = this.config.direct_http_timeout_ms || 2500;
+    const node = nodeId ? this.db.getNode(nodeId) : (this.db.getNodeByIp ? this.db.getNodeByIp(ip) : null);
+    const user = node?.auth_username || this.config.node_auth?.username || 'admin';
+    const pass = node?.auth_password || this.config.node_auth?.password || 'admin';
+    const basicAuth = 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
 
     // Helper for making HTTP POST
     const makeRequest = (path, bodyObj, token) => {
@@ -513,6 +527,8 @@ class NodeManager {
         };
         if (token) {
           headers['Authorization'] = `Bearer ${token}`;
+        } else if (user && pass) {
+          headers['Authorization'] = basicAuth;
         }
 
         const req = http.request({
@@ -577,8 +593,15 @@ class NodeManager {
     return { success: false, message: res.error || `HTTP ${res.statusCode}` };
   }
 
-  async authenticateNode(ip) {
-    const creds = this.config.node_auth || { username: 'admin', password: 'admin' };
+  async authenticateNode(ip, customUser = null, customPass = null) {
+    let user = customUser;
+    let pass = customPass;
+    if (!user || !pass) {
+      const node = this.db.getNodeByIp ? this.db.getNodeByIp(ip) : null;
+      user = node?.auth_username || this.config.node_auth?.username || 'admin';
+      pass = node?.auth_password || this.config.node_auth?.password || 'admin';
+    }
+    const creds = { username: user, password: pass };
     return new Promise((resolve) => {
       const payload = JSON.stringify(creds);
       const req = http.request({
@@ -696,6 +719,80 @@ class NodeManager {
       }
     }
     return results;
+  }
+
+  async pushNodeConfig(nodeId) {
+    const node = this.db.getNode(nodeId);
+    if (!node || !node.ip) {
+      throw new Error(`Node '${nodeId}' not found or missing IP address`);
+    }
+
+    const relays = this.db.getRelays({ node_id: nodeId });
+    const channelsPayload = relays.map(r => ({
+      id: r.channel_id,
+      pin: r.pin,
+      name: r.name,
+      room: r.room,
+      function: r.function,
+      activeLow: r.active_low,
+      initialMode: r.initial_mode,
+      enabled: r.enabled
+    }));
+
+    const os = require('node:os');
+    let hostIp = '192.168.1.10';
+    try {
+      const ifaces = os.networkInterfaces();
+      for (const [name, list] of Object.entries(ifaces)) {
+        for (const item of list) {
+          if (item.family === 'IPv4' && !item.internal && !name.toLowerCase().includes('virtual') && !item.address.startsWith('192.168.56.')) {
+            hostIp = item.address;
+            break;
+          }
+        }
+      }
+    } catch {}
+
+    const receiverPayload = {
+      enabled: true,
+      server: `${hostIp}:${this.config.tcp_port || 2000}`
+    };
+
+    const user = node.auth_username || this.config.node_auth?.username || 'admin';
+    const pass = node.auth_password || this.config.node_auth?.password || 'admin';
+    const headers = {
+      'Content-Type': 'application/json',
+      'Authorization': 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64')
+    };
+
+    const results = {};
+
+    try {
+      const r1 = await fetch(`http://${node.ip}/api/gpio`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ channels: channelsPayload }),
+        signal: AbortSignal.timeout(3000)
+      });
+      results.gpio = { status: r1.status, ok: r1.ok };
+    } catch (e) {
+      results.gpio = { error: e.message };
+    }
+
+    try {
+      const r2 = await fetch(`http://${node.ip}/api/receiver`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(receiverPayload),
+        signal: AbortSignal.timeout(3000)
+      });
+      results.receiver = { status: r2.status, ok: r2.ok };
+    } catch (e) {
+      results.receiver = { error: e.message };
+    }
+
+    this.db.logAudit('CONFIG_PUSHED', nodeId, `Pushed configuration to node '${node.name}' (${node.ip})`);
+    return { success: true, results, pushedChannels: channelsPayload.length };
   }
 
   getFleetStats() {

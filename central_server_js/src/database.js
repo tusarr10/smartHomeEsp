@@ -465,6 +465,8 @@ class FleetDatabase {
     try { this.db.exec(`ALTER TABLE nodes ADD COLUMN littlefs_used INTEGER DEFAULT 0`); } catch {}
     try { this.db.exec(`ALTER TABLE nodes ADD COLUMN littlefs_available INTEGER DEFAULT 0`); } catch {}
     try { this.db.exec(`ALTER TABLE nodes ADD COLUMN wifi_ssid TEXT DEFAULT ''`); } catch {}
+    try { this.db.exec(`ALTER TABLE nodes ADD COLUMN auth_username TEXT DEFAULT 'admin'`); } catch {}
+    try { this.db.exec(`ALTER TABLE nodes ADD COLUMN auth_password TEXT DEFAULT 'admin'`); } catch {}
 
     this.seedDefaults();
   }
@@ -807,6 +809,8 @@ class FleetDatabase {
         free_heap: n.free_heap,
         is_online: Boolean(n.is_online),
         status: Boolean(n.is_online) ? 'Online' : 'Offline',
+        auth_username: n.auth_username || 'admin',
+        auth_password: n.auth_password || 'admin',
         room: n.room,
         location: n.location,
         category: n.category,
@@ -850,6 +854,8 @@ class FleetDatabase {
       free_heap: row.free_heap,
       is_online: Boolean(row.is_online),
       status: Boolean(row.is_online) ? 'Online' : 'Offline',
+      auth_username: row.auth_username || 'admin',
+      auth_password: row.auth_password || 'admin',
       room: row.room,
       location: row.location,
       category: row.category,
@@ -873,6 +879,123 @@ class FleetDatabase {
   renameNode(nodeId, newName) {
     const res = this.db.prepare('UPDATE nodes SET name = ? WHERE node_id = ?').run(newName, nodeId);
     return res.changes > 0;
+  }
+
+  getNodeByIp(ip) {
+    if (!ip) return null;
+    const row = this.db.prepare('SELECT node_id FROM nodes WHERE ip_address = ?').get(ip);
+    if (!row) return null;
+    return this.getNode(row.node_id);
+  }
+
+  updateNodeSettings(nodeId, settings = {}) {
+    const existing = this.getNode(nodeId);
+    if (!existing) return null;
+
+    const name = settings.name !== undefined ? settings.name.trim() : existing.name;
+    const room = settings.room !== undefined ? settings.room.trim() : existing.room;
+    const category = settings.category !== undefined ? settings.category.trim() : existing.category;
+    const location = settings.location !== undefined ? settings.location.trim() : existing.location;
+    const ip = settings.ip_address !== undefined ? settings.ip_address.trim() : (settings.ip !== undefined ? settings.ip.trim() : existing.ip_address);
+    const hw = settings.hardware_type !== undefined ? settings.hardware_type.trim() : existing.hardware_type;
+    const fw = settings.firmware_version !== undefined ? settings.firmware_version.trim() : existing.firmware_version;
+    const authUser = settings.auth_username !== undefined ? settings.auth_username.trim() : (existing.auth_username || 'admin');
+    const authPass = settings.auth_password !== undefined ? settings.auth_password : (existing.auth_password || 'admin');
+
+    this.db.prepare(`
+      UPDATE nodes SET
+        name = ?,
+        room = ?,
+        category = ?,
+        location = ?,
+        ip_address = ?,
+        hardware_type = ?,
+        firmware_version = ?,
+        auth_username = ?,
+        auth_password = ?
+      WHERE node_id = ?
+    `).run(name, room, category, location, ip, hw, fw, authUser, authPass, nodeId);
+
+    return this.getNode(nodeId);
+  }
+
+  addOrUpdateRelay(nodeId, relayData = {}) {
+    let rawId = relayData.channel_id ?? relayData.id;
+    if (typeof rawId === 'string') {
+      const match = rawId.match(/\d+/);
+      if (match) rawId = parseInt(match[0], 10);
+    }
+    const channelId = Number(rawId);
+    if (isNaN(channelId) || channelId <= 0) {
+      throw new Error('Valid numeric channel_id (e.g. 1, 2, 3 or ch1) is required');
+    }
+
+    const pin = Number(relayData.pin ?? 0);
+    const name = (relayData.name || `Relay ${channelId}`).trim();
+    const room = (relayData.room || 'General').trim();
+    const func = (relayData.function || 'Relay').trim();
+    const activeLow = (relayData.active_low === false || relayData.activeLow === false) ? 0 : 1;
+    const initialMode = Number(relayData.initial_mode ?? relayData.initialMode ?? 0);
+    const enabled = (relayData.enabled === false) ? 0 : 1;
+    const nowStr = new Date().toISOString();
+
+    const existing = this.db.prepare('SELECT id FROM relays WHERE node_id = ? AND channel_id = ?').get(nodeId, channelId);
+
+    if (existing) {
+      this.db.prepare(`
+        UPDATE relays SET
+          pin = ?, name = ?, room = ?, function = ?, active_low = ?, initial_mode = ?, enabled = ?, last_changed_at = ?
+        WHERE node_id = ? AND channel_id = ?
+      `).run(pin, name, room, func, activeLow, initialMode, enabled, nowStr, nodeId, channelId);
+    } else {
+      this.db.prepare(`
+        INSERT INTO relays (
+          node_id, channel_id, pin, name, room, function, active_low, initial_mode, enabled, current_state, requested_state, is_syncing, last_changed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?)
+      `).run(nodeId, channelId, pin, name, room, func, activeLow, initialMode, enabled, nowStr);
+    }
+
+    // Keep channels_json in nodes table in sync
+    const allRelays = this.getRelays({ node_id: nodeId });
+    const channels = allRelays.map(r => ({
+      id: r.channel_id,
+      pin: r.pin,
+      name: r.name,
+      room: r.room,
+      function: r.function,
+      activeLow: r.active_low,
+      initialMode: r.initial_mode,
+      enabled: r.enabled,
+      state: r.current_state
+    }));
+    this.db.prepare('UPDATE nodes SET channels_json = ? WHERE node_id = ?').run(JSON.stringify(channels), nodeId);
+
+    return this.getRelay(nodeId, channelId);
+  }
+
+  deleteRelay(nodeId, channelId) {
+    let numericId = channelId;
+    if (typeof channelId === 'string') {
+      const match = channelId.match(/\d+/);
+      if (match) numericId = parseInt(match[0], 10);
+    }
+    this.db.prepare('DELETE FROM relays WHERE node_id = ? AND channel_id = ?').run(nodeId, numericId);
+    
+    // Refresh channels_json in nodes table
+    const allRelays = this.getRelays({ node_id: nodeId });
+    const channels = allRelays.map(r => ({
+      id: r.channel_id,
+      pin: r.pin,
+      name: r.name,
+      room: r.room,
+      function: r.function,
+      activeLow: r.active_low,
+      initialMode: r.initial_mode,
+      enabled: r.enabled,
+      state: r.current_state
+    }));
+    this.db.prepare('UPDATE nodes SET channels_json = ? WHERE node_id = ?').run(JSON.stringify(channels), nodeId);
+    return true;
   }
 
   setNodeOnline(nodeId, isOnline) {
