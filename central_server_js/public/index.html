@@ -5,9 +5,54 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>SmartHome Central Management Platform</title>
   <link rel="icon" type="image/svg+xml" href="/assets/logo.svg">
-  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="stylesheet" href="/assets/style.css?v=2.1.0">
 </head>
 <body>
+  <!-- DEDICATED FULLSCREEN LOGIN SCREEN -->
+  <div id="login-screen" class="login-screen-overlay" style="display: none;">
+    <div class="login-card">
+      <div class="login-header">
+        <div class="login-brand-icon">
+          <img src="/assets/logo.svg" alt="SmartHome Logo" class="login-logo-img">
+        </div>
+        <h2 class="login-title">SmartHome Platform</h2>
+        <p class="login-subtitle">Central Fleet Management & Telemetry System</p>
+        <div class="login-auth-badge">
+          <span>🔐</span> Authentication Required
+        </div>
+      </div>
+
+      <form id="login-form" class="login-form" onsubmit="handleLoginSubmit(event)">
+        <div class="form-group">
+          <label for="login-username" class="form-label">Username</label>
+          <div class="input-with-icon">
+            <span class="input-icon">👤</span>
+            <input type="text" id="login-username" class="login-input" placeholder="Username (e.g. admin)" autocomplete="username" required>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="login-password" class="form-label">Password</label>
+          <div class="input-with-icon">
+            <span class="input-icon">🔒</span>
+            <input type="password" id="login-password" class="login-input" placeholder="Password" autocomplete="current-password" required>
+            <button type="button" class="pwd-toggle-btn" onclick="toggleLoginPasswordVisibility()" title="Show/Hide Password">👁️</button>
+          </div>
+        </div>
+
+        <div id="login-error-msg" class="login-error-alert" style="display: none;"></div>
+
+        <button type="submit" id="login-submit-btn" class="login-submit-btn">
+          <span>Sign In to Dashboard</span>
+          <span class="login-btn-arrow">→</span>
+        </button>
+      </form>
+
+      <div class="login-footer">
+        <span>Protected Fleet Management System &bull; Authorized Personnel Only</span>
+      </div>
+    </div>
+  </div>
   <!-- SIDEBAR NAVIGATION (RBAC, LittleFS, Config Sync, Commands, Fleet) -->
   <aside class="sidebar">
     <div class="sidebar-header">
@@ -116,8 +161,8 @@
         <!-- Active User & Session Profile Pill -->
         <div id="topbar-user-badge" onclick="handleUserBadgeClick()" title="Active Session | Click to manage account or sign out" style="cursor: pointer; padding: 6px 12px; border-radius: 8px; background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.3); display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 500; color: #a7f3d0; transition: all 0.2s ease;">
           <span>👤</span>
-          <span id="topbar-username">admin</span>
-          <span id="topbar-role" class="status-badge badge-online" style="font-size: 10px; padding: 2px 6px;">SUPER_ADMIN</span>
+          <span id="topbar-username">User</span>
+          <span id="topbar-role" class="status-badge badge-online" style="font-size: 10px; padding: 2px 6px;">AUTHENTICATING</span>
         </div>
       </div>
     </header>
@@ -133,6 +178,6 @@
   <!-- Floating Toast Notification Container -->
   <div id="toast-container" class="toast-container"></div>
 
-  <script src="/assets/app.js"></script>
+  <script src="/assets/app.js?v=2.1.0"></script>
 </body>
 </html>

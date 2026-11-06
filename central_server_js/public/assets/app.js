@@ -1,7 +1,7 @@
 let authToken = localStorage.getItem('smarthome_token') || '';
 let currentUser = null;
 
-// Global transparent fetch interceptor to attach Bearer token and auto-refresh on 401
+// Global transparent fetch interceptor to attach Bearer token and handle 401 Unauthorized
 const _nativeFetch = window.fetch;
 window.fetch = async function(resource, init = {}) {
   init = init || {};
@@ -28,34 +28,22 @@ window.fetch = async function(resource, init = {}) {
 
   let res = await _nativeFetch(resource, init);
 
-  // Auto-login recovery on 401 Unauthorized
+  // If token is rejected (401 Unauthorized), session has expired or been revoked
   if (res.status === 401 && !urlStr.includes('/auth/login')) {
-    try {
-      const loginRes = await _nativeFetch(`${API_BASE}/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: 'admin', password: 'admin123' })
-      });
-      const data = await loginRes.json();
-      if (data.success && data.token) {
-        authToken = data.token;
-        currentUser = data.user;
-        localStorage.setItem('smarthome_token', authToken);
-        if (typeof updateTopbarUserBadge === 'function') updateTopbarUserBadge();
-
-        // Retry request with new token
-        if (typeof Headers !== 'undefined' && init.headers instanceof Headers) {
-          init.headers.set('Authorization', `Bearer ${authToken}`);
-        } else if (Array.isArray(init.headers)) {
-          init.headers = init.headers.filter(([k]) => k.toLowerCase() !== 'authorization');
-          init.headers.push(['Authorization', `Bearer ${authToken}`]);
-        } else {
-          init.headers['Authorization'] = `Bearer ${authToken}`;
-        }
-        res = await _nativeFetch(resource, init);
+    if (authToken || currentUser) {
+      authToken = '';
+      currentUser = null;
+      localStorage.removeItem('smarthome_token');
+      if (ws) {
+        try { ws.close(); } catch {}
+        ws = null;
       }
-    } catch (e) {
-      console.warn('Auto-login refresh failed:', e);
+      if (typeof closeModal === 'function') closeModal();
+      if (typeof updateTopbarUserBadge === 'function') updateTopbarUserBadge();
+      if (typeof showLoginScreen === 'function') showLoginScreen();
+      if (typeof showToast === 'function') {
+        showToast({ title: 'Session Expired', message: 'Please sign in to continue.', severity: 'WARNING' });
+      }
     }
   }
 
@@ -68,40 +56,78 @@ async function fetchWithAuth(url, options = {}) {
 
 async function checkCurrentUser() {
   if (!authToken) {
-    // Auto-login with default admin if first time
-    try {
-      const loginRes = await fetch(`${API_BASE}/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: 'admin', password: 'admin123' })
-      });
-      const data = await loginRes.json();
-      if (data.success && data.token) {
-        authToken = data.token;
-        currentUser = data.user;
-        localStorage.setItem('smarthome_token', authToken);
-        updateTopbarUserBadge();
-        return;
-      }
-    } catch {}
+    currentUser = null;
     updateTopbarUserBadge();
-    return;
+    return false;
   }
 
   try {
     const res = await fetchWithAuth(`${API_BASE}/auth/me`);
+    if (res.status === 401) {
+      currentUser = null;
+      authToken = '';
+      localStorage.removeItem('smarthome_token');
+      updateTopbarUserBadge();
+      return false;
+    }
     const data = await res.json();
     if (data.success && data.user) {
       currentUser = data.user;
+      updateTopbarUserBadge();
+      return true;
     } else {
       currentUser = null;
       authToken = '';
       localStorage.removeItem('smarthome_token');
+      updateTopbarUserBadge();
+      return false;
     }
   } catch {
     currentUser = null;
+    updateTopbarUserBadge();
+    return false;
   }
-  updateTopbarUserBadge();
+}
+
+function showLoginScreen() {
+  const screen = document.getElementById('login-screen');
+  if (screen) {
+    screen.style.display = 'flex';
+    const uInput = document.getElementById('login-username');
+    if (uInput) {
+      setTimeout(() => uInput.focus(), 60);
+    }
+    const errEl = document.getElementById('login-error-msg');
+    if (errEl) {
+      errEl.style.display = 'none';
+      errEl.textContent = '';
+    }
+  }
+  const mainWrapper = document.querySelector('.main-wrapper');
+  const sidebar = document.querySelector('.sidebar');
+  if (mainWrapper) mainWrapper.style.visibility = 'hidden';
+  if (sidebar) sidebar.style.visibility = 'hidden';
+}
+
+function hideLoginScreen() {
+  const screen = document.getElementById('login-screen');
+  if (screen) {
+    screen.style.display = 'none';
+  }
+  const mainWrapper = document.querySelector('.main-wrapper');
+  const sidebar = document.querySelector('.sidebar');
+  if (mainWrapper) mainWrapper.style.visibility = 'visible';
+  if (sidebar) sidebar.style.visibility = 'visible';
+}
+
+function toggleLoginPasswordVisibility() {
+  const pwd = document.getElementById('login-password');
+  if (!pwd) return;
+  pwd.type = pwd.type === 'password' ? 'text' : 'password';
+}
+
+function showLoginModal() {
+  showLoginScreen();
 }
 
 function updateTopbarUserBadge() {
@@ -115,15 +141,15 @@ function updateTopbarUserBadge() {
     roleEl.textContent = primaryRole;
     roleEl.className = 'status-badge ' + (primaryRole === 'SUPER_ADMIN' ? 'badge-sync' : 'badge-online');
   } else {
-    nameEl.textContent = 'Sign In';
-    roleEl.textContent = 'GUEST';
+    nameEl.textContent = 'Not Signed In';
+    roleEl.textContent = 'LOCKED';
     roleEl.className = 'status-badge badge-offline';
   }
 }
 
 function handleUserBadgeClick() {
   if (!currentUser) {
-    showLoginModal();
+    showLoginScreen();
     return;
   }
 
@@ -167,34 +193,29 @@ function handleUserBadgeClick() {
   `);
 }
 
-function showLoginModal() {
-  openModal(`
-    <div class="modal-card" style="max-width: 400px;">
-      <div class="modal-header">
-        <h3>Sign In to SmartHome Platform</h3>
-        <button class="modal-close-btn" onclick="closeModal()">&times;</button>
-      </div>
-      <form onsubmit="handleLoginSubmit(event)" style="padding: 16px 0;">
-        <div style="margin-bottom: 12px;">
-          <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Username</label>
-          <input type="text" id="login-username" value="admin" required class="input-field" style="width:100%;">
-        </div>
-        <div style="margin-bottom: 16px;">
-          <label style="display:block; font-size:12px; color:var(--text-muted); margin-bottom:4px;">Password</label>
-          <input type="password" id="login-password" value="admin123" required class="input-field" style="width:100%;">
-        </div>
-        <div id="login-error-msg" style="color:var(--accent-red); font-size:12.5px; margin-bottom:12px; display:none;"></div>
-        <button type="submit" class="btn btn-primary" style="width:100%;">Sign In</button>
-      </form>
-    </div>
-  `);
-}
-
 async function handleLoginSubmit(e) {
-  e.preventDefault();
-  const u = document.getElementById('login-username').value.trim();
-  const p = document.getElementById('login-password').value;
+  if (e) e.preventDefault();
+  const uInput = document.getElementById('login-username');
+  const pInput = document.getElementById('login-password');
   const errEl = document.getElementById('login-error-msg');
+  const btn = document.getElementById('login-submit-btn');
+
+  const u = uInput ? uInput.value.trim() : '';
+  const p = pInput ? pInput.value : '';
+
+  if (!u || !p) {
+    if (errEl) {
+      errEl.textContent = 'Please enter both username and password';
+      errEl.style.display = 'flex';
+    }
+    return;
+  }
+
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span>Signing In...</span>';
+  }
+  if (errEl) errEl.style.display = 'none';
 
   try {
     const res = await fetch(`${API_BASE}/auth/login`, {
@@ -208,16 +229,29 @@ async function handleLoginSubmit(e) {
       currentUser = data.user;
       localStorage.setItem('smarthome_token', authToken);
       updateTopbarUserBadge();
-      closeModal();
+      hideLoginScreen();
+      if (pInput) pInput.value = '';
       showToast({ title: 'Signed In', message: `Welcome back, ${data.user.full_name || data.user.username}!`, severity: 'SUCCESS' });
+      initWebSocket();
+      checkUnreadNotifications();
       loadCurrentView();
     } else {
-      errEl.textContent = data.error || 'Authentication failed';
-      errEl.style.display = 'block';
+      if (errEl) {
+        errEl.textContent = data.error || 'Authentication failed';
+        errEl.style.display = 'flex';
+      }
+      if (pInput) pInput.focus();
     }
   } catch (err) {
-    errEl.textContent = 'Server connection error';
-    errEl.style.display = 'block';
+    if (errEl) {
+      errEl.textContent = 'Server connection error. Please try again.';
+      errEl.style.display = 'flex';
+    }
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = '<span>Sign In to Dashboard</span><span class="login-btn-arrow">→</span>';
+    }
   }
 }
 
@@ -228,10 +262,22 @@ async function logoutUser() {
   authToken = '';
   currentUser = null;
   localStorage.removeItem('smarthome_token');
-  updateTopbarUserBadge();
   closeModal();
+
+  if (ws) {
+    try { ws.close(); } catch {}
+    ws = null;
+  }
+
+  updateTopbarUserBadge();
+
+  const container = document.getElementById("content-area");
+  if (container) {
+    container.innerHTML = '';
+  }
+
   showToast({ title: 'Signed Out', message: 'You have been signed out.', severity: 'INFO' });
-  loadCurrentView();
+  showLoginScreen();
 }
 
 async function submitPasswordChange() {
@@ -260,6 +306,10 @@ async function submitPasswordChange() {
 }
 
 function switchView(view) {
+  if (!currentUser) {
+    showLoginScreen();
+    return;
+  }
   const item = document.querySelector(`.nav-item[data-view="${view}"]`);
   if (item) {
     document.querySelectorAll(".nav-item").forEach(i => i.classList.remove("active"));
@@ -378,12 +428,21 @@ let fleetData = {
 // --- INITIALIZATION ---
 document.addEventListener("DOMContentLoaded", async () => {
   setupNavigation();
-  await checkCurrentUser();
-  initWebSocket();
-  checkUnreadNotifications();
-  loadCurrentView();
-  setInterval(refreshActiveMetrics, 10000);
-  setInterval(checkUnreadNotifications, 25000);
+  const isAuthenticated = await checkCurrentUser();
+  if (isAuthenticated) {
+    hideLoginScreen();
+    initWebSocket();
+    checkUnreadNotifications();
+    loadCurrentView();
+  } else {
+    showLoginScreen();
+  }
+  setInterval(() => {
+    if (currentUser) refreshActiveMetrics();
+  }, 10000);
+  setInterval(() => {
+    if (currentUser) checkUnreadNotifications();
+  }, 25000);
 });
 
 // --- NAVIGATION ---
@@ -391,6 +450,10 @@ function setupNavigation() {
   document.querySelectorAll(".nav-item").forEach(item => {
     item.addEventListener("click", e => {
       e.preventDefault();
+      if (!currentUser) {
+        showLoginScreen();
+        return;
+      }
       document.querySelectorAll(".nav-item").forEach(i => i.classList.remove("active"));
       item.classList.add("active");
       currentView = item.dataset.view;
@@ -401,6 +464,10 @@ function setupNavigation() {
 }
 
 function loadCurrentView() {
+  if (!currentUser) {
+    showLoginScreen();
+    return;
+  }
   const container = document.getElementById("content-area");
   container.innerHTML = `<div style="text-align:center; padding: 40px; color: var(--text-secondary);">Loading ${currentView}...</div>`;
 
@@ -448,7 +515,9 @@ function initWebSocket() {
 
   ws.onclose = () => {
     updateWsStatus(false);
-    setTimeout(initWebSocket, 4000);
+    if (currentUser) {
+      setTimeout(initWebSocket, 4000);
+    }
   };
 
   ws.onerror = () => {
@@ -493,6 +562,8 @@ function handleLiveEvent(type, data) {
     if (currentView === "commands") loadCommands();
   } else if (type === "config_updated" || type === "config_synced") {
     if (currentView === "config-sync") loadConfigSync();
+  } else if (type === "littlefs_synced") {
+    if (currentView === "littlefs") refreshLittlefsList();
   }
 }
 
@@ -561,61 +632,1008 @@ async function loadOverview() {
   }
 }
 
-// --- 2. NODES, DISCOVERY SCANNER & NODE SETTINGS ---
+// --- 2. HOME-CENTRIC NODE MANAGEMENT & DISCOVERY SCANNER ---
+let activeHomeId = null;
+let activeRoomTab = 'all'; // 'all', numeric roomId, or 'unassigned'
+let cachedHomes = [];
+let cachedRooms = [];
+
 async function loadNodes() {
   const container = document.getElementById("content-area");
   try {
-    const res = await fetch(`${API_BASE}/nodes`);
-    const rawNodes = await res.json();
-    const nodes = Array.isArray(rawNodes) ? rawNodes : (rawNodes.nodes || []);
-    fleetData.nodes = nodes;
+    // 1. Fetch homes
+    let homes = [];
+    try {
+      const homesRes = await fetchWithAuth(`${API_BASE}/homes`);
+      const homesData = await homesRes.json();
+      if (homesData.success && Array.isArray(homesData.homes)) {
+        homes = homesData.homes;
+      }
+    } catch (e) {
+      console.warn("Failed to fetch homes:", e);
+    }
+
+    if (homes.length === 0) {
+      homes = [{ id: 1, name: 'Primary Residence', owner_user_id: null, rooms_count: 1, nodes_count: 2 }];
+    }
+    cachedHomes = homes;
+
+    // Default active home to first available home
+    if (!activeHomeId || !homes.some(h => Number(h.id) === Number(activeHomeId))) {
+      activeHomeId = homes[0].id;
+    }
+    const currentHome = homes.find(h => Number(h.id) === Number(activeHomeId)) || homes[0];
+
+    // 2. Fetch rooms for active home
+    let rooms = [];
+    try {
+      const roomsRes = await fetchWithAuth(`${API_BASE}/homes/${activeHomeId}/rooms`);
+      const roomsData = await roomsRes.json();
+      if (roomsData.success && Array.isArray(roomsData.rooms)) {
+        rooms = roomsData.rooms;
+      }
+    } catch (e) {
+      console.warn("Failed to fetch rooms:", e);
+    }
+    cachedRooms = rooms;
+
+    // 3. Fetch nodes
+    let allNodes = [];
+    try {
+      const nodesRes = await fetchWithAuth(`${API_BASE}/nodes`);
+      const rawNodes = await nodesRes.json();
+      allNodes = Array.isArray(rawNodes) ? rawNodes : (rawNodes.nodes || []);
+      fleetData.nodes = allNodes;
+    } catch (e) {
+      console.warn("Failed to fetch nodes:", e);
+    }
+
+    // Separate home nodes and unassigned nodes
+    const homeNodes = allNodes.filter(n => Number(n.home_id) === Number(activeHomeId));
+    const unassignedNodes = allNodes.filter(n => !n.home_id || !n.room_id);
+
+    // Validate active room tab
+    if (activeRoomTab !== 'all' && activeRoomTab !== 'unassigned') {
+      const roomIdNum = Number(activeRoomTab);
+      if (!rooms.some(r => Number(r.id) === roomIdNum)) {
+        activeRoomTab = 'all';
+      }
+    }
 
     container.innerHTML = `
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 10px;">
-        <div>
-          <div style="font-size: 16px; font-weight: 600;">Node Fleet Management</div>
-          <div style="font-size: 13px; color: var(--text-secondary);">${nodes.length} Node(s) registered in fleet</div>
-        </div>
-        <div style="display: flex; gap: 10px;">
-          <button class="btn btn-secondary" onclick="showNetworkScannerModal()">🔍 Scan Local Network</button>
-          <button class="btn btn-primary" onclick="showAddNodeModal()">+ Add Node</button>
-        </div>
-      </div>
-      <div class="cards-grid">
-        ${nodes.length === 0 ? '<div style="color: var(--text-secondary); padding: 20px; grid-column: 1 / -1; background: var(--bg-secondary); border-radius: 8px; border: 1px dashed var(--border-color); text-align: center;">No nodes currently registered. Click <strong>"🔍 Scan Local Network"</strong> to discover live ESP devices or <strong>"+ Add Node"</strong> to manually register one.</div>' : ''}
-        ${nodes.map(n => `
-          <div class="node-card">
-            <div class="card-header">
-              <div>
-                <div class="card-title">${escapeHtml(n.name || n.node_id)}</div>
-                <div class="card-meta">ID: <code>${escapeHtml(n.node_id)}</code></div>
-              </div>
-              <span class="status-badge ${n.is_online ? 'badge-online' : 'badge-offline'}">
-                <span class="pulse-dot"></span> ${n.status || (n.is_online ? 'Online' : 'Offline')}
-              </span>
-            </div>
-            <div style="font-size: 13px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 12px 0;">
-              <div><strong>HW:</strong> ${escapeHtml(n.hardware_type || 'ESP8266')}</div>
-              <div><strong>FW:</strong> v${escapeHtml(n.firmware_version || '1.0.0')}</div>
-              <div><strong>IP:</strong> <a href="http://${escapeHtml(n.ip_address)}" target="_blank" style="color: var(--accent-blue);">${escapeHtml(n.ip_address || 'N/A')}</a></div>
-              <div><strong>RSSI:</strong> ${n.rssi || -70} dBm</div>
-              <div><strong>Room:</strong> ${escapeHtml(n.room || 'General')}</div>
-              <div><strong>Free Heap:</strong> ${(Number(n.free_heap || 0) / 1024).toFixed(1)} KB</div>
-            </div>
-            <div style="border-top: 1px solid var(--border-color); padding-top: 12px; display: flex; gap: 8px; flex-wrap: wrap;">
-              <button class="btn btn-primary" style="font-size: 12px; padding: 6px 10px;" onclick="showNodeSettingsModal('${n.node_id}')">⚙️ Settings</button>
-              <button class="btn btn-secondary" style="font-size: 12px; padding: 6px 10px;" onclick="syncPinsWithHardware('${n.node_id}')">⚡ Sync Pins</button>
-              <button class="btn btn-secondary" style="font-size: 12px; padding: 6px 10px;" onclick="restartNode('${n.node_id}')">🔄 Reboot</button>
-              <button class="btn btn-danger" style="font-size: 12px; padding: 6px 10px;" onclick="deleteNode('${n.node_id}')">🗑️ Delete</button>
-            </div>
+      <!-- HOME SELECTOR BAR -->
+      <div class="home-selector-bar">
+        <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span style="font-size: 20px;">🏡</span>
+            <select class="home-select-dropdown" id="active-home-select" onchange="handleHomeChange(this.value)">
+              ${homes.map(h => `
+                <option value="${h.id}" ${Number(h.id) === Number(activeHomeId) ? 'selected' : ''}>
+                  ${escapeHtml(h.name)} (${h.nodes_count ?? 0} devices, ${h.rooms_count ?? 0} rooms)
+                </option>
+              `).join('')}
+            </select>
           </div>
-        `).join("")}
+          <button class="btn btn-secondary" style="font-size: 12px; padding: 6px 12px;" onclick="showAddHomeModal()">+ Add Home</button>
+          <button class="btn btn-secondary" style="font-size: 12px; padding: 6px 12px;" onclick="showManageHomeModal(${activeHomeId})">⚙️ Home Settings & Members</button>
+        </div>
+
+        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+          <button class="btn btn-secondary" style="font-size: 12px; padding: 6px 12px;" onclick="showAddRoomModal(${activeHomeId})">+ Add Room</button>
+          <button class="btn btn-secondary" style="font-size: 12px; padding: 6px 12px;" onclick="showNetworkScannerModal()">🔍 Scan Network</button>
+          <button class="btn btn-primary" style="font-size: 12px; padding: 6px 12px;" onclick="showAddNodeModal()">+ Add Node</button>
+        </div>
       </div>
+
+      <!-- HOME SUMMARY STRIP -->
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; flex-wrap: wrap; gap: 10px;">
+        <div class="home-summary-strip">
+          <span class="home-summary-pill">
+            📍 <strong>${escapeHtml(currentHome.name)}</strong>
+          </span>
+          <span class="home-summary-pill">
+            ${currentHome.owner_username 
+              ? `👑 Owner: <strong>${escapeHtml(currentHome.owner_username)}</strong>` 
+              : `👑 <em>Managed by Super Admin (Bootstrap Mode)</em>`}
+          </span>
+          <span class="home-summary-pill">
+            🚪 <strong>${rooms.length}</strong> Room(s)
+          </span>
+          <span class="home-summary-pill">
+            ⚡ <strong>${homeNodes.filter(n => n.is_online).length} / ${homeNodes.length}</strong> Online
+          </span>
+        </div>
+
+        ${unassignedNodes.length > 0 ? `
+          <button class="btn btn-secondary" style="font-size: 11.5px; padding: 4px 10px; border-color: rgba(245,158,11,0.4); color: #fbbf24;" onclick="switchRoomTab('unassigned')">
+            ⚠️ ${unassignedNodes.length} Unassigned Device(s) waiting for room placement
+          </button>
+        ` : ''}
+      </div>
+
+      <!-- ROOM SELECTOR TABS -->
+      <div class="room-tabs-nav">
+        <button class="room-tab-btn ${activeRoomTab === 'all' ? 'active' : ''}" onclick="switchRoomTab('all')">
+          🏠 All Rooms <span class="room-tab-badge">${homeNodes.length}</span>
+        </button>
+        ${rooms.map(r => {
+          const roomNodeCount = homeNodes.filter(n => Number(n.room_id) === Number(r.id)).length;
+          return `
+            <button class="room-tab-btn ${activeRoomTab === String(r.id) ? 'active' : ''}" onclick="switchRoomTab('${r.id}')">
+              ${r.icon === 'bed' ? '🛏️' : r.icon === 'couch' ? '🛋️' : r.icon === 'kitchen' ? '🍳' : '🚪'} ${escapeHtml(r.name)}
+              <span class="room-tab-badge">${roomNodeCount}</span>
+            </button>
+          `;
+        }).join('')}
+        <button class="room-tab-btn ${activeRoomTab === 'unassigned' ? 'active' : ''}" onclick="switchRoomTab('unassigned')">
+          📥 Unassigned Nodes <span class="room-tab-badge" style="${unassignedNodes.length > 0 ? 'background:#f59e0b; color:#111827; font-weight:700;' : ''}">${unassignedNodes.length}</span>
+        </button>
+      </div>
+
+      <!-- ROOM / NODE CONTENT -->
+      ${renderRoomNodeSections({
+        activeRoomTab,
+        currentHome,
+        rooms,
+        homeNodes,
+        unassignedNodes
+      })}
     `;
   } catch (e) {
-    container.innerHTML = `<div style="color: var(--accent-red);">Error loading nodes: ${e.message}</div>`;
+    container.innerHTML = `<div style="color: var(--accent-red); padding: 20px;">Error loading nodes: ${e.message}</div>`;
   }
 }
+
+function handleHomeChange(val) {
+  activeHomeId = Number(val);
+  activeRoomTab = 'all';
+  loadNodes();
+}
+
+function switchRoomTab(tab) {
+  activeRoomTab = tab;
+  loadNodes();
+}
+
+function renderRoomNodeSections({ activeRoomTab, currentHome, rooms, homeNodes, unassignedNodes }) {
+  if (activeRoomTab === 'unassigned') {
+    return `
+      <div class="unassigned-banner">
+        <div>
+          <div style="font-weight: 600; color: #fbbf24; font-size: 14px;">📥 Unassigned Nodes Queue</div>
+          <div style="font-size: 12.5px; color: var(--text-secondary); margin-top: 2px;">
+            These newly registered or detached microcontrollers do not currently belong to any room. Assign them to a room to organize your smart home.
+          </div>
+        </div>
+      </div>
+      ${unassignedNodes.length === 0 ? `
+        <div style="color: var(--text-secondary); padding: 32px; background: var(--bg-secondary); border-radius: 8px; border: 1px dashed var(--border-color); text-align: center;">
+          🎉 All nodes in your fleet are currently assigned to homes and rooms!
+        </div>
+      ` : `
+        <div class="cards-grid">
+          ${unassignedNodes.map(n => renderNodeCard(n, true)).join('')}
+        </div>
+      `}
+    `;
+  }
+
+  if (activeRoomTab !== 'all') {
+    const targetRoomId = Number(activeRoomTab);
+    const room = rooms.find(r => Number(r.id) === targetRoomId);
+    const roomNodes = homeNodes.filter(n => Number(n.room_id) === targetRoomId);
+
+    return `
+      <div class="room-section-header">
+        <div class="room-section-title">
+          <span>${room?.icon === 'bed' ? '🛏️' : room?.icon === 'couch' ? '🛋️' : '🚪'}</span>
+          <span>${escapeHtml(room?.name || 'Room')}</span>
+          <span style="font-size: 12px; font-weight: normal; color: var(--text-secondary);">(${roomNodes.length} devices)</span>
+        </div>
+        <div>
+          <button class="btn btn-secondary" style="font-size: 11.5px; padding: 4px 10px;" onclick="showEditRoomModal(${targetRoomId})">⚙️ Edit Room</button>
+        </div>
+      </div>
+      ${roomNodes.length === 0 ? `
+        <div style="color: var(--text-secondary); padding: 28px; background: var(--bg-secondary); border-radius: 8px; border: 1px dashed var(--border-color); text-align: center;">
+          No devices assigned to <strong>${escapeHtml(room?.name || 'this room')}</strong>. Click <strong>"📦 Move"</strong> on any device to place it here.
+        </div>
+      ` : `
+        <div class="cards-grid">
+          ${roomNodes.map(n => renderNodeCard(n, false)).join('')}
+        </div>
+      `}
+    `;
+  }
+
+  // "All Rooms" view: Group by room
+  if (rooms.length === 0 && homeNodes.length === 0) {
+    return `
+      <div style="color: var(--text-secondary); padding: 32px; background: var(--bg-secondary); border-radius: 8px; border: 1px dashed var(--border-color); text-align: center;">
+        No rooms or devices currently in <strong>${escapeHtml(currentHome.name)}</strong>. Click <strong>"+ Add Room"</strong> to create your first room.
+      </div>
+    `;
+  }
+
+  let html = '';
+  for (const r of rooms) {
+    const roomNodes = homeNodes.filter(n => Number(n.room_id) === Number(r.id));
+    html += `
+      <div class="room-section-header">
+        <div class="room-section-title">
+          <span>${r.icon === 'bed' ? '🛏️' : r.icon === 'couch' ? '🛋️' : r.icon === 'kitchen' ? '🍳' : '🚪'}</span>
+          <span>${escapeHtml(r.name)}</span>
+          <span style="font-size: 12px; font-weight: normal; color: var(--text-secondary);">(${roomNodes.length} node${roomNodes.length === 1 ? '' : 's'})</span>
+        </div>
+        <div>
+          <button class="btn btn-secondary" style="font-size: 11px; padding: 3px 8px;" onclick="showEditRoomModal(${r.id})">⚙️ Edit Room</button>
+        </div>
+      </div>
+      ${roomNodes.length === 0 ? `
+        <div style="color: var(--text-muted); padding: 16px; background: rgba(255,255,255,0.02); border-radius: 6px; font-size: 12.5px; margin-bottom: 14px;">
+          No devices currently assigned to this room.
+        </div>
+      ` : `
+        <div class="cards-grid" style="margin-bottom: 24px;">
+          ${roomNodes.map(n => renderNodeCard(n, false)).join('')}
+        </div>
+      `}
+    `;
+  }
+
+  return html;
+}
+
+function renderNodeCard(n, isUnassigned = false) {
+  return `
+    <div class="node-card">
+      <div class="card-header">
+        <div>
+          <div class="card-title">${escapeHtml(n.name || n.node_id)}</div>
+          <div class="card-meta">ID: <code>${escapeHtml(n.node_id)}</code></div>
+        </div>
+        <span class="status-badge ${n.is_online ? 'badge-online' : 'badge-offline'}">
+          <span class="pulse-dot"></span> ${n.status || (n.is_online ? 'Online' : 'Offline')}
+        </span>
+      </div>
+
+      <!-- LOCATION / HOME / ROOM HIERARCHY BADGES -->
+      <div style="display: flex; gap: 6px; margin: 8px 0; flex-wrap: wrap;">
+        ${n.home_name ? `<span class="badge-home">🏡 ${escapeHtml(n.home_name)}</span>` : '<span class="badge-unassigned">⚠️ Unassigned Home</span>'}
+        ${n.room_name ? `<span class="badge-room">🚪 ${escapeHtml(n.room_name)}</span>` : '<span class="badge-unassigned">⚠️ No Room</span>'}
+        <span class="status-badge" style="font-size: 11px; padding: 2px 6px;">${escapeHtml(n.hardware_type || 'ESP8266')}</span>
+      </div>
+
+      <div style="font-size: 12.5px; display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 10px 0;">
+        <div><strong>FW:</strong> v${escapeHtml(n.firmware_version || '1.0.0')}</div>
+        <div><strong>IP:</strong> <a href="http://${escapeHtml(n.ip_address)}" target="_blank" style="color: var(--accent-blue);">${escapeHtml(n.ip_address || 'N/A')}</a></div>
+        <div><strong>RSSI:</strong> ${n.rssi || -70} dBm</div>
+        <div><strong>Heap:</strong> ${(Number(n.free_heap || 0) / 1024).toFixed(1)} KB</div>
+        <div><strong>Relays:</strong> ${n.relays_count || (n.channels ? n.channels.length : 0)} Active</div>
+        <div><strong>Uptime:</strong> ${Math.floor((n.uptime_sec || 0) / 3600)}h ${Math.floor(((n.uptime_sec || 0) % 3600) / 60)}m</div>
+      </div>
+
+      <div style="border-top: 1px solid var(--border-color); padding-top: 10px; display: flex; gap: 6px; flex-wrap: wrap;">
+        ${isUnassigned ? `
+          <button class="btn btn-primary" style="font-size: 11.5px; padding: 5px 10px;" onclick="showAssignNodeModal('${n.node_id}')">➕ Assign to Room</button>
+        ` : `
+          <button class="btn btn-primary" style="font-size: 11.5px; padding: 5px 9px;" onclick="showNodeSettingsModal('${n.node_id}')">⚙️ Settings</button>
+          <button class="btn btn-secondary" style="font-size: 11.5px; padding: 5px 9px;" onclick="showMoveNodeModal('${n.node_id}')">📦 Move</button>
+        `}
+        <button class="btn btn-secondary" style="font-size: 11.5px; padding: 5px 9px;" onclick="syncPinsWithHardware('${n.node_id}')">⚡ Sync Pins</button>
+        <button class="btn btn-secondary" style="font-size: 11.5px; padding: 5px 9px;" onclick="restartNode('${n.node_id}')">🔄 Reboot</button>
+        ${!isUnassigned ? `
+          <button class="btn btn-secondary" style="font-size: 11.5px; padding: 5px 9px; color: #fbbf24;" onclick="confirmUnassignNode('${n.node_id}')">📤 Unassign</button>
+        ` : ''}
+        <button class="btn btn-danger" style="font-size: 11.5px; padding: 5px 9px;" onclick="deleteNode('${n.node_id}')">🗑️ Delete</button>
+      </div>
+    </div>
+  `;
+}
+
+// ==========================================
+// HOME, ROOM, & NODE ASSIGNMENT MODALS
+// ==========================================
+
+function showAddHomeModal() {
+  const html = `
+    <div class="modal-content">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+        <h3 style="margin: 0;">🏡 Create New Home</h3>
+        <button class="btn btn-secondary" style="padding: 4px 8px;" onclick="closeModal()">&times;</button>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Home Name *</label>
+        <input type="text" id="add-home-name" class="form-control" placeholder="e.g. Summer Beach House, Office" value="">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Description (Optional)</label>
+        <input type="text" id="add-home-desc" class="form-control" placeholder="e.g. Primary holiday property" value="">
+      </div>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+        <div class="form-group">
+          <label class="form-label">Timezone</label>
+          <input type="text" id="add-home-tz" class="form-control" placeholder="UTC" value="UTC">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Address</label>
+          <input type="text" id="add-home-addr" class="form-control" placeholder="City, Country" value="">
+        </div>
+      </div>
+      <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px;">
+        <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="submitAddHome()">Create Home</button>
+      </div>
+    </div>
+  `;
+  openModal(html);
+}
+
+async function submitAddHome() {
+  const name = document.getElementById("add-home-name").value.trim();
+  const description = document.getElementById("add-home-desc").value.trim();
+  const timezone = document.getElementById("add-home-tz").value.trim();
+  const address = document.getElementById("add-home-addr").value.trim();
+
+  if (!name) {
+    alert("Home name is required");
+    return;
+  }
+
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/homes`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, description, timezone, address })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: "Home Created", message: `Home '${data.home.name}' initialized`, severity: "SUCCESS" });
+      closeModal();
+      activeHomeId = data.home.id;
+      loadNodes();
+    } else {
+      alert("Error: " + data.error);
+    }
+  } catch (err) {
+    alert("Failed to create home: " + err.message);
+  }
+}
+
+async function showManageHomeModal(homeId) {
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/homes/${homeId}`);
+    const data = await res.json();
+    if (!data.success || !data.home) {
+      alert("Could not load home details: " + (data.error || "Unknown"));
+      return;
+    }
+    const h = data.home;
+
+    const membersRes = await fetchWithAuth(`${API_BASE}/homes/${homeId}/members`);
+    const membersData = await membersRes.json();
+    const members = membersData.members || [];
+
+    const html = `
+      <div class="modal-content" style="max-width: 640px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <h3 style="margin: 0;">⚙️ Manage Home: ${escapeHtml(h.name)}</h3>
+          <button class="btn btn-secondary" style="padding: 4px 8px;" onclick="closeModal()">&times;</button>
+        </div>
+
+        <div style="background: rgba(255,255,255,0.03); border-radius: 8px; padding: 12px; margin-bottom: 16px; font-size: 13px;">
+          <div><strong>Owner Status:</strong> ${h.owner_username ? `<span style="color:var(--accent-blue);">👑 ${escapeHtml(h.owner_username)}</span>` : '<span style="color:#fbbf24;">👑 Managed by Super Admin (Bootstrap Mode)</span>'}</div>
+          <div style="margin-top: 4px; color: var(--text-secondary);">Total Rooms: ${h.rooms_count} | Total Devices: ${h.nodes_count}</div>
+        </div>
+
+        <h4 style="margin: 16px 0 8px; font-size: 14px;">Home Information</h4>
+        <div class="form-group">
+          <label class="form-label">Home Name</label>
+          <input type="text" id="edit-home-name" class="form-control" value="${escapeHtml(h.name)}">
+        </div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+          <div class="form-group">
+            <label class="form-label">Timezone</label>
+            <input type="text" id="edit-home-tz" class="form-control" value="${escapeHtml(h.timezone || 'UTC')}">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Address</label>
+            <input type="text" id="edit-home-addr" class="form-control" value="${escapeHtml(h.address || '')}">
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 8px; margin-top: 10px;">
+          <button class="btn btn-primary" style="font-size: 12px;" onclick="submitUpdateHome(${homeId})">Save Changes</button>
+          <button class="btn btn-secondary" style="font-size: 12px;" onclick="showAppointOwnerModal(${homeId})">👑 Appoint / Transfer Owner</button>
+        </div>
+
+        <hr style="border: none; border-top: 1px solid var(--border-color); margin: 20px 0;">
+
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+          <h4 style="margin: 0; font-size: 14px;">Home Members & Access Roles</h4>
+          <button class="btn btn-secondary" style="font-size: 11px; padding: 3px 8px;" onclick="showAddMemberModal(${homeId})">+ Add Member</button>
+        </div>
+
+        <div style="max-height: 180px; overflow-y: auto;">
+          ${members.length === 0 ? '<div style="color:var(--text-muted); font-size:12px; padding:8px 0;">No assigned members yet. Add members to grant family or guest access.</div>' : `
+            <table style="width: 100%; font-size: 12.5px; border-collapse: collapse;">
+              <thead>
+                <tr style="text-align: left; color: var(--text-secondary); border-bottom: 1px solid var(--border-color);">
+                  <th style="padding: 6px;">User</th>
+                  <th style="padding: 6px;">Role</th>
+                  <th style="padding: 6px; text-align: right;">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${members.map(m => `
+                  <tr style="border-bottom: 1px solid rgba(255,255,255,0.05);">
+                    <td style="padding: 6px;"><strong>${escapeHtml(m.username)}</strong> <span style="color:var(--text-muted); font-size:11px;">(${escapeHtml(m.email || '')})</span></td>
+                    <td style="padding: 6px;"><span class="badge-home">${escapeHtml(m.role)}</span></td>
+                    <td style="padding: 6px; text-align: right;">
+                      <button class="btn btn-danger" style="font-size: 10px; padding: 2px 6px;" onclick="removeHomeMember(${homeId}, ${m.user_id})">Remove</button>
+                    </td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          `}
+        </div>
+
+        <div style="display: flex; justify-content: flex-end; margin-top: 20px;">
+          <button class="btn btn-secondary" onclick="closeModal()">Close</button>
+        </div>
+      </div>
+    `;
+    openModal(html);
+  } catch (err) {
+    alert("Error loading manage home modal: " + err.message);
+  }
+}
+
+async function submitUpdateHome(homeId) {
+  const name = document.getElementById("edit-home-name").value.trim();
+  const timezone = document.getElementById("edit-home-tz").value.trim();
+  const address = document.getElementById("edit-home-addr").value.trim();
+
+  if (!name) {
+    alert("Home name is required");
+    return;
+  }
+
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/homes/${homeId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, timezone, address })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: "Home Updated", message: "Home settings updated", severity: "SUCCESS" });
+      closeModal();
+      loadNodes();
+    } else {
+      alert("Error: " + data.error);
+    }
+  } catch (err) {
+    alert("Update failed: " + err.message);
+  }
+}
+
+function showAddRoomModal(homeId) {
+  const html = `
+    <div class="modal-content">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+        <h3 style="margin: 0;">🚪 Add Room</h3>
+        <button class="btn btn-secondary" style="padding: 4px 8px;" onclick="closeModal()">&times;</button>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Room Name *</label>
+        <input type="text" id="add-room-name" class="form-control" placeholder="e.g. Living Room, Kitchen, Kids Room" value="">
+      </div>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+        <div class="form-group">
+          <label class="form-label">Floor</label>
+          <input type="text" id="add-room-floor" class="form-control" placeholder="Ground" value="Ground">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Icon</label>
+          <select id="add-room-icon" class="form-control">
+            <option value="room">🚪 General Room</option>
+            <option value="bed">🛏️ Bedroom</option>
+            <option value="couch">🛋️ Living Room</option>
+            <option value="kitchen">🍳 Kitchen</option>
+            <option value="bath">🛁 Bathroom</option>
+            <option value="desk">🖥️ Office / Study</option>
+            <option value="garage">🚗 Garage</option>
+          </select>
+        </div>
+      </div>
+      <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px;">
+        <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="submitAddRoom(${homeId})">Create Room</button>
+      </div>
+    </div>
+  `;
+  openModal(html);
+}
+
+async function submitAddRoom(homeId) {
+  const name = document.getElementById("add-room-name").value.trim();
+  const floor = document.getElementById("add-room-floor").value.trim();
+  const icon = document.getElementById("add-room-icon").value;
+
+  if (!name) {
+    alert("Room name is required");
+    return;
+  }
+
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/homes/${homeId}/rooms`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, floor, icon })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: "Room Created", message: `Room '${data.room.name}' created`, severity: "SUCCESS" });
+      closeModal();
+      activeRoomTab = String(data.room.id);
+      loadNodes();
+    } else {
+      alert("Error: " + data.error);
+    }
+  } catch (err) {
+    alert("Failed to create room: " + err.message);
+  }
+}
+
+async function showEditRoomModal(roomId) {
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/rooms/${roomId}`);
+    const data = await res.json();
+    if (!data.success || !data.room) {
+      alert("Could not load room details");
+      return;
+    }
+    const r = data.room;
+
+    const html = `
+      <div class="modal-content">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <h3 style="margin: 0;">⚙️ Edit Room: ${escapeHtml(r.name)}</h3>
+          <button class="btn btn-secondary" style="padding: 4px 8px;" onclick="closeModal()">&times;</button>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Room Name *</label>
+          <input type="text" id="edit-room-name" class="form-control" value="${escapeHtml(r.name)}">
+        </div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+          <div class="form-group">
+            <label class="form-label">Floor</label>
+            <input type="text" id="edit-room-floor" class="form-control" value="${escapeHtml(r.floor || 'Ground')}">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Icon</label>
+            <select id="edit-room-icon" class="form-control">
+              <option value="room" ${r.icon === 'room' ? 'selected' : ''}>🚪 General Room</option>
+              <option value="bed" ${r.icon === 'bed' ? 'selected' : ''}>🛏️ Bedroom</option>
+              <option value="couch" ${r.icon === 'couch' ? 'selected' : ''}>🛋️ Living Room</option>
+              <option value="kitchen" ${r.icon === 'kitchen' ? 'selected' : ''}>🍳 Kitchen</option>
+              <option value="bath" ${r.icon === 'bath' ? 'selected' : ''}>🛁 Bathroom</option>
+              <option value="desk" ${r.icon === 'desk' ? 'selected' : ''}>🖥️ Office / Study</option>
+              <option value="garage" ${r.icon === 'garage' ? 'selected' : ''}>🚗 Garage</option>
+            </select>
+          </div>
+        </div>
+        <div style="font-size: 12px; color: var(--text-muted); margin-top: 6px;">
+          Assigned Devices in Room: <strong>${r.nodes_count ?? 0}</strong>
+        </div>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 18px;">
+          <button class="btn btn-danger" style="font-size: 12px;" onclick="confirmDeleteRoom(${roomId}, ${r.nodes_count ?? 0})">🗑️ Delete Room</button>
+          <div style="display: flex; gap: 8px;">
+            <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+            <button class="btn btn-primary" onclick="submitEditRoom(${roomId})">Save Changes</button>
+          </div>
+        </div>
+      </div>
+    `;
+    openModal(html);
+  } catch (err) {
+    alert("Error: " + err.message);
+  }
+}
+
+async function submitEditRoom(roomId) {
+  const name = document.getElementById("edit-room-name").value.trim();
+  const floor = document.getElementById("edit-room-floor").value.trim();
+  const icon = document.getElementById("edit-room-icon").value;
+
+  if (!name) {
+    alert("Room name is required");
+    return;
+  }
+
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/rooms/${roomId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, floor, icon })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: "Room Updated", message: `Room '${data.room.name}' saved`, severity: "SUCCESS" });
+      closeModal();
+      loadNodes();
+    } else {
+      alert("Error: " + data.error);
+    }
+  } catch (err) {
+    alert("Failed to update room: " + err.message);
+  }
+}
+
+async function confirmDeleteRoom(roomId, nodesCount) {
+  if (nodesCount > 0) {
+    alert(`Cannot delete this room because ${nodesCount} device(s) are currently assigned to it. Move or unassign all devices first.`);
+    return;
+  }
+  if (!confirm("Are you sure you want to delete this room? This action cannot be undone.")) {
+    return;
+  }
+
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/rooms/${roomId}`, { method: "DELETE" });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: "Room Deleted", message: "Room deleted successfully", severity: "INFO" });
+      closeModal();
+      activeRoomTab = 'all';
+      loadNodes();
+    } else {
+      alert("Error: " + data.error);
+    }
+  } catch (err) {
+    alert("Failed to delete room: " + err.message);
+  }
+}
+
+async function showMoveNodeModal(nodeId) {
+  try {
+    const homesRes = await fetchWithAuth(`${API_BASE}/homes`);
+    const homesData = await homesRes.json();
+    const homes = homesData.homes || [];
+
+    const node = fleetData.nodes.find(n => n.node_id === nodeId) || {};
+
+    const html = `
+      <div class="modal-content">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <h3 style="margin: 0;">📦 Move Device: ${escapeHtml(node.name || nodeId)}</h3>
+          <button class="btn btn-secondary" style="padding: 4px 8px;" onclick="closeModal()">&times;</button>
+        </div>
+        <p style="font-size: 13px; color: var(--text-secondary); margin: 0 0 14px; line-height: 1.5;">
+          Select the target Home and Room. Historical telemetry, GPIO definitions, and relay configurations are preserved.
+        </p>
+
+        <div class="form-group">
+          <label class="form-label">Target Home *</label>
+          <select id="move-target-home" class="form-control" onchange="loadRoomsForTargetHome(this.value)">
+            ${homes.map(h => `
+              <option value="${h.id}" ${Number(h.id) === Number(node.home_id || activeHomeId) ? 'selected' : ''}>
+                ${escapeHtml(h.name)}
+              </option>
+            `).join('')}
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">Target Room *</label>
+          <select id="move-target-room" class="form-control">
+            <option value="">Loading rooms...</option>
+          </select>
+        </div>
+
+        <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px;">
+          <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+          <button class="btn btn-primary" onclick="submitMoveNode('${nodeId}')">Confirm Move</button>
+        </div>
+      </div>
+    `;
+    openModal(html);
+    const initialHomeId = Number(document.getElementById("move-target-home").value);
+    loadRoomsForTargetHome(initialHomeId, node.room_id);
+  } catch (err) {
+    alert("Error: " + err.message);
+  }
+}
+
+async function loadRoomsForTargetHome(homeId, selectedRoomId = null) {
+  const roomSelect = document.getElementById("move-target-room") || document.getElementById("assign-target-room");
+  if (!roomSelect) return;
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/homes/${homeId}/rooms`);
+    const data = await res.json();
+    const rooms = data.rooms || [];
+    if (rooms.length === 0) {
+      roomSelect.innerHTML = '<option value="">No rooms in this home (create one first)</option>';
+      return;
+    }
+    roomSelect.innerHTML = rooms.map(r => `
+      <option value="${r.id}" ${Number(r.id) === Number(selectedRoomId) ? 'selected' : ''}>
+        ${r.icon === 'bed' ? '🛏️' : r.icon === 'couch' ? '🛋️' : '🚪'} ${escapeHtml(r.name)} (${escapeHtml(r.floor || 'Ground')})
+      </option>
+    `).join('');
+  } catch (err) {
+    roomSelect.innerHTML = `<option value="">Error loading rooms</option>`;
+  }
+}
+
+async function submitMoveNode(nodeId) {
+  const homeId = Number(document.getElementById("move-target-home").value);
+  const roomId = Number(document.getElementById("move-target-room").value);
+
+  if (!homeId || !roomId) {
+    alert("Please select both a target Home and Room");
+    return;
+  }
+
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/nodes/${nodeId}/move`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ homeId, roomId })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: "Node Moved", message: `Node moved to ${data.node?.room_name || 'new room'}`, severity: "SUCCESS" });
+      closeModal();
+      activeHomeId = homeId;
+      activeRoomTab = String(roomId);
+      loadNodes();
+    } else {
+      alert("Error: " + data.error);
+    }
+  } catch (err) {
+    alert("Move failed: " + err.message);
+  }
+}
+
+async function showAssignNodeModal(nodeId) {
+  try {
+    const homesRes = await fetchWithAuth(`${API_BASE}/homes`);
+    const homesData = await homesRes.json();
+    const homes = homesData.homes || [];
+
+    const node = fleetData.nodes.find(n => n.node_id === nodeId) || {};
+
+    const html = `
+      <div class="modal-content">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <h3 style="margin: 0;">➕ Assign Node to Room</h3>
+          <button class="btn btn-secondary" style="padding: 4px 8px;" onclick="closeModal()">&times;</button>
+        </div>
+        <p style="font-size: 13px; color: var(--text-secondary); margin: 0 0 14px; line-height: 1.5;">
+          Assign microcontroller <code>${escapeHtml(nodeId)}</code> (<strong>${escapeHtml(node.name || 'ESP Device')}</strong>) to an active Home and Room.
+        </p>
+
+        <div class="form-group">
+          <label class="form-label">Target Home *</label>
+          <select id="assign-target-home" class="form-control" onchange="loadRoomsForTargetHome(this.value)">
+            ${homes.map(h => `
+              <option value="${h.id}" ${Number(h.id) === Number(activeHomeId) ? 'selected' : ''}>
+                ${escapeHtml(h.name)}
+              </option>
+            `).join('')}
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">Target Room *</label>
+          <select id="assign-target-room" class="form-control">
+            <option value="">Loading rooms...</option>
+          </select>
+        </div>
+
+        <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px;">
+          <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+          <button class="btn btn-primary" onclick="submitAssignNode('${nodeId}')">Assign Node</button>
+        </div>
+      </div>
+    `;
+    openModal(html);
+    const initialHomeId = Number(document.getElementById("assign-target-home").value);
+    loadRoomsForTargetHome(initialHomeId);
+  } catch (err) {
+    alert("Error: " + err.message);
+  }
+}
+
+async function submitAssignNode(nodeId) {
+  const homeId = Number(document.getElementById("assign-target-home").value);
+  const roomId = Number(document.getElementById("assign-target-room").value);
+
+  if (!homeId || !roomId) {
+    alert("Please select both a target Home and Room");
+    return;
+  }
+
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/nodes/${nodeId}/assign`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ homeId, roomId })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: "Node Assigned", message: `Node assigned to ${data.node?.room_name || 'Room'}`, severity: "SUCCESS" });
+      closeModal();
+      activeHomeId = homeId;
+      activeRoomTab = String(roomId);
+      loadNodes();
+    } else {
+      alert("Error: " + data.error);
+    }
+  } catch (err) {
+    alert("Assignment failed: " + err.message);
+  }
+}
+
+async function confirmUnassignNode(nodeId) {
+  if (!confirm(`Are you sure you want to unassign device '${nodeId}'? It will be moved to the Unassigned Nodes queue.`)) {
+    return;
+  }
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/nodes/${nodeId}/unassign`, { method: "POST" });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: "Node Unassigned", message: "Node moved to Unassigned Nodes queue", severity: "INFO" });
+      loadNodes();
+    } else {
+      alert("Error: " + data.error);
+    }
+  } catch (err) {
+    alert("Unassign failed: " + err.message);
+  }
+}
+
+async function showAppointOwnerModal(homeId) {
+  try {
+    const usersRes = await fetchWithAuth(`${API_BASE}/admin/users`);
+    const usersData = await usersRes.json();
+    const users = usersData.users || [];
+
+    const html = `
+      <div class="modal-content">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <h3 style="margin: 0;">👑 Appoint / Transfer Home Owner</h3>
+          <button class="btn btn-secondary" style="padding: 4px 8px;" onclick="closeModal()">&times;</button>
+        </div>
+        <p style="font-size: 13px; color: var(--text-secondary); margin: 0 0 14px; line-height: 1.5;">
+          Appointing a Home Owner grants full authority over this home, its rooms, members, and all contained devices.
+        </p>
+        <div class="form-group">
+          <label class="form-label">Select User *</label>
+          <select id="appoint-owner-user" class="form-control">
+            ${users.map(u => `
+              <option value="${u.id}">${escapeHtml(u.username)} (${escapeHtml(u.email || u.full_name || 'User')})</option>
+            `).join('')}
+          </select>
+        </div>
+        <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px;">
+          <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+          <button class="btn btn-primary" onclick="submitAppointOwner(${homeId})">Confirm Appointment</button>
+        </div>
+      </div>
+    `;
+    openModal(html);
+  } catch (err) {
+    alert("Failed to load users: " + err.message);
+  }
+}
+
+async function submitAppointOwner(homeId) {
+  const userId = Number(document.getElementById("appoint-owner-user").value);
+  if (!userId) return;
+
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/homes/${homeId}/owner`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: "Owner Appointed", message: "Home Owner appointed successfully", severity: "SUCCESS" });
+      closeModal();
+      loadNodes();
+    } else {
+      alert("Error: " + data.error);
+    }
+  } catch (err) {
+    alert("Appointment failed: " + err.message);
+  }
+}
+
+async function showAddMemberModal(homeId) {
+  try {
+    const usersRes = await fetchWithAuth(`${API_BASE}/admin/users`);
+    const usersData = await usersRes.json();
+    const users = usersData.users || [];
+
+    const html = `
+      <div class="modal-content">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <h3 style="margin: 0;">👤 Add Home Member</h3>
+          <button class="btn btn-secondary" style="padding: 4px 8px;" onclick="closeModal()">&times;</button>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Select User *</label>
+          <select id="add-member-user" class="form-control">
+            ${users.map(u => `
+              <option value="${u.id}">${escapeHtml(u.username)} (${escapeHtml(u.email || '')})</option>
+            `).join('')}
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Home Role *</label>
+          <select id="add-member-role" class="form-control">
+            <option value="FAMILY_MEMBER">Family Member (Control devices in permitted rooms)</option>
+            <option value="HOME_ADMIN">Home Admin (Manage rooms, assign nodes, edit config)</option>
+            <option value="GUEST">Guest (Restricted temporary control)</option>
+            <option value="VIEWER">Viewer (Read-only access)</option>
+          </select>
+        </div>
+        <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px;">
+          <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+          <button class="btn btn-primary" onclick="submitAddMember(${homeId})">Add Member</button>
+        </div>
+      </div>
+    `;
+    openModal(html);
+  } catch (err) {
+    alert("Error: " + err.message);
+  }
+}
+
+async function submitAddMember(homeId) {
+  const userId = Number(document.getElementById("add-member-user").value);
+  const role = document.getElementById("add-member-role").value;
+
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/homes/${homeId}/members`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId, role })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: "Member Added", message: "User added to home", severity: "SUCCESS" });
+      closeModal();
+      showManageHomeModal(homeId);
+    } else {
+      alert("Error: " + data.error);
+    }
+  } catch (err) {
+    alert("Failed: " + err.message);
+  }
+}
+
+async function removeHomeMember(homeId, userId) {
+  if (!confirm("Are you sure you want to remove this member from the home?")) return;
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/homes/${homeId}/members/${userId}`, { method: "DELETE" });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: "Member Removed", message: "Member removed from home", severity: "INFO" });
+      showManageHomeModal(homeId);
+    } else {
+      alert("Error: " + data.error);
+    }
+  } catch (err) {
+    alert("Failed: " + err.message);
+  }
+}
+
 
 function showAddNodeModal(prefillIp = '', prefillName = '', prefillUser = 'admin', prefillPass = 'admin') {
   const html = `
@@ -917,20 +1935,27 @@ async function showNodeSettingsModal(nodeId, activeTab = 'general') {
       return;
     }
 
-    // Parse configured relay channels
-    let channels = [];
+    // Grab pin catalog (contains live hardware pins, allocated sensors, and active relays)
+    let pinCatalog = null;
     try {
-      if (typeof node.channels_json === 'string' && node.channels_json.trim()) {
-        channels = JSON.parse(node.channels_json);
-      } else if (Array.isArray(node.channels_json)) {
-        channels = node.channels_json;
+      const pinRes = await fetch(`${API_BASE}/nodes/${nodeId}/pins`);
+      const pinData = await pinRes.json();
+      if (pinData.success && pinData.catalog) {
+        pinCatalog = pinData.catalog;
       }
     } catch (e) {
-      channels = [];
+      console.warn("Could not fetch pin catalog:", e);
     }
 
+    // Active relays from catalog or node
+    const relaysList = (pinCatalog && Array.isArray(pinCatalog.relays)) ? pinCatalog.relays : [];
+    const channels = relaysList.length > 0 ? relaysList : (Array.isArray(node.channels_json) ? node.channels_json : []);
+
+    const freePinCount = pinCatalog ? pinCatalog.freePins : 0;
+    const totalPinCount = pinCatalog ? pinCatalog.totalPins : 0;
+
     const html = `
-      <div class="modal-content modal-lg">
+      <div class="modal-content modal-lg" style="max-width: 900px; max-height: 90vh; overflow-y: auto;">
         <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); padding-bottom: 12px;">
           <div>
             <div style="display: flex; align-items: center; gap: 10px;">
@@ -938,14 +1963,14 @@ async function showNodeSettingsModal(nodeId, activeTab = 'general') {
               <span class="status-badge ${node.is_online ? 'badge-online' : 'badge-offline'}">${node.status || (node.is_online ? 'Online' : 'Offline')}</span>
             </div>
             <div style="font-size: 12px; color: var(--text-secondary); margin-top: 4px;">
-              Node ID: <code>${escapeHtml(node.node_id)}</code> &bull; IP: <code>${escapeHtml(node.ip_address)}</code> &bull; MAC: <code>${escapeHtml(node.mac_address || 'N/A')}</code>
+              Node ID: <code>${escapeHtml(node.node_id)}</code> &bull; IP: <code>${escapeHtml(node.ip_address)}</code> &bull; Hardware: <code>${escapeHtml(node.hardware_type || 'ESP8266')}</code>
             </div>
           </div>
           <button class="btn btn-secondary" style="padding: 4px 8px;" onclick="closeModal()">&times;</button>
         </div>
 
         <!-- TABS NAVIGATION -->
-        <div class="settings-tabs" style="margin-top: 8px;">
+        <div class="settings-tabs" style="margin-top: 10px;">
           <button class="settings-tab-btn ${activeTab === 'general' ? 'active' : ''}" data-tab="general" onclick="switchSettingsTab('general')">
             📋 General & Network
           </button>
@@ -987,18 +2012,21 @@ async function showNodeSettingsModal(nodeId, activeTab = 'general') {
             <div><strong>Firmware Version:</strong> v${escapeHtml(node.firmware_version || '1.0.0')}</div>
             <div><strong>Wi-Fi RSSI:</strong> ${node.rssi || -70} dBm</div>
             <div><strong>Free Dynamic Heap:</strong> ${(Number(node.free_heap || 0) / 1024).toFixed(1)} KB</div>
-            <div><strong>System Uptime:</strong> ${Math.floor((node.uptime_sec || 0) / 3600)}h ${Math.floor(((node.uptime_sec || 0) % 3600) / 60)}m</div>
-            <div><strong>Last Heartbeat:</strong> ${node.last_seen ? new Date(node.last_seen).toLocaleTimeString() : 'N/A'}</div>
+            <div><strong>System Uptime:</strong> ${Math.floor(Number(node.uptime_sec || 0) / 60)} min</div>
+            <div><strong>MAC Address:</strong> <code>${escapeHtml(node.mac_address || 'N/A')}</code></div>
           </div>
         </div>
 
-        <!-- TAB 2: AUTHENTICATION -->
+        <!-- TAB 2: USER ID & PASSWORD -->
         <div id="tab-pane-auth" class="settings-tab-pane ${activeTab === 'auth' ? 'active' : ''}">
-          <p style="font-size: 13px; color: var(--text-secondary); margin-top: 0;">
-            Configure per-node HTTP Basic Authentication credentials. The central server will authenticate with these credentials when querying <code>/api/status</code>, controlling relays, and pushing configurations.
-          </p>
+          <div style="background: var(--bg-primary); border: 1px solid var(--border-color); border-radius: 10px; padding: 16px;">
+            <div style="font-size: 13px; font-weight: 600; color: var(--text-primary); margin-bottom: 4px;">
+              Device Authentication Credentials
+            </div>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-bottom: 14px;">
+              Configured HTTP Basic Authentication credentials matching the firmware on this node.
+            </div>
 
-          <div style="background: var(--bg-primary); border: 1px solid var(--border-color); border-radius: 8px; padding: 16px;">
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px;">
               <div class="form-group">
                 <label class="form-label">Node User ID / Username *</label>
@@ -1028,52 +2056,142 @@ async function showNodeSettingsModal(nodeId, activeTab = 'general') {
 
         <!-- TAB 3: RELAY CHANNELS -->
         <div id="tab-pane-relays" class="settings-tab-pane ${activeTab === 'relays' ? 'active' : ''}">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-            <div style="font-size: 13px; color: var(--text-secondary);">
-              Configure GPIO pins, load types, and active logic for this node's relays.
+          <!-- Action Toolbar -->
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">
+            <div>
+              <div style="font-size: 13.5px; font-weight: 600; color: var(--text-primary);">
+                Hardware GPIO Pin Allocation & Relay Channels
+              </div>
+              <div style="font-size: 12px; color: var(--text-secondary);">
+                Grab live pins directly from node, view allocated sensors, and add or remove relays.
+              </div>
             </div>
-            <div style="display: flex; gap: 8px;">
-              <button class="btn btn-secondary" style="font-size: 12px;" onclick="pushConfigToNode('${node.node_id}')">📤 Push Config to Node</button>
-              <button class="btn btn-primary" style="font-size: 12px;" onclick="showAddRelayModal('${node.node_id}')">+ Add Relay</button>
+            <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+              <button class="btn btn-secondary" id="btn-sync-pins" style="font-size: 12px; display: flex; align-items: center; gap: 6px; border-color: rgba(59, 130, 246, 0.4); color: #93c5fd;" onclick="syncPinsFromNode('${node.node_id}')">
+                <span>🔄</span>
+                <span>Grab Pins from Node</span>
+              </button>
+              <button class="btn btn-secondary" style="font-size: 12px; display: flex; align-items: center; gap: 6px;" onclick="pushConfigToNode('${node.node_id}')">
+                <span>📤</span>
+                <span>Push to Node</span>
+              </button>
+              <button class="btn btn-primary" style="font-size: 12px; display: flex; align-items: center; gap: 6px;" onclick="showAddRelayModal('${node.node_id}')">
+                <span>+</span>
+                <span>Add Relay</span>
+              </button>
             </div>
           </div>
 
-          <div id="push-config-result" style="display: none; padding: 8px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 10px;"></div>
+          <div id="sync-pins-status" style="display: none; padding: 8px 12px; border-radius: 6px; font-size: 12.5px; margin-bottom: 12px;"></div>
+          <div id="push-config-result" style="display: none; padding: 8px 12px; border-radius: 6px; font-size: 12.5px; margin-bottom: 12px;"></div>
+
+          <!-- SECTION 1: PHYSICAL HARDWARE PIN MAP & AVAILABILITY -->
+          <div style="background: var(--bg-primary); border: 1px solid var(--border-color); border-radius: 10px; padding: 14px; margin-bottom: 16px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+              <div style="font-size: 12.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary);">
+                📌 Available Hardware Pins & Sensors (${freePinCount} Free / ${totalPinCount} Total)
+              </div>
+              <div style="font-size: 11.5px; color: var(--text-muted);">
+                Model: <code>${escapeHtml(pinCatalog ? pinCatalog.hardware : (node.hardware_type || 'ESP8266'))}</code>
+              </div>
+            </div>
+
+            <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px;">
+              ${(pinCatalog ? pinCatalog.pins : []).map(p => {
+                let badgeClass = 'badge-info';
+                let roleLabel = '🟢 Free Pin';
+                if (p.role === 'RELAY') {
+                  badgeClass = p.state ? 'badge-online' : 'badge-sync';
+                  roleLabel = `⚡ Relay: ${escapeHtml(p.relayName || `Ch ${p.channelId}`)}`;
+                } else if (p.role === 'SENSOR') {
+                  badgeClass = 'badge-warning';
+                  roleLabel = '🌡️ Sensor Input';
+                } else if (p.safety === 'BOOT_SENSITIVE') {
+                  badgeClass = 'badge-warning';
+                  roleLabel = '⚠️ Free (Boot-Sensitive)';
+                }
+
+                return `
+                  <div style="background: rgba(255,255,255,0.025); border: 1px solid var(--border-color); border-radius: 8px; padding: 10px; display: flex; flex-direction: column; justify-content: space-between; gap: 8px;">
+                    <div>
+                      <div style="display: flex; justify-content: space-between; align-items: center; gap: 6px;">
+                        <div style="font-size: 13px; font-weight: 600; color: var(--text-primary); display: flex; align-items: center; gap: 5px;">
+                          <span>${p.dPin.includes('A0') ? '📈' : (p.isRelay ? '🔌' : '📍')}</span>
+                          <span>${escapeHtml(p.dPin)}</span>
+                          <span style="font-size: 11px; color: var(--text-muted); font-weight: normal;">(GPIO ${p.pin})</span>
+                        </div>
+                        <span class="status-badge ${badgeClass}" style="font-size: 10px; white-space: nowrap;">
+                          ${roleLabel}
+                        </span>
+                      </div>
+                      <div style="font-size: 11px; color: var(--text-secondary); margin-top: 4px;">
+                        ${escapeHtml(p.notes)}
+                      </div>
+                    </div>
+
+                    <div style="display: flex; justify-content: flex-end; align-items: center; padding-top: 6px; border-top: 1px dashed rgba(255,255,255,0.06);">
+                      ${p.isRelay ? `
+                        <div style="display: flex; gap: 6px;">
+                          <button class="btn btn-secondary" style="padding: 2px 7px; font-size: 11px;" onclick="showAddRelayModal('${node.node_id}', '${p.channelId}')">✏️ Edit</button>
+                          <button class="btn btn-danger" style="padding: 2px 7px; font-size: 11px;" onclick="deleteRelayChannel('${node.node_id}', '${p.channelId}')">🗑️ Remove</button>
+                        </div>
+                      ` : (p.safety !== 'SENSOR_ONLY' ? `
+                        <button class="btn btn-primary" style="padding: 2px 8px; font-size: 11px; background: rgba(59, 130, 246, 0.15); border: 1px solid rgba(59, 130, 246, 0.35); color: #93c5fd;" onclick="showAddRelayModal('${node.node_id}', null, ${p.pin})">
+                          + Assign Relay
+                        </button>
+                      ` : `<span style="font-size: 11px; color: var(--text-muted);">Analog ADC Input</span>`)}
+                    </div>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          </div>
+
+          <!-- SECTION 2: CONFIGURED RELAYS LIST -->
+          <div style="font-size: 12.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary); margin-bottom: 8px;">
+            ⚡ Active Relay Channels (${channels.length})
+          </div>
 
           <div class="settings-table-wrapper">
             <table class="settings-table">
               <thead>
                 <tr>
-                  <th>Channel ID</th>
+                  <th>Channel</th>
                   <th>GPIO Pin</th>
                   <th>Relay Name</th>
                   <th>Room</th>
                   <th>Type</th>
                   <th>Logic</th>
                   <th>Boot State</th>
+                  <th>Live Status</th>
                   <th style="text-align: right;">Actions</th>
                 </tr>
               </thead>
               <tbody>
                 ${channels.length === 0 ? `
                   <tr>
-                    <td colspan="8" style="text-align: center; color: var(--text-secondary); padding: 24px;">
-                      No relay channels configured for this node. Click <strong>"+ Add Relay"</strong> to create one.
+                    <td colspan="9" style="text-align: center; color: var(--text-secondary); padding: 24px;">
+                      No relay channels configured. Click <strong>"🔄 Grab Pins from Node"</strong> or <strong>"+ Add Relay"</strong>.
                     </td>
                   </tr>
                 ` : channels.map(c => `
                   <tr>
-                    <td><code>${escapeHtml(c.id || c.channel_id || 'ch1')}</code></td>
+                    <td><code>Ch ${escapeHtml(c.id || c.channel_id)}</code></td>
                     <td><span class="status-badge badge-info" style="font-size: 11px;">GPIO ${c.pin}</span></td>
                     <td style="font-weight: 500;">${escapeHtml(c.name || 'Relay')}</td>
                     <td>${escapeHtml(c.room || node.room || 'General')}</td>
                     <td><span style="text-transform: capitalize;">${escapeHtml(c.function || c.type || 'relay')}</span></td>
                     <td>${c.active_low !== false ? '<span style="color: var(--accent-blue);">Active LOW</span>' : '<span style="color: var(--accent-green);">Active HIGH</span>'}</td>
                     <td><code>${escapeHtml(c.boot_state || c.initial_mode || 'OFF')}</code></td>
+                    <td>
+                      <span class="status-badge ${c.current_state || c.state ? 'badge-online' : 'badge-offline'}" style="font-size: 11px;">
+                        ${c.current_state || c.state ? '● ON' : '○ OFF'}
+                      </span>
+                    </td>
                     <td style="text-align: right;">
                       <div style="display: inline-flex; gap: 6px;">
                         <button class="btn btn-secondary" style="padding: 4px 8px; font-size: 11px;" onclick="showAddRelayModal('${node.node_id}', '${escapeHtml(c.id || c.channel_id)}')">✏️ Edit</button>
-                        <button class="btn btn-danger" style="padding: 4px 8px; font-size: 11px;" onclick="deleteRelayChannel('${node.node_id}', '${escapeHtml(c.id || c.channel_id)}')">🗑️</button>
+                        <button class="btn btn-danger" style="padding: 4px 8px; font-size: 11px;" onclick="deleteRelayChannel('${node.node_id}', '${escapeHtml(c.id || c.channel_id)}')">🗑️ Remove</button>
                       </div>
                     </td>
                   </tr>
@@ -1097,191 +2215,199 @@ async function showNodeSettingsModal(nodeId, activeTab = 'general') {
   }
 }
 
-// Test per-node credentials against physical device
-async function testNodeAuth(nodeId) {
-  const btn = document.getElementById("btn-test-auth");
-  const resultDiv = document.getElementById("auth-test-result");
-  const username = document.getElementById("setting-auth-user").value.trim();
-  const password = document.getElementById("setting-auth-pass").value.trim();
-
-  btn.disabled = true;
-  btn.textContent = "Testing...";
-  resultDiv.style.color = "var(--accent-blue)";
-  resultDiv.textContent = "Connecting to node...";
+// Active grab/sync pins directly from node hardware
+async function syncPinsFromNode(nodeId) {
+  const btn = document.getElementById("btn-sync-pins");
+  const statusBox = document.getElementById("sync-pins-status");
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = "<span>🔄</span><span>Grabbing...</span>";
+  }
+  if (statusBox) {
+    statusBox.style.display = "block";
+    statusBox.style.background = "rgba(59, 130, 246, 0.15)";
+    statusBox.style.color = "var(--accent-blue)";
+    statusBox.textContent = "Connecting to node and reading hardware pins...";
+  }
 
   try {
-    const res = await fetch(`${API_BASE}/nodes/${nodeId}/test-auth`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, password })
+    const res = await fetch(`${API_BASE}/nodes/${nodeId}/sync-pins`, {
+      method: "POST"
     });
     const data = await res.json();
-    btn.disabled = false;
-    btn.textContent = "🧪 Test Connection & Authentication";
-
     if (data.success) {
-      resultDiv.style.color = "var(--accent-green)";
-      resultDiv.textContent = `✅ Connected! Latency: ${data.latencyMs}ms (HTTP ${data.httpStatus} OK, ${data.hardware || 'ESP8266'})`;
+      if (statusBox) {
+        statusBox.style.background = "rgba(16, 185, 129, 0.15)";
+        statusBox.style.color = "var(--accent-green)";
+        statusBox.textContent = `✅ Successfully grabbed ${data.count} pin(s) directly from node!`;
+      }
+      setTimeout(() => {
+        showNodeSettingsModal(nodeId, 'relays');
+      }, 600);
     } else {
-      resultDiv.style.color = "var(--accent-red)";
-      resultDiv.textContent = `❌ ${data.error || 'Authentication / Connection failed'}`;
+      if (statusBox) {
+        statusBox.style.background = "rgba(239, 68, 68, 0.15)";
+        statusBox.style.color = "var(--accent-red)";
+        statusBox.textContent = "Failed to grab pins: " + (data.error || "Unknown error");
+      }
     }
   } catch (err) {
-    btn.disabled = false;
-    btn.textContent = "🧪 Test Connection & Authentication";
-    resultDiv.style.color = "var(--accent-red)";
-    resultDiv.textContent = `❌ Error: ${err.message}`;
-  }
-}
-
-// Save node settings to database
-async function saveNodeSettings(nodeId) {
-  const name = document.getElementById("setting-name").value.trim();
-  const room = document.getElementById("setting-room").value.trim();
-  const category = document.getElementById("setting-category").value.trim();
-  const ip_address = document.getElementById("setting-ip").value.trim();
-  const location = document.getElementById("setting-location").value.trim();
-  const auth_username = document.getElementById("setting-auth-user").value.trim();
-  const auth_password = document.getElementById("setting-auth-pass").value.trim();
-  const statusBox = document.getElementById("node-settings-status");
-  const btn = document.getElementById("btn-save-settings");
-
-  btn.disabled = true;
-  btn.textContent = "Saving...";
-  statusBox.style.display = "block";
-  statusBox.style.background = "rgba(59, 130, 246, 0.15)";
-  statusBox.style.color = "var(--accent-blue)";
-  statusBox.textContent = "Saving node settings...";
-
-  try {
-    const res = await fetch(`${API_BASE}/nodes/${nodeId}/settings`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, room, category, ip_address, location, auth_username, auth_password })
-    });
-    const data = await res.json();
-    btn.disabled = false;
-    btn.textContent = "💾 Save Settings";
-
-    if (data.success) {
-      statusBox.style.background = "rgba(34, 197, 94, 0.15)";
-      statusBox.style.color = "var(--accent-green)";
-      statusBox.textContent = "Settings saved successfully!";
-      setTimeout(() => {
-        closeModal();
-        loadNodes();
-      }, 800);
-    } else {
+    if (statusBox) {
       statusBox.style.background = "rgba(239, 68, 68, 0.15)";
       statusBox.style.color = "var(--accent-red)";
-      statusBox.textContent = "Error: " + (data.error || "Failed to update node");
+      statusBox.textContent = "Error grabbing pins: " + err.message;
     }
-  } catch (err) {
-    btn.disabled = false;
-    btn.textContent = "💾 Save Settings";
-    statusBox.style.background = "rgba(239, 68, 68, 0.15)";
-    statusBox.style.color = "var(--accent-red)";
-    statusBox.textContent = "Network error: " + err.message;
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = "<span>🔄</span><span>Grab Pins from Node</span>";
+    }
   }
 }
 
 // Modal for adding or editing a relay channel
-async function showAddRelayModal(nodeId, editChannelId = null) {
+async function showAddRelayModal(nodeId, editChannelId = null, preselectedPin = null) {
   let existingChannel = null;
+  let pinCatalog = null;
+  let node = null;
 
   try {
     const res = await fetch(`${API_BASE}/nodes`);
     const rawNodes = await res.json();
     const nodes = Array.isArray(rawNodes) ? rawNodes : (rawNodes.nodes || []);
-    const node = nodes.find(n => n.node_id === nodeId);
+    node = nodes.find(n => n.node_id === nodeId);
     if (node && node.channels_json) {
       const channels = typeof node.channels_json === 'string' ? JSON.parse(node.channels_json) : node.channels_json;
       if (editChannelId) {
-        existingChannel = channels.find(c => (c.id || c.channel_id) === editChannelId);
+        existingChannel = channels.find(c => String(c.id || c.channel_id) === String(editChannelId));
       }
     }
+
+    const pinRes = await fetch(`${API_BASE}/nodes/${nodeId}/pins`);
+    const pinData = await pinRes.json();
+    if (pinData.success && pinData.catalog) {
+      pinCatalog = pinData.catalog;
+    }
   } catch (e) {
-    console.warn("Could not find existing channel data", e);
+    console.warn("Could not load node or pin catalog for add relay modal:", e);
   }
 
   const isEdit = !!existingChannel;
-  const channelId = existingChannel ? (existingChannel.id || existingChannel.channel_id) : `ch${Date.now() % 1000}`;
-  const pin = existingChannel ? existingChannel.pin : 4;
+  
+  // Calculate next available integer channel ID if adding
+  let nextChannelId = 1;
+  if (!isEdit && pinCatalog && Array.isArray(pinCatalog.relays)) {
+    const existingIds = pinCatalog.relays.map(r => parseInt(String(r.channel_id || r.id).replace(/\D/g, '')) || 0);
+    while (existingIds.includes(nextChannelId)) {
+      nextChannelId++;
+    }
+  }
+
+  const channelId = existingChannel ? (existingChannel.id || existingChannel.channel_id) : nextChannelId;
+  const pin = preselectedPin !== null ? preselectedPin : (existingChannel ? existingChannel.pin : (pinCatalog && pinCatalog.pins.find(p => p.role === 'FREE') ? pinCatalog.pins.find(p => p.role === 'FREE').pin : 5));
   const name = existingChannel ? existingChannel.name : 'Ceiling Light';
-  const room = existingChannel ? (existingChannel.room || '') : '';
+  const room = existingChannel ? (existingChannel.room || '') : (node ? node.room || '' : '');
   const func = existingChannel ? (existingChannel.function || existingChannel.type || 'light') : 'light';
   const activeLow = existingChannel ? (existingChannel.active_low !== false) : true;
   const bootState = existingChannel ? (existingChannel.boot_state || 'OFF') : 'OFF';
 
+  // Build pin options from hardware catalog
+  let pinOptionsHtml = '';
+  if (pinCatalog && Array.isArray(pinCatalog.pins)) {
+    pinOptionsHtml = pinCatalog.pins.filter(p => p.safety !== 'SENSOR_ONLY').map(p => {
+      const isSelected = p.pin == pin;
+      const isOccupied = p.isRelay && String(p.channelId) !== String(channelId);
+      let desc = p.notes;
+      if (isOccupied) {
+        desc = `⚡ IN USE: ${p.relayName} (Ch ${p.channelId})`;
+      } else if (p.safety === 'SAFE') {
+        desc = '🟢 FREE (Safe Output)';
+      } else if (p.safety === 'BOOT_SENSITIVE') {
+        desc = '⚠️ FREE (Boot-Sensitive)';
+      }
+      return `<option value="${p.pin}" ${isSelected ? 'selected' : ''} ${isOccupied ? 'disabled style="color: #64748b;"' : ''}>
+        ${escapeHtml(p.dPin)} - ${desc}
+      </option>`;
+    }).join('');
+  } else {
+    // Fallback standard options
+    pinOptionsHtml = `
+      <option value="5" ${pin == 5 ? 'selected' : ''}>D1 (GPIO 5) - Safe I2C SCL, boot-neutral</option>
+      <option value="4" ${pin == 4 ? 'selected' : ''}>D2 (GPIO 4) - Safe I2C SDA, boot-neutral</option>
+      <option value="14" ${pin == 14 ? 'selected' : ''}>D5 (GPIO 14) - Safe SPI SCK / Sensor</option>
+      <option value="12" ${pin == 12 ? 'selected' : ''}>D6 (GPIO 12) - Safe SPI MISO</option>
+      <option value="13" ${pin == 13 ? 'selected' : ''}>D7 (GPIO 13) - Safe SPI MOSI</option>
+      <option value="15" ${pin == 15 ? 'selected' : ''}>D8 (GPIO 15) - Boot sensitive (Pull-down)</option>
+      <option value="0" ${pin == 0 ? 'selected' : ''}>GPIO 0 - Boot sensitive / Flash pin</option>
+      <option value="2" ${pin == 2 ? 'selected' : ''}>GPIO 2 - Boot sensitive / TXD1</option>
+      <option value="16" ${pin == 16 ? 'selected' : ''}>D0 (GPIO 16) - Deep sleep wake</option>
+    `;
+  }
+
   const html = `
-    <div class="modal-content" style="max-width: 500px;">
-      <div style="display: flex; justify-content: space-between; align-items: center;">
+    <div class="modal-content" style="max-width: 520px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); padding-bottom: 10px;">
         <h3 style="margin: 0;">${isEdit ? '✏️ Edit Relay Channel' : '⚡ Add Relay Channel'}</h3>
         <button class="btn btn-secondary" style="padding: 4px 8px;" onclick="showNodeSettingsModal('${nodeId}', 'relays')">&times;</button>
       </div>
 
-      <div class="form-group">
-        <label class="form-label">Channel Identifier (Unique) *</label>
-        <input type="text" id="relay-channel-id" class="form-control" value="${escapeHtml(channelId)}" ${isEdit ? 'readonly style="opacity: 0.7;"' : ''} placeholder="ch1">
-      </div>
-
-      <div class="form-group">
-        <label class="form-label">GPIO Pin *</label>
-        <select id="relay-pin" class="form-control">
-          <option value="4" ${pin == 4 ? 'selected' : ''}>GPIO 4 (NodeMCU D2) - Standard Relay 1</option>
-          <option value="5" ${pin == 5 ? 'selected' : ''}>GPIO 5 (NodeMCU D1) - Standard Relay 2</option>
-          <option value="12" ${pin == 12 ? 'selected' : ''}>GPIO 12 (NodeMCU D6) - Relay 3</option>
-          <option value="14" ${pin == 14 ? 'selected' : ''}>GPIO 14 (NodeMCU D5) - Relay 4</option>
-          <option value="13" ${pin == 13 ? 'selected' : ''}>GPIO 13 (NodeMCU D7)</option>
-          <option value="15" ${pin == 15 ? 'selected' : ''}>GPIO 15 (NodeMCU D8 - Pull-down required)</option>
-          <option value="0" ${pin == 0 ? 'selected' : ''}>GPIO 0 (NodeMCU D3 / ESP-01 Flash Pin)</option>
-          <option value="2" ${pin == 2 ? 'selected' : ''}>GPIO 2 (NodeMCU D4 / ESP-01 TXD1)</option>
-          <option value="16" ${pin == 16 ? 'selected' : ''}>GPIO 16 (NodeMCU D0 - No PWM)</option>
-        </select>
-      </div>
-
-      <div class="form-group">
-        <label class="form-label">Friendly Name *</label>
-        <input type="text" id="relay-name" class="form-control" value="${escapeHtml(name)}" placeholder="e.g. Master Bedroom Fan">
-      </div>
-
-      <div class="form-group">
-        <label class="form-label">Room / Zone</label>
-        <input type="text" id="relay-room" class="form-control" value="${escapeHtml(room)}" placeholder="Leave blank to use Node's room">
-      </div>
-
-      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
-        <div class="form-group">
-          <label class="form-label">Load Type / Function</label>
-          <select id="relay-func" class="form-control">
-            <option value="light" ${func === 'light' ? 'selected' : ''}>💡 Light</option>
-            <option value="fan" ${func === 'fan' ? 'selected' : ''}>💨 Fan</option>
-            <option value="socket" ${func === 'socket' ? 'selected' : ''}>🔌 Socket / Outlet</option>
-            <option value="relay" ${func === 'relay' ? 'selected' : ''}>⚡ General Relay</option>
-            <option value="heater" ${func === 'heater' ? 'selected' : ''}>🔥 Water Heater</option>
-            <option value="ac" ${func === 'ac' ? 'selected' : ''}>❄️ AC / Cooler</option>
-          </select>
+      <div style="padding: 14px 0;">
+        <div style="display: grid; grid-template-columns: 1fr 2fr; gap: 12px; margin-bottom: 12px;">
+          <div class="form-group">
+            <label class="form-label">Channel Number *</label>
+            <input type="number" id="relay-channel-id" class="form-control" value="${channelId}" min="1" max="32" ${isEdit ? 'readonly style="opacity: 0.7;"' : ''} placeholder="1">
+          </div>
+          <div class="form-group">
+            <label class="form-label">GPIO Pin *</label>
+            <select id="relay-pin" class="form-control">
+              ${pinOptionsHtml}
+            </select>
+          </div>
         </div>
+
         <div class="form-group">
-          <label class="form-label">Initial State on Boot</label>
-          <select id="relay-boot" class="form-control">
-            <option value="OFF" ${bootState === 'OFF' ? 'selected' : ''}>OFF (Safe Default)</option>
-            <option value="ON" ${bootState === 'ON' ? 'selected' : ''}>ON</option>
-            <option value="RESTORE" ${bootState === 'RESTORE' ? 'selected' : ''}>RESTORE (Last State)</option>
-          </select>
+          <label class="form-label">Friendly Name *</label>
+          <input type="text" id="relay-name" class="form-control" value="${escapeHtml(name)}" placeholder="e.g. Living Room Fan">
         </div>
+
+        <div class="form-group">
+          <label class="form-label">Room / Zone</label>
+          <input type="text" id="relay-room" class="form-control" value="${escapeHtml(room)}" placeholder="Leave blank to inherit node room">
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px;">
+          <div class="form-group">
+            <label class="form-label">Load Type / Function</label>
+            <select id="relay-func" class="form-control">
+              <option value="light" ${func === 'light' ? 'selected' : ''}>💡 Light</option>
+              <option value="fan" ${func === 'fan' ? 'selected' : ''}>💨 Fan</option>
+              <option value="socket" ${func === 'socket' ? 'selected' : ''}>🔌 Socket / Outlet</option>
+              <option value="relay" ${func === 'relay' ? 'selected' : ''}>⚡ General Relay</option>
+              <option value="heater" ${func === 'heater' ? 'selected' : ''}>🔥 Water Heater</option>
+              <option value="ac" ${func === 'ac' ? 'selected' : ''}>❄️ AC / Cooler</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Boot State</label>
+            <select id="relay-boot" class="form-control">
+              <option value="OFF" ${bootState === 'OFF' ? 'selected' : ''}>OFF (Safe Default)</option>
+              <option value="ON" ${bootState === 'ON' ? 'selected' : ''}>ON</option>
+              <option value="RESTORE" ${bootState === 'RESTORE' ? 'selected' : ''}>RESTORE (Last State)</option>
+            </select>
+          </div>
+        </div>
+
+        <div style="background: rgba(255,255,255,0.03); border: 1px solid var(--border-color); border-radius: 8px; padding: 10px; margin-top: 4px;">
+          <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer;">
+            <input type="checkbox" id="relay-active-low" ${activeLow ? 'checked' : ''}>
+            <span>Active LOW Logic (Default for optocoupler relay boards)</span>
+          </label>
+        </div>
+
+        <div id="add-relay-status" style="display: none; padding: 8px 12px; border-radius: 6px; font-size: 13px; margin-top: 12px;"></div>
       </div>
 
-      <div style="margin-top: 4px;">
-        <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer;">
-          <input type="checkbox" id="relay-active-low" ${activeLow ? 'checked' : ''}>
-          <span>Active LOW Relay (Typical optically-isolated relay modules)</span>
-        </label>
-      </div>
-
-      <div id="add-relay-status" style="display: none; padding: 8px; border-radius: 6px; font-size: 13px;"></div>
-
-      <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 10px;">
+      <div style="display: flex; justify-content: flex-end; gap: 10px; border-top: 1px solid var(--border-color); padding-top: 12px;">
         <button class="btn btn-secondary" onclick="showNodeSettingsModal('${nodeId}', 'relays')">Back</button>
         <button class="btn btn-primary" id="btn-submit-relay" onclick="submitSaveRelay('${nodeId}')">${isEdit ? 'Update Relay' : 'Add Relay'}</button>
       </div>
@@ -1292,7 +2418,8 @@ async function showAddRelayModal(nodeId, editChannelId = null) {
 
 // Submit relay add or update
 async function submitSaveRelay(nodeId) {
-  const channelId = document.getElementById("relay-channel-id").value.trim();
+  const rawChannelId = document.getElementById("relay-channel-id").value.trim();
+  const channel_id = parseInt(rawChannelId.replace(/\D/g, '')) || 1;
   const pin = parseInt(document.getElementById("relay-pin").value);
   const name = document.getElementById("relay-name").value.trim();
   const room = document.getElementById("relay-room").value.trim();
@@ -1302,11 +2429,11 @@ async function submitSaveRelay(nodeId) {
   const statusBox = document.getElementById("add-relay-status");
   const btn = document.getElementById("btn-submit-relay");
 
-  if (!channelId || !name) {
+  if (!name) {
     statusBox.style.display = "block";
     statusBox.style.background = "rgba(239, 68, 68, 0.15)";
     statusBox.style.color = "var(--accent-red)";
-    statusBox.textContent = "Please provide both Channel ID and Name.";
+    statusBox.textContent = "Please provide a friendly name for this relay.";
     return;
   }
 
@@ -1318,7 +2445,7 @@ async function submitSaveRelay(nodeId) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        channel_id: channelId,
+        channel_id,
         pin,
         name,
         room,
@@ -1331,6 +2458,7 @@ async function submitSaveRelay(nodeId) {
     btn.disabled = false;
 
     if (data.success) {
+      showToast({ title: 'Relay Configured', message: `Relay '${name}' (Ch ${channel_id}) saved and pushed to node.`, severity: 'SUCCESS' });
       showNodeSettingsModal(nodeId, 'relays');
     } else {
       statusBox.style.display = "block";
@@ -1349,7 +2477,7 @@ async function submitSaveRelay(nodeId) {
 
 // Delete relay channel from node
 async function deleteRelayChannel(nodeId, channelId) {
-  if (!confirm(`Are you sure you want to delete relay channel "${channelId}" from this node?`)) {
+  if (!confirm(`Are you sure you want to remove relay channel "${channelId}" from this node?`)) {
     return;
   }
 
@@ -1359,6 +2487,7 @@ async function deleteRelayChannel(nodeId, channelId) {
     });
     const data = await res.json();
     if (data.success) {
+      showToast({ title: 'Relay Removed', message: `Relay channel ${channelId} removed from fleet and node.`, severity: 'INFO' });
       showNodeSettingsModal(nodeId, 'relays');
     } else {
       alert("Failed to delete relay: " + (data.error || "Unknown error"));
@@ -1803,6 +2932,8 @@ async function renderOtaWizard(presetFwId = null, presetNodeId = null) {
     const rawFw = await fwRes.json();
     const nodes = Array.isArray(rawNodes) ? rawNodes : (rawNodes.nodes || []);
     const firmwares = Array.isArray(rawFw) ? rawFw : (rawFw.firmware || rawFw.firmwares || []);
+    window._cachedFirmwares = firmwares;
+    window._cachedNodes = nodes;
 
     if (nodes.length === 0) {
       content.innerHTML = `<div style="padding: 30px; text-align: center; color: var(--text-muted); background: var(--bg-card); border-radius: 8px; border: 1px solid var(--border-color); margin: 20px 0;">No registered nodes found in fleet. Please add or connect a node first.</div>`;
@@ -1863,15 +2994,9 @@ async function renderOtaWizard(presetFwId = null, presetNodeId = null) {
             <button class="btn btn-secondary" style="font-size: 12px;" onclick="onWizardFirmwareChanged()">🧪 Run Pre-Flight Validation</button>
           </div>
 
-          <div class="form-group" style="margin-bottom: 16px;">
-            <label class="form-label">Candidate Firmware Binary</label>
-            <select id="wiz-fw-select" class="form-control" onchange="onWizardFirmwareChanged()">
-              ${firmwares.length === 0 ? '<option value="">(No firmware binaries uploaded - upload in Firmware Catalog first)</option>' : firmwares.map(f => `
-                <option value="${f.id}" ${f.id === otaWizardState.firmwareId ? 'selected' : ''}>
-                  ${f.filename} [v${f.version}] (${(f.file_size_bytes/1024).toFixed(1)} KB) - ${f.release_channel || 'LTS'}
-                </option>
-              `).join("")}
-            </select>
+          <!-- CONTAINER POPULATED DYNAMICALLY FOR THE SELECTED DEVICE TYPE ONLY -->
+          <div id="wiz-fw-selector-container">
+            <div style="padding: 16px; text-align: center; color: var(--text-muted);">Loading firmware options for selected device...</div>
           </div>
 
           <!-- PRE-CHECK RESULTS CONTAINER -->
@@ -1928,6 +3053,9 @@ async function renderOtaWizard(presetFwId = null, presetNodeId = null) {
       </div>
     `;
 
+    // Immediately render candidate firmware for default node before network fetch
+    updateWizardFirmwareOptions(defaultNode);
+
     // Trigger initial live fetch & pre-check
     await onWizardNodeChanged();
   } catch (err) {
@@ -1942,12 +3070,20 @@ async function onWizardNodeChanged() {
   const nodeId = nodeSelect.value;
   otaWizardState.nodeId = nodeId;
 
+  const nodes = window._cachedNodes || [];
+  const currentNode = nodes.find(n => n.node_id === nodeId) || null;
+
+  // 1. Immediately update candidate firmware selector for THIS node's device type!
+  updateWizardFirmwareOptions(currentNode);
+
   const diagView = document.getElementById("wiz-node-diagnostics-view");
-  diagView.innerHTML = `
-    <div style="padding: 16px; text-align: center; color: var(--text-secondary);">
-      <span class="pulse-dot"></span> Connecting to node over LAN and fetching live hardware diagnostics...
-    </div>
-  `;
+  if (diagView) {
+    diagView.innerHTML = `
+      <div style="padding: 16px; text-align: center; color: var(--text-secondary);">
+        <span class="pulse-dot"></span> Connecting to node over LAN and fetching live hardware diagnostics...
+      </div>
+    `;
+  }
 
   try {
     const res = await fetch(`${API_BASE}/ota/node-diagnostics/${nodeId}`);
@@ -1955,71 +3091,91 @@ async function onWizardNodeChanged() {
     if (!res.ok) throw new Error(d.error || 'Failed to fetch node diagnostics');
     otaWizardState.diagnostics = d;
 
-    diagView.innerHTML = `
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-        <div style="display: flex; align-items: center; gap: 10px;">
-          <span class="status-badge badge-online"><span class="pulse-dot"></span> Node Reachable</span>
-          <span style="font-size: 12px; color: var(--text-secondary);">Ping: <strong>${d.rttMs}ms</strong> | IP: <strong>${d.ip}</strong> | MAC: <code>${d.network.mac}</code></span>
-        </div>
-        <div>
-          <span class="status-badge badge-lts">Installed: v${d.firmwareVersion}</span>
-        </div>
-      </div>
+    // 2. Refresh candidate firmware dropdown using confirmed hardware model from live diagnostics
+    updateWizardFirmwareOptions(d || currentNode);
 
-      <div class="ota-diag-grid">
-        <div class="ota-stat-chip">
-          <span class="chip-label">Hardware Model & Core</span>
-          <span class="chip-value" style="font-size: 13px;">${d.hardware}</span>
-          <span style="font-size: 11px; color: var(--text-muted);">Core: ${d.coreVersion} | SDK: ${d.sdkVersion}</span>
+    if (diagView) {
+      diagView.innerHTML = `
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span class="status-badge badge-online"><span class="pulse-dot"></span> Node Reachable</span>
+            <span style="font-size: 12px; color: var(--text-secondary);">Ping: <strong>${d.rttMs}ms</strong> | IP: <strong>${d.ip}</strong> | MAC: <code>${d.network.mac}</code></span>
+          </div>
+          <div>
+            <span class="status-badge badge-lts">Installed: v${d.firmwareVersion}</span>
+          </div>
         </div>
 
-        <div class="ota-stat-chip">
-          <span class="chip-label">Free Sketch Space</span>
-          <span class="chip-value" style="color: var(--accent-green);">${(d.flashGeometry.freeSketchSpace/1024).toFixed(1)} KB Available</span>
-          <span style="font-size: 11px; color: var(--text-muted);">Sketch: ${(d.flashGeometry.sketchSize/1024).toFixed(1)} KB | Flash: ${(d.flashGeometry.flashSize/1024/1024).toFixed(1)} MB</span>
-        </div>
+        <div class="ota-diag-grid">
+          <div class="ota-stat-chip">
+            <span class="chip-label">Hardware Architecture</span>
+            <span class="chip-value" style="font-size: 13px;">${d.hardware}</span>
+            <span style="font-size: 11px; color: var(--text-muted);">Core: ${d.coreVersion} | SDK: ${d.sdkVersion}</span>
+          </div>
 
-        <div class="ota-stat-chip">
-          <span class="chip-label">Free Heap Memory</span>
-          <span class="chip-value" style="color: var(--accent-blue);">${(d.memory.freeHeap/1024).toFixed(1)} KB</span>
-          <span style="font-size: 11px; color: var(--text-muted);">Max Block: ${(d.memory.maxFreeBlock/1024).toFixed(1)} KB | Frag: ${d.memory.heapFragPercent}%</span>
-        </div>
+          <div class="ota-stat-chip">
+            <span class="chip-label">Free Sketch Space</span>
+            <span class="chip-value" style="color: var(--accent-green);">${(d.flashGeometry.freeSketchSpace/1024).toFixed(1)} KB Available</span>
+            <span style="font-size: 11px; color: var(--text-muted);">Sketch: ${(d.flashGeometry.sketchSize/1024).toFixed(1)} KB | Flash: ${(d.flashGeometry.flashSize/1024/1024).toFixed(1)} MB</span>
+          </div>
 
-        <div class="ota-stat-chip">
-          <span class="chip-label">Network & Uptime</span>
-          <span class="chip-value">${d.network.rssi} dBm (Wi-Fi)</span>
-          <span style="font-size: 11px; color: var(--text-muted);">Uptime: ${Math.floor(d.network.uptimeSec/60)}m | Resets: ${d.network.bootCount}</span>
-        </div>
-      </div>
-    `;
+          <div class="ota-stat-chip">
+            <span class="chip-label">Free Heap Memory</span>
+            <span class="chip-value" style="color: var(--accent-blue);">${(d.memory.freeHeap/1024).toFixed(1)} KB</span>
+            <span style="font-size: 11px; color: var(--text-muted);">Max Block: ${(d.memory.maxFreeBlock/1024).toFixed(1)} KB | Frag: ${d.memory.heapFragPercent}%</span>
+          </div>
 
-    // Re-run pre-check with the new node diagnostics
+          <div class="ota-stat-chip">
+            <span class="chip-label">Network & Uptime</span>
+            <span class="chip-value">${d.network.rssi} dBm (Wi-Fi)</span>
+            <span style="font-size: 11px; color: var(--text-muted);">Uptime: ${Math.floor(d.network.uptimeSec/60)}m | Resets: ${d.network.bootCount}</span>
+          </div>
+        </div>
+      `;
+    }
+
+    // 3. Trigger candidate firmware validation
     await onWizardFirmwareChanged();
   } catch (err) {
-    diagView.innerHTML = `
-      <div class="check-item check-fail">
-        <span>❌</span>
-        <div>
-          <strong>Failed to fetch live diagnostics:</strong> ${err.message}.
-          <div style="font-size: 11px; margin-top: 4px;">Please check if the node is powered on and connected to the home Wi-Fi network.</div>
+    if (diagView) {
+      diagView.innerHTML = `
+        <div class="check-item check-fail">
+          <span>❌</span>
+          <div>
+            <strong>Failed to fetch live diagnostics:</strong> ${err.message}.
+            <div style="font-size: 11px; margin-top: 4px;">Please check if the node is powered on and connected to the home Wi-Fi network.</div>
+          </div>
         </div>
-      </div>
-    `;
+      `;
+    }
+    await onWizardFirmwareChanged();
   }
 }
 
 // Handler: Firmware Changed in Wizard
 async function onWizardFirmwareChanged() {
   const fwSelect = document.getElementById("wiz-fw-select");
-  if (!fwSelect) return;
-  const fwId = fwSelect.value;
-  otaWizardState.firmwareId = fwId;
-
   const preCheckView = document.getElementById("wiz-precheck-view");
   const downgradeBox = document.getElementById("wiz-downgrade-override-box");
   const deployBtn = document.getElementById("btn-start-ota-deploy");
 
+  if (!fwSelect || !preCheckView) return;
+  const fwId = fwSelect.value;
+  otaWizardState.firmwareId = fwId ? Number(fwId) : null;
+
   if (!otaWizardState.nodeId) return;
+
+  if (!fwId) {
+    preCheckView.innerHTML = `
+      <div class="check-item check-warn">
+        <span>⚠️</span>
+        <div><strong>No firmware selected:</strong> Please upload a certified firmware binary compiled specifically for this device type.</div>
+      </div>
+    `;
+    if (downgradeBox) downgradeBox.style.display = 'none';
+    if (deployBtn) deployBtn.disabled = true;
+    return;
+  }
 
   preCheckView.innerHTML = `
     <div style="padding: 14px; text-align: center; color: var(--text-secondary);">
@@ -2386,23 +3542,89 @@ async function renderOtaHistory() {
 }
 
 // Upload Modal with LTS metadata
-function showUploadFirmwareModal() {
+async function showUploadFirmwareModal(preselectedHw = null) {
+  let nodes = window._cachedNodes || [];
+  if (nodes.length === 0) {
+    try {
+      const res = await fetch(`${API_BASE}/nodes`);
+      const data = await res.json();
+      nodes = Array.isArray(data) ? data : (data.nodes || []);
+      window._cachedNodes = nodes;
+    } catch {}
+  }
+
   const html = `
-    <div class="modal-content">
-      <div style="display: flex; justify-content: space-between; align-items: center;">
-        <h3 style="margin: 0;">Upload Certified Firmware Binary (.bin)</h3>
+    <div class="modal-content" style="max-width: 600px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+        <div>
+          <h3 style="margin: 0; font-size: 18px;">Upload Certified Firmware Binary (.bin)</h3>
+          <div style="font-size: 12px; color: var(--text-secondary); margin-top: 2px;">
+            Target an available fleet node or register a brand-new device architecture
+          </div>
+        </div>
         <button class="btn btn-secondary" style="padding: 4px 8px;" onclick="closeModal()">&times;</button>
       </div>
 
       <div class="form-group">
-        <label class="form-label">Firmware File (.bin) *</label>
-        <input type="file" id="fw-file" class="form-control" accept=".bin">
+        <label class="form-label">Firmware Binary File (.bin) *</label>
+        <input type="file" id="fw-file" class="form-control" accept=".bin" onchange="onFwFileSelected()">
+        <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">
+          Must be an exported binary file with ESP ROM magic byte <code>0xE9</code>.
+        </div>
+      </div>
+
+      <!-- TARGET DEVICE / HARDWARE PLATFORM SELECTION -->
+      <div class="form-group">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+          <label class="form-label" style="margin: 0;">Target Device or Hardware Platform *</label>
+          <button type="button" class="btn btn-secondary" style="font-size: 11px; padding: 2px 8px; color: var(--accent-blue);" onclick="toggleCustomDeviceInput(true)">
+            ➕ Add New Device Model
+          </button>
+        </div>
+
+        <div id="fw-device-select-container">
+          <select id="fw-hardware" class="form-control" onchange="onUploadDeviceSelectionChanged()">
+            ${nodes.length > 0 ? `
+              <optgroup label="📡 Target Available Nodes in Fleet">
+                ${nodes.map(n => `
+                  <option value="${escapeHtml(n.hardware_type || n.hardware || 'ESP8266')}" data-nodename="${escapeHtml(n.name)}">
+                    ${escapeHtml(n.name)} (${escapeHtml(n.ip_address || 'No IP')}) — [${escapeHtml(n.hardware_type || 'ESP8266')}]
+                  </option>
+                `).join('')}
+              </optgroup>
+            ` : ''}
+
+            <optgroup label="⚙️ Standard Hardware Platforms">
+              <option value="ESP8266 (ESP-12E/F) NodeMCU">ESP8266 (ESP-12E/F) NodeMCU (4MB Flash)</option>
+              <option value="ESP8266 ESP-01 / ESP-01S (1MB)">ESP8266 ESP-01 / ESP-01S (1MB Flash)</option>
+              <option value="ESP8266 (Generic)">ESP8266 Generic</option>
+              <option value="ESP32">ESP32 (WROOM / WROVER)</option>
+            </optgroup>
+
+            <optgroup label="➕ Custom Device Model">
+              <option value="__NEW_DEVICE__">+ Add New Custom Device Model...</option>
+            </optgroup>
+          </select>
+        </div>
+
+        <!-- NEW CUSTOM DEVICE MODEL INPUT BOX -->
+        <div id="fw-new-device-box" style="display: none; margin-top: 8px; background: rgba(59, 130, 246, 0.08); border: 1px dashed rgba(59, 130, 246, 0.3); border-radius: 6px; padding: 10px;">
+          <label class="form-label" style="font-size: 12px; margin-bottom: 4px; color: #93c5fd;">Enter New Device Model / Hardware Name:</label>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <input type="text" id="fw-custom-hardware" class="form-control" placeholder="e.g. ESP32-CAM, Sonoff Basic R2, Shelly 1, Custom PCB" style="font-size: 13px;">
+            <button type="button" class="btn btn-secondary" style="font-size: 11px; white-space: nowrap;" onclick="toggleCustomDeviceInput(false)">Use Existing</button>
+          </div>
+          <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">
+            This registers a separate hardware platform category in your fleet firmware repository.
+          </div>
+        </div>
       </div>
 
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
         <div class="form-group">
           <label class="form-label">Firmware Version *</label>
-          <input type="text" id="fw-version" class="form-control" placeholder="1.7.0" value="1.7.0">
+          <input type="text" id="fw-version" class="form-control" placeholder="e.g. 1.7.0" value="1.7.0">
+          <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Format: Semantic version (X.Y.Z)</div>
         </div>
 
         <div class="form-group">
@@ -2417,38 +3639,139 @@ function showUploadFirmwareModal() {
       </div>
 
       <div class="form-group">
-        <label class="form-label">Target Hardware Platform</label>
-        <select id="fw-hardware" class="form-control">
-          <option value="ESP8266 (ESP-12E/F) NodeMCU">ESP8266 (ESP-12E/F) NodeMCU</option>
-          <option value="ESP8266 (Generic)">ESP8266 (Generic)</option>
-          <option value="ESP32">ESP32</option>
-        </select>
-      </div>
-
-      <div class="form-group">
         <label class="form-label">Changelog & Release Notes</label>
-        <textarea id="fw-notes" class="form-control" rows="2" placeholder="Describe optimizations, bug fixes, or enhancements...">Long-Term Support release with dynamic heap optimization and TCP keep-alive.</textarea>
+        <textarea id="fw-notes" class="form-control" rows="2" placeholder="Describe optimizations, bug fixes, or enhancements...">Production LTS release with dynamic heap optimization and TCP keep-alive.</textarea>
       </div>
 
-      <div id="fw-upload-status" style="display: none; font-size: 13px; padding: 8px; border-radius: 6px;"></div>
+      <div id="fw-upload-status" style="display: none; font-size: 13px; padding: 8px; border-radius: 6px; margin-bottom: 12px;"></div>
 
-      <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 8px;">
+      <div style="display: flex; justify-content: flex-end; gap: 10px;">
         <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
         <button class="btn btn-primary" id="btn-submit-upload-fw" onclick="submitUploadFirmware()">Upload & Register</button>
       </div>
     </div>
   `;
   openModal(html);
+
+  // If a preselected hardware was passed, choose it
+  if (preselectedHw) {
+    setTimeout(() => {
+      const sel = document.getElementById("fw-hardware");
+      if (sel) {
+        for (let i = 0; i < sel.options.length; i++) {
+          if (sel.options[i].value.includes(preselectedHw) || preselectedHw.includes(sel.options[i].value)) {
+            sel.selectedIndex = i;
+            break;
+          }
+        }
+      }
+    }, 50);
+  }
+}
+
+// Toggle custom device input vs dropdown
+function toggleCustomDeviceInput(showCustom) {
+  const customBox = document.getElementById("fw-new-device-box");
+  const selectBox = document.getElementById("fw-device-select-container");
+  const customInput = document.getElementById("fw-custom-hardware");
+  const sel = document.getElementById("fw-hardware");
+
+  if (showCustom === undefined) {
+    showCustom = (customBox.style.display === "none");
+  }
+
+  if (showCustom) {
+    customBox.style.display = "block";
+    selectBox.style.display = "none";
+    if (customInput) customInput.focus();
+  } else {
+    customBox.style.display = "none";
+    selectBox.style.display = "block";
+    if (sel && sel.value === "__NEW_DEVICE__") {
+      sel.selectedIndex = 0;
+    }
+  }
+}
+
+// Handler when user chooses an option from the hardware / node dropdown
+function onUploadDeviceSelectionChanged() {
+  const sel = document.getElementById("fw-hardware");
+  if (!sel) return;
+
+  if (sel.value === "__NEW_DEVICE__") {
+    toggleCustomDeviceInput(true);
+    return;
+  }
+
+  const selectedOpt = sel.options[sel.selectedIndex];
+  const nodeName = selectedOpt?.dataset?.nodename;
+  const notesField = document.getElementById("fw-notes");
+  if (nodeName && notesField && notesField.value.includes("Production LTS release")) {
+    notesField.value = `Certified LTS firmware build targeted for ${nodeName} (${sel.value}).`;
+  }
+}
+
+// Inspect file when selected
+function onFwFileSelected() {
+  const fileInput = document.getElementById("fw-file");
+  const statusBox = document.getElementById("fw-upload-status");
+  if (!fileInput.files || fileInput.files.length === 0) return;
+
+  const file = fileInput.files[0];
+  const sizeKb = (file.size / 1024).toFixed(1);
+
+  // Auto-detect version from filename if present (e.g. firmware-v1.7.0.bin)
+  const match = file.name.match(/v?([0-9]+\.[0-9]+(\.[0-9]+)?)/i);
+  if (match) {
+    const verInput = document.getElementById("fw-version");
+    if (verInput) verInput.value = match[1];
+  }
+
+  // Pre-check ESP-01 file size
+  const customBox = document.getElementById("fw-new-device-box");
+  const isCustom = customBox && customBox.style.display !== "none";
+  const hwVal = isCustom ? (document.getElementById("fw-custom-hardware")?.value || '') : (document.getElementById("fw-hardware")?.value || '');
+
+  if (hwVal.includes("ESP-01") && file.size > 512000) {
+    statusBox.style.display = "block";
+    statusBox.style.background = "rgba(245, 158, 11, 0.15)";
+    statusBox.style.color = "#fde047";
+    statusBox.textContent = `⚠️ Notice: File size (${sizeKb} KB) is large for ESP-01 1MB flash partition limit (~480 KB). Ensure sketch fits inside partition.`;
+  } else {
+    statusBox.style.display = "none";
+  }
 }
 
 async function submitUploadFirmware() {
   const fileInput = document.getElementById("fw-file");
   const version = document.getElementById("fw-version").value.trim() || "1.6.0";
-  const hardware_type = document.getElementById("fw-hardware").value;
   const release_channel = document.getElementById("fw-channel").value;
   const notes = document.getElementById("fw-notes").value.trim();
   const statusBox = document.getElementById("fw-upload-status");
   const btn = document.getElementById("btn-submit-upload-fw");
+
+  // Determine Hardware Target: Custom Device vs Selected Node/Platform
+  const customBox = document.getElementById("fw-new-device-box");
+  const isCustom = customBox && customBox.style.display !== "none";
+  let hardware_type = "";
+
+  if (isCustom) {
+    hardware_type = document.getElementById("fw-custom-hardware")?.value.trim() || "";
+    if (!hardware_type) {
+      statusBox.style.display = "block";
+      statusBox.style.background = "rgba(239, 68, 68, 0.15)";
+      statusBox.style.color = "var(--accent-red)";
+      statusBox.textContent = "Please enter the new device model name.";
+      return;
+    }
+  } else {
+    const sel = document.getElementById("fw-hardware");
+    if (sel.value === "__NEW_DEVICE__") {
+      toggleCustomDeviceInput(true);
+      return;
+    }
+    hardware_type = sel.value;
+  }
 
   if (!fileInput.files || fileInput.files.length === 0) {
     statusBox.style.display = "block";
@@ -2458,19 +3781,39 @@ async function submitUploadFirmware() {
     return;
   }
 
+  // Client-side semver validation
+  const semverRegex = /^v?([0-9]+)\.([0-9]+)(\.([0-9]+))?(-[0-9A-Za-z.-]+)?$/;
+  if (!semverRegex.test(version)) {
+    statusBox.style.display = "block";
+    statusBox.style.background = "rgba(239, 68, 68, 0.15)";
+    statusBox.style.color = "var(--accent-red)";
+    statusBox.textContent = "Invalid version format! Please use standard semantic versioning (e.g. 1.6.1, 1.7.0, 2.0.0).";
+    return;
+  }
+
+  // Client-side ESP-01 size check
+  if (hardware_type.includes("ESP-01") && fileInput.files[0].size > 512000) {
+    statusBox.style.display = "block";
+    statusBox.style.background = "rgba(239, 68, 68, 0.15)";
+    statusBox.style.color = "var(--accent-red)";
+    statusBox.textContent = `Binary is too large for ESP-01! Size is ${(fileInput.files[0].size/1024).toFixed(1)} KB, but ESP-01 max partition is ~480 KB.`;
+    return;
+  }
+
   const formData = new FormData();
   formData.append("firmware", fileInput.files[0]);
   formData.append("version", version);
+  formData.append("hardware", hardware_type);
   formData.append("hardware_type", hardware_type);
   formData.append("release_channel", release_channel);
   formData.append("notes", notes);
 
   btn.disabled = true;
-  btn.textContent = "Uploading...";
+  btn.textContent = "Uploading & Verifying...";
   statusBox.style.display = "block";
   statusBox.style.background = "rgba(59, 130, 246, 0.15)";
   statusBox.style.color = "var(--accent-blue)";
-  statusBox.textContent = "Uploading firmware binary & calculating SHA256 checksum...";
+  statusBox.textContent = `Uploading binary for '${hardware_type}' and validating ROM flash signature...`;
 
   try {
     const res = await fetch(`${API_BASE}/firmware/upload`, {
@@ -2481,7 +3824,7 @@ async function submitUploadFirmware() {
     if (result.success) {
       statusBox.style.background = "rgba(34, 197, 94, 0.15)";
       statusBox.style.color = "var(--accent-green)";
-      statusBox.textContent = `Firmware v${version} uploaded and registered in LTS catalog!`;
+      statusBox.textContent = `Firmware v${version} for '${hardware_type}' successfully registered in catalog!`;
       setTimeout(() => {
         closeModal();
         loadFirmware('catalog');
@@ -3357,8 +4700,9 @@ async function loadLittlefs() {
               ${nodeOptions}
             </select>
           </div>
-          <div style="display: flex; gap: 8px;">
+          <div style="display: flex; gap: 8px; flex-wrap: wrap;">
             <button class="btn btn-primary" onclick="refreshLittlefsList()">🔄 Refresh Files</button>
+            <button class="btn btn-secondary" id="btn-fs-live-sync" onclick="triggerLittlefsLiveSync()">⚡ Live Sync</button>
             <button class="btn btn-secondary" onclick="openUploadFsModal()">📤 Upload File</button>
             <button class="btn btn-secondary" onclick="triggerLittlefsBackup()">💾 Backup Partition</button>
             <button class="btn btn-secondary" onclick="openFsBackupsHistoryModal()">📜 Backups History</button>
@@ -3383,6 +4727,208 @@ function handleLittlefsNodeChange(val) {
   refreshLittlefsList();
 }
 
+function switchToFirstSupportedFsNode() {
+  const sel = document.getElementById('littlefs-node-select');
+  if (sel) {
+    for (let i = 0; i < sel.options.length; i++) {
+      if (sel.options[i].value !== selectedFsNodeId) {
+        sel.selectedIndex = i;
+        handleLittlefsNodeChange(sel.options[i].value);
+        break;
+      }
+    }
+  }
+}
+
+async function triggerLittlefsLiveSync() {
+  if (!selectedFsNodeId) return;
+  const btn = document.getElementById('btn-fs-live-sync');
+  const oldText = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '⚡ Syncing LittleFS...'; }
+  showToast({ title: 'LittleFS Live Sync', message: 'Reconciling LittleFS filesystem and config files with central server...', severity: 'INFO' });
+
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/nodes/${selectedFsNodeId}/fs/sync`, { method: 'POST' });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: 'Live Sync Completed', message: `Synchronized ${data.filesCount || 0} LittleFS files and configuration records`, severity: 'SUCCESS' });
+      await refreshLittlefsList();
+    } else {
+      showToast({ title: 'Live Sync Notice', message: data.error || 'Live sync encountered an issue', severity: data.unsupported ? 'WARNING' : 'ERROR' });
+      if (data.unsupported) {
+        await refreshLittlefsList();
+      }
+    }
+  } catch (err) {
+    showToast({ title: 'Sync Error', message: err.message, severity: 'ERROR' });
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = oldText; }
+  }
+}
+
+async function viewFsFile(filePath) {
+  openModal(`
+    <div class="modal-card" style="max-width: 680px; width: 92vw;">
+      <div class="modal-header" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); padding-bottom: 12px; margin-bottom: 14px;">
+        <h3 style="font-size: 15px; margin: 0; color: var(--text-primary);">📄 File Inspector: <code style="color: var(--accent-blue);">${escapeHtml(filePath)}</code></h3>
+        <button class="modal-close-btn" style="background:none; border:none; color:var(--text-muted); font-size:24px; cursor:pointer; line-height:1; padding:0 4px;" onclick="closeModal()">&times;</button>
+      </div>
+      <div id="fs-file-viewer-body" style="padding: 4px 0 16px 0;">
+        <div style="text-align:center; padding: 30px; color: var(--text-secondary);">Loading file content from LittleFS...</div>
+      </div>
+    </div>
+  `);
+
+  const bodyEl = document.getElementById('fs-file-viewer-body');
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/nodes/${selectedFsNodeId}/fs/file-content?path=${encodeURIComponent(filePath)}`);
+    const data = await res.json();
+    if (!data.success) {
+      bodyEl.innerHTML = `<div style="color:var(--accent-red); padding:10px;">Failed to read file: ${escapeHtml(data.error)}</div>`;
+      return;
+    }
+
+    const isSmall = (data.size < 5120); // Strict < 5 KB heap-safe boundary
+    const isJson = filePath.toLowerCase().endsWith('.json');
+    const isEditable = isSmall && data.isText;
+
+    let displayContent = data.content || '';
+    if (isJson) {
+      try {
+        displayContent = JSON.stringify(JSON.parse(displayContent), null, 2);
+      } catch {}
+    }
+
+    bodyEl.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; font-size:12px; flex-wrap:wrap; gap:8px;">
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span>Size: <strong>${(data.size / 1024).toFixed(2)} KB</strong> (${data.size} bytes)</span>
+          <span>Type: <code>${escapeHtml(data.contentType || 'text/plain')}</code></span>
+        </div>
+        <div>
+          ${isEditable ? 
+            `<span class="status-badge badge-online" style="font-size:11px; padding:2px 8px;">✏️ Editable (&lt; 5 KB Heap-Safe)</span>` : 
+            `<span class="status-badge badge-sync" style="font-size:11px; padding:2px 8px;">🔒 Read-Only Protected (${(data.size/1024).toFixed(1)} KB)</span>`
+          }
+        </div>
+      </div>
+
+      ${isEditable ? `
+        <div style="background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.25); border-radius: 6px; padding: 8px 12px; margin-bottom: 10px; font-size: 12px; color: #a7f3d0; display:flex; justify-content:space-between; align-items:center;">
+          <div>
+            <strong>🟢 Node Heap Safe:</strong> File is strictly under 5 KB (${(data.size / 1024).toFixed(2)} KB). Completely safe for ESP8266 RAM/heap budget (~23 KB).
+          </div>
+          <div style="display:flex; gap:6px;">
+            <button type="button" class="btn btn-secondary" style="font-size:11px; padding:2px 8px;" onclick="toggleEditorTheme()" title="Toggle Light/Dark Editor Background">🌓 Theme</button>
+            ${isJson ? `<button type="button" class="btn btn-secondary" style="font-size:11px; padding:2px 8px;" onclick="formatEditorJson()">✨ Prettify JSON</button>` : ''}
+          </div>
+        </div>
+      ` : `
+        <div style="background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.3); border-radius: 6px; padding: 8px 12px; margin-bottom: 10px; font-size: 12px; color: #f59e0b; display:flex; justify-content:space-between; align-items:center;">
+          <div>
+            ⚠️ <strong>Heap Safety Protection:</strong> Direct browser editing is disabled for files larger than 5 KB to prevent microcontroller RAM/heap exhaustion (ESP8266 free heap is ~23–38 KB). To replace this large web bundle file, use the <strong>Upload File</strong> button.
+          </div>
+          <button type="button" class="btn btn-secondary" style="font-size:11px; padding:2px 8px;" onclick="toggleEditorTheme()" title="Toggle Light/Dark Editor Background">🌓 Theme</button>
+        </div>
+      `}
+
+      <textarea id="fs-editor-textarea" ${isEditable ? '' : 'readonly'} onkeydown="handleEditorKeyDown(event)" class="code-editor-textarea" style="width:100%; height:370px; font-family:'Consolas','Fira Code','Monaco',monospace; font-size:13.5px; line-height:1.6; background-color:#0b1120 !important; color:#f8fafc !important; caret-color:#38bdf8 !important; border:1px solid rgba(56,189,248,0.4) !important; padding:12px; border-radius:6px; resize:vertical; tab-size:2;">${escapeHtml(displayContent)}</textarea>
+
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-top:14px;">
+        <div>
+          <a href="${API_BASE}/nodes/${selectedFsNodeId}/fs/download?path=${encodeURIComponent(filePath)}" class="btn btn-secondary" style="font-size:12px; text-decoration:none;">💾 Download File</a>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-secondary" onclick="closeModal()">Close</button>
+          ${isEditable ? `<button id="btn-save-fs-file" class="btn btn-primary" onclick="saveFsEditedFile('${escapeHtml(filePath)}')">💾 Save Changes to LittleFS</button>` : ''}
+        </div>
+      </div>
+    `;
+  } catch (err) {
+    bodyEl.innerHTML = `<div style="color:var(--accent-red); padding:10px;">Error: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function handleEditorKeyDown(e) {
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    const ta = e.target;
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    ta.value = ta.value.substring(0, start) + "  " + ta.value.substring(end);
+    ta.selectionStart = ta.selectionEnd = start + 2;
+  }
+}
+
+function formatEditorJson() {
+  const ta = document.getElementById('fs-editor-textarea');
+  if (!ta) return;
+  try {
+    const parsed = JSON.parse(ta.value);
+    ta.value = JSON.stringify(parsed, null, 2);
+    showToast({ title: 'JSON Formatted', message: 'Syntax verified and indented', severity: 'INFO' });
+  } catch (err) {
+    alert('Invalid JSON syntax: ' + err.message);
+  }
+}
+
+function toggleEditorTheme() {
+  const ta = document.getElementById('fs-editor-textarea') || document.getElementById('config-json-textarea');
+  if (!ta) return;
+  const isLight = ta.classList.toggle('theme-light');
+  if (isLight) {
+    ta.style.setProperty('background-color', '#ffffff', 'important');
+    ta.style.setProperty('color', '#0f172a', 'important');
+    ta.style.setProperty('border-color', '#94a3b8', 'important');
+    ta.style.setProperty('caret-color', '#0f172a', 'important');
+  } else {
+    ta.style.setProperty('background-color', '#0b1120', 'important');
+    ta.style.setProperty('color', '#f8fafc', 'important');
+    ta.style.setProperty('border-color', 'rgba(56, 189, 248, 0.4)', 'important');
+    ta.style.setProperty('caret-color', '#38bdf8', 'important');
+  }
+}
+
+async function saveFsEditedFile(filePath) {
+  const ta = document.getElementById('fs-editor-textarea');
+  const btn = document.getElementById('btn-save-fs-file');
+  if (!ta) return;
+
+  const content = ta.value;
+
+  if (filePath.toLowerCase().endsWith('.json')) {
+    try {
+      JSON.parse(content);
+    } catch (err) {
+      alert('Cannot save invalid JSON: ' + err.message);
+      return;
+    }
+  }
+
+  const oldText = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '💾 Saving to LittleFS...'; }
+
+  try {
+    const res = await fetchWithAuth(`${API_BASE}/nodes/${selectedFsNodeId}/fs/save-content`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: filePath, content })
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast({ title: 'Saved to LittleFS', message: `Successfully saved '${filePath}' (${data.size} bytes)`, severity: 'SUCCESS' });
+      closeModal();
+      refreshLittlefsList();
+    } else {
+      alert('Save failed: ' + data.error);
+    }
+  } catch (err) {
+    alert('Save error: ' + err.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = oldText; }
+  }
+}
+
 async function refreshLittlefsList() {
   const detailsEl = document.getElementById('littlefs-details-container');
   if (!detailsEl || !selectedFsNodeId) return;
@@ -3394,6 +4940,29 @@ async function refreshLittlefsList() {
     const data = await res.json();
 
     if (!data.success) {
+      if (data.unsupported) {
+        detailsEl.innerHTML = `
+          <div class="metric-card" style="border-left: 4px solid var(--accent-amber); padding: 24px;">
+            <div style="display: flex; align-items: flex-start; gap: 14px;">
+              <span style="font-size: 30px;">⚠️</span>
+              <div style="flex: 1;">
+                <h3 style="color: var(--accent-amber); margin: 0 0 8px 0; font-size: 16px;">LittleFS Partition Not Supported on This Device</h3>
+                <p style="color: var(--text-secondary); margin: 0 0 12px 0; font-size: 13.5px; line-height: 1.5;">
+                  ${escapeHtml(data.error || 'This device uses a minimal partition scheme without a LittleFS web file manager.')}
+                </p>
+                <div style="background: rgba(255,255,255,0.03); border: 1px solid var(--border-color); border-radius: 6px; padding: 12px; margin-bottom: 14px; font-size: 12.5px; color: var(--text-muted);">
+                  <strong>Hardware Note:</strong> Microcontrollers with 1MB flash (e.g. ESP8266 ESP-01 / ESP-01S) allocate flash exclusively to the application sketch and OTA buffer. LittleFS file browsing and asset hosting are available on devices with 4MB+ flash (such as ESP-12E/F NodeMCU or ESP32).
+                </div>
+                <button class="btn btn-primary" onclick="switchToFirstSupportedFsNode()">
+                  🔄 Switch to NodeMCU (4MB) with LittleFS
+                </button>
+              </div>
+            </div>
+          </div>
+        `;
+        return;
+      }
+
       detailsEl.innerHTML = `
         <div class="metric-card" style="border-left: 4px solid var(--accent-red);">
           <h3 style="color: var(--accent-red);">Filesystem Query Failed</h3>
@@ -3471,6 +5040,7 @@ async function refreshLittlefsList() {
                 </td>
                 <td style="padding: 12px 18px; text-align: right;">
                   <div style="display: inline-flex; gap: 6px;">
+                    <button class="btn btn-secondary" style="padding: 4px 10px; font-size: 12px;" onclick="viewFsFile('${escapeHtml(f.path)}')">👁️ View</button>
                     <a href="${API_BASE}/nodes/${selectedFsNodeId}/fs/download?path=${encodeURIComponent(f.path)}" download="${escapeHtml(f.name)}" class="btn btn-secondary" style="padding: 4px 10px; font-size: 12px; text-decoration: none;">Download</a>
                     <button class="btn btn-secondary" style="padding: 4px 10px; font-size: 12px;" onclick="openRenameFsModal('${escapeHtml(f.path)}')">Rename</button>
                     <button class="btn btn-danger" style="padding: 4px 10px; font-size: 12px;" onclick="deleteFsFile('${escapeHtml(f.path)}')">Delete</button>
@@ -3803,7 +5373,7 @@ async function refreshConfigDetails() {
           <h3 style="font-size: 15px;">Authoritative Configuration Payload (JSON)</h3>
           <span style="font-size: 12px; color: var(--text-muted);">Strict JSON schema validated</span>
         </div>
-        <textarea id="config-json-textarea" class="input-field" style="width: 100%; height: 380px; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px; line-height: 1.5; background: #080c14; border: 1px solid var(--border-color); padding: 12px; border-radius: 8px; resize: vertical;">${JSON.stringify(c.config, null, 2)}</textarea>
+        <textarea id="config-json-textarea" class="code-editor-textarea" style="width: 100%; height: 380px; font-family: 'Consolas', 'Monaco', monospace; font-size: 13.5px; line-height: 1.6; background-color: #0b1120 !important; color: #f8fafc !important; caret-color: #38bdf8 !important; border: 1px solid rgba(56, 189, 248, 0.4); padding: 12px; border-radius: 8px; resize: vertical;">${JSON.stringify(c.config, null, 2)}</textarea>
       </div>
     `;
   } catch (err) {
@@ -4507,4 +6077,372 @@ function handleLogSearch(kw) {
 
 function refreshActiveMetrics() {
   if (currentView === "overview") loadOverview();
+}
+
+// === DEVICE-TYPE HARDWARE ISOLATION & SEPARATION HELPERS ===
+
+function getNodeHardwareCategory(node) {
+  if (!node) return 'ESP8266-NodeMCU';
+  const hw = (node.hardware || node.hardware_type || '').toLowerCase();
+  if (hw.includes('esp-01') || hw.includes('esp01') || hw.includes('1mb')) {
+    return 'ESP-01';
+  }
+  if (hw.includes('nodemcu') || hw.includes('esp-12') || hw.includes('4mb')) {
+    return 'ESP8266-NodeMCU';
+  }
+  if (hw.includes('esp32')) {
+    return 'ESP32';
+  }
+  return 'ESP8266-Generic';
+}
+
+function getFirmwareHardwareCategory(fw) {
+  if (!fw) return 'ESP8266-NodeMCU';
+  const hw = (fw.hardware_type || fw.hardware || '').toLowerCase();
+  if (hw.includes('esp-01') || hw.includes('esp01') || hw.includes('1mb')) {
+    return 'ESP-01';
+  }
+  if (hw.includes('nodemcu') || hw.includes('esp-12') || hw.includes('4mb')) {
+    return 'ESP8266-NodeMCU';
+  }
+  if (hw.includes('esp32')) {
+    return 'ESP32';
+  }
+  return 'ESP8266-Generic';
+}
+
+function getHardwareProfileDetails(cat) {
+  switch (cat) {
+    case 'ESP-01':
+      return {
+        key: 'ESP-01',
+        title: 'ESP8266 ESP-01 / ESP-01S (1MB)',
+        badge: '<span class="status-badge" style="background: rgba(168, 85, 247, 0.2); color: #c084fc; font-weight: 600;">ESP8266 ESP-01 (1MB Flash)</span>',
+        uploadHw: 'ESP8266 ESP-01 / ESP-01S (1MB)'
+      };
+    case 'ESP8266-NodeMCU':
+      return {
+        key: 'ESP8266-NodeMCU',
+        title: 'ESP8266 (ESP-12E/F) NodeMCU',
+        badge: '<span class="status-badge" style="background: rgba(59, 130, 246, 0.2); color: #60a5fa; font-weight: 600;">ESP8266 NodeMCU (4MB Flash)</span>',
+        uploadHw: 'ESP8266 (ESP-12E/F) NodeMCU'
+      };
+    case 'ESP32':
+      return {
+        key: 'ESP32',
+        title: 'ESP32 Microcontroller',
+        badge: '<span class="status-badge" style="background: rgba(34, 197, 94, 0.2); color: #4ade80; font-weight: 600;">ESP32 Architecture</span>',
+        uploadHw: 'ESP32'
+      };
+    default:
+      return {
+        key: 'ESP8266-Generic',
+        title: 'ESP8266 Generic',
+        badge: '<span class="status-badge badge-sync" font-weight: 600;">ESP8266 Generic</span>',
+        uploadHw: 'ESP8266 (Generic)'
+      };
+  }
+}
+
+// Strictly populates candidate firmware options for the target device ONLY
+function updateWizardFirmwareOptions(node) {
+  const container = document.getElementById("wiz-fw-selector-container");
+  if (!container) return;
+
+  const firmwares = window._cachedFirmwares || [];
+  const nodeCat = getNodeHardwareCategory(node);
+  const profile = getHardwareProfileDetails(nodeCat);
+
+  // STRICT FILTER: Keep ONLY binaries belonging to this device type!
+  const deviceFirmwares = firmwares.filter(f => getFirmwareHardwareCategory(f) === nodeCat);
+
+  // Sort: Latest version first, then descending version/id
+  deviceFirmwares.sort((a, b) => (b.is_latest ? 1 : 0) - (a.is_latest ? 1 : 0) || b.id - a.id);
+
+  if (deviceFirmwares.length === 0) {
+    otaWizardState.firmwareId = null;
+    container.innerHTML = `
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+        <label class="form-label" style="margin: 0;">Target Hardware Profile: ${profile.badge}</label>
+      </div>
+      <div style="padding: 16px; background: rgba(245, 158, 11, 0.1); border: 1px dashed rgba(245, 158, 11, 0.4); border-radius: 8px; margin-bottom: 12px;">
+        <div style="display: flex; gap: 12px; align-items: flex-start;">
+          <span style="font-size: 22px;">⚠️</span>
+          <div style="flex: 1;">
+            <strong style="color: #fde047;">No Firmware Binaries Available for ${profile.title}</strong>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 4px; line-height: 1.5;">
+              Binaries from other hardware devices are strictly hidden to prevent cross-flashing or partition bricking. Please upload a binary compiled for this specific device.
+            </div>
+            <div style="margin-top: 10px;">
+              <button class="btn btn-primary" style="font-size: 12px; padding: 6px 14px;" onclick="showUploadFirmwareModalForHw('${profile.uploadHw}')">
+                + Upload ${profile.title} Firmware (.bin)
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <input type="hidden" id="wiz-fw-select" value="">
+    `;
+
+    const preCheckView = document.getElementById("wiz-precheck-view");
+    if (preCheckView) {
+      preCheckView.innerHTML = `
+        <div class="check-item check-warn">
+          <span>⚠️</span>
+          <div><strong>Awaiting Dedicated Binary:</strong> No firmware uploaded for ${profile.title} yet. Click "+ Upload Firmware" above.</div>
+        </div>
+      `;
+    }
+    const deployBtn = document.getElementById("btn-start-ota-deploy");
+    if (deployBtn) deployBtn.disabled = true;
+    return;
+  }
+
+  // Auto-select latest version
+  const defaultSelected = deviceFirmwares.find(f => f.is_latest) || deviceFirmwares[0];
+  otaWizardState.firmwareId = defaultSelected.id;
+
+  const latestList = deviceFirmwares.filter(f => f.is_latest);
+  const historicalList = deviceFirmwares.filter(f => !f.is_latest);
+
+  container.innerHTML = `
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+      <label class="form-label" style="margin: 0;">
+        Dedicated Firmware for: ${profile.badge}
+      </label>
+      <span style="font-size: 12px; color: var(--text-secondary);">
+        <strong>${deviceFirmwares.length}</strong> version(s) available for this device
+      </span>
+    </div>
+
+    <div class="form-group" style="margin-bottom: 16px;">
+      <select id="wiz-fw-select" class="form-control" onchange="onWizardFirmwareChanged()" style="font-size: 13px; font-weight: 500;">
+        ${latestList.length > 0 ? `
+          <optgroup label="⭐ Latest Release for ${profile.title}">
+            ${latestList.map(f => `
+              <option value="${f.id}" selected>
+                🌟 [RECOMMENDED LATEST] v${escapeHtml(f.version)} (${escapeHtml(f.filename)}) — ${(f.file_size_bytes/1024).toFixed(1)} KB [${escapeHtml(f.release_channel || 'LTS')}]
+              </option>
+            `).join('')}
+          </optgroup>
+        ` : ''}
+
+        ${historicalList.length > 0 ? `
+          <optgroup label="📦 Historical Versions for ${profile.title} (Rollback / Downgrade)">
+            ${historicalList.map(f => `
+              <option value="${f.id}">
+                📦 [ROLLBACK] v${escapeHtml(f.version)} (${escapeHtml(f.filename)}) — ${(f.file_size_bytes/1024).toFixed(1)} KB [${escapeHtml(f.release_channel || 'LTS')}]
+              </option>
+            `).join('')}
+          </optgroup>
+        ` : ''}
+      </select>
+    </div>
+  `;
+}
+
+// Helper: Open upload modal with preselected hardware type
+function showUploadFirmwareModalForHw(preselectedHw) {
+  showUploadFirmwareModal();
+  setTimeout(() => {
+    const sel = document.getElementById("fw-hardware");
+    if (sel && preselectedHw) {
+      for (let i = 0; i < sel.options.length; i++) {
+        if (sel.options[i].value.includes(preselectedHw) || preselectedHw.includes(sel.options[i].value)) {
+          sel.selectedIndex = i;
+          break;
+        }
+      }
+    }
+  }, 50);
+}
+
+// Helper: Filter catalog table by hardware target
+function filterCatalogByHw(targetHw) {
+  const rows = document.querySelectorAll("#ota-tab-content table.data-table tbody tr");
+  const buttons = document.querySelectorAll("#catalog-hw-filters button");
+
+  buttons.forEach(b => {
+    b.className = (b.textContent.includes(targetHw) || (targetHw === 'all' && b.textContent.includes('All')))
+      ? 'btn btn-primary'
+      : 'btn btn-secondary';
+  });
+
+  rows.forEach(r => {
+    if (targetHw === 'all') {
+      r.style.display = '';
+      return;
+    }
+    const hwCell = r.querySelector("td:nth-child(2)");
+    if (!hwCell) return;
+    const txt = hwCell.textContent || '';
+    if (txt.includes(targetHw) || targetHw.includes(txt)) {
+      r.style.display = '';
+    } else {
+      r.style.display = 'none';
+    }
+  });
+}
+
+// === SUB-VIEW 5: COMPREHENSIVE OTA DEVELOPER GUIDE ===
+function renderOtaDeveloperGuide() {
+  const content = document.getElementById("ota-tab-content");
+  content.innerHTML = `
+    <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 8px; padding: 24px; max-width: 1000px; margin: 0 auto;">
+      <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 20px;">
+        <span style="font-size: 28px;">📖</span>
+        <div>
+          <h2 style="margin: 0; font-size: 20px;">ESP8266 & ESP32 Over-The-Air (OTA) Developer Guide</h2>
+          <div style="font-size: 13px; color: var(--text-secondary);">Complete reference for compilation, flash partition sizing, semantic versioning, and crash-resilient updates</div>
+        </div>
+      </div>
+
+      <!-- SECTION 1: ARCHITECTURE & PARTITION MAP -->
+      <div style="margin-bottom: 24px;">
+        <h3 style="font-size: 16px; margin: 0 0 10px 0; color: var(--accent-blue); display: flex; align-items: center; gap: 8px;">
+          <span>1. Flash Memory Partition Architectures & Sizing Limits</span>
+        </h3>
+        <p style="font-size: 13px; line-height: 1.6; color: var(--text-secondary); margin: 0 0 12px 0;">
+          The ESP8266 uses a dual-slot OTA mechanism. The flash memory must accommodate both the currently running sketch and the incoming binary simultaneously until the flash write finishes and passes verification.
+        </p>
+
+        <table class="data-table" style="font-size: 13px; margin-bottom: 12px;">
+          <thead>
+            <tr>
+              <th>Target Board</th>
+              <th>Total Flash</th>
+              <th>Recommended Partition Scheme</th>
+              <th>Max Sketch Binary Size</th>
+              <th>Dual-Slot OTA Safe Barrier</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>ESP8266 (ESP-12E/F) NodeMCU</strong></td>
+              <td>4 MB (4,194,304 B)</td>
+              <td><code>4MB (FS:2MB OTA:~1019KB)</code> or <code>4MB (FS:1MB OTA:~1400KB)</code></td>
+              <td>~1,044,480 B (1.0 MB)</td>
+              <td><span class="status-badge badge-online">Safe Margin (+1,000 KB)</span></td>
+            </tr>
+            <tr>
+              <td><strong>ESP8266 ESP-01 / ESP-01S</strong></td>
+              <td>1 MB (1,048,576 B)</td>
+              <td><code>1MB (FS:64KB OTA:~470KB)</code> (Strict Requirement)</td>
+              <td>~480,000 B (468 KB)</td>
+              <td><span class="status-badge badge-lts">Strict Barrier (&lt; 480 KB)</span></td>
+            </tr>
+            <tr>
+              <td><strong>ESP32 (WROOM / WROVER)</strong></td>
+              <td>4 MB / 8 MB / 16 MB</td>
+              <td><code>Default 4MB with spiffs (1.2MB APP / 1.5MB SPIFFS)</code></td>
+              <td>~1,310,720 B (1.25 MB)</td>
+              <td><span class="status-badge badge-online">Safe Margin (+1,200 KB)</span></td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div style="padding: 10px 14px; background: rgba(239, 68, 68, 0.1); border-left: 4px solid var(--accent-red); border-radius: 4px; font-size: 12px; color: #fca5a5;">
+          <strong>CRITICAL WARNING FOR ESP-01 (1MB):</strong> Never select <code>1MB (FS:512KB)</code> in Arduino IDE or PlatformIO for ESP-01. With 512KB SPIFFS, free sketch space drops to &lt; 250KB, causing <code>Update.begin()</code> to immediately reject the upload with <code>ESP8266 OTA Begin Failed: Not Enough Space</code>.
+        </div>
+      </div>
+
+      <!-- SECTION 2: EXPORTING COMPILED BINARY -->
+      <div style="margin-bottom: 24px;">
+        <h3 style="font-size: 16px; margin: 0 0 10px 0; color: var(--accent-blue); display: flex; align-items: center; gap: 8px;">
+          <span>2. How to Compile & Export Binary (.bin)</span>
+        </h3>
+        
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+          <div style="background: var(--bg-primary); padding: 14px; border-radius: 6px; border: 1px solid var(--border-color);">
+            <div style="font-weight: 600; font-size: 13px; margin-bottom: 6px; color: #93c5fd;">In Arduino IDE 1.8.x / 2.x</div>
+            <ol style="font-size: 12px; line-height: 1.6; padding-left: 20px; margin: 0; color: var(--text-secondary);">
+              <li>Select your board under <strong>Tools ➔ Board</strong>:
+                <br>• NodeMCU: <code>NodeMCU 1.0 (ESP-12E Module)</code>
+                <br>• ESP-01: <code>Generic ESP8266 Module</code>
+              </li>
+              <li>Set <strong>Tools ➔ Flash Size</strong>:
+                <br>• NodeMCU: <code>4MB (FS:2MB OTA:~1019KB)</code>
+                <br>• ESP-01: <code>1MB (FS:64KB OTA:~470KB)</code>
+              </li>
+              <li>Click menu: <strong>Sketch ➔ Export Compiled Binary</strong> (or press <kbd>Ctrl+Alt+S</kbd>).</li>
+              <li>Locate the <code>.bin</code> file inside your sketch folder (under <code>build/esp8266.esp8266.../</code>).</li>
+            </ol>
+          </div>
+
+          <div style="background: var(--bg-primary); padding: 14px; border-radius: 6px; border: 1px solid var(--border-color);">
+            <div style="font-weight: 600; font-size: 13px; margin-bottom: 6px; color: #93c5fd;">In PlatformIO (VS Code)</div>
+            <ol style="font-size: 12px; line-height: 1.6; padding-left: 20px; margin: 0; color: var(--text-secondary);">
+              <li>In <code>platformio.ini</code>, specify flash partitions:
+                <pre style="background: #0f172a; padding: 6px; border-radius: 4px; margin: 4px 0; font-size: 11px;">[env:esp01_1m]
+board = esp01_1m
+board_build.ldscript = eagle.flash.1m64.ld</pre>
+              </li>
+              <li>Run build task: <code>pio run</code>.</li>
+              <li>The output binary is located at:
+                <br><code style="font-size: 11px;">.pio/build/esp01_1m/firmware.bin</code>
+              </li>
+            </ol>
+          </div>
+        </div>
+      </div>
+
+      <!-- SECTION 3: EMBEDDING VERSION & REBOOT VERIFICATION -->
+      <div style="margin-bottom: 24px;">
+        <h3 style="font-size: 16px; margin: 0 0 10px 0; color: var(--accent-blue); display: flex; align-items: center; gap: 8px;">
+          <span>3. Semantic Versioning in Microcontroller Code</span>
+        </h3>
+        <p style="font-size: 13px; line-height: 1.6; color: var(--text-secondary); margin: 0 0 10px 0;">
+          The Central Server validates firmware versions using semantic versioning (<code>X.Y.Z</code>). When releasing an update, bump the version macro in your source code so the node automatically reports the new version upon rebooting:
+        </p>
+
+        <pre style="background: #0f172a; padding: 12px; border-radius: 6px; border: 1px solid var(--border-color); font-family: monospace; font-size: 12px; color: #e2e8f0; overflow-x: auto;">
+// In your sketch or config header:
+#define FIRMWARE_NAME    "SmartHome-NodeMCU"
+#define FIRMWARE_VERSION "1.7.0"  // &lt;-- Bump this version on every release!
+
+// In handleStatus() returning GET /api/status:
+void handleStatus() {
+  DynamicJsonDocument doc(1024);
+  doc["deviceName"] = FIRMWARE_NAME;
+  doc["firmwareVersion"] = FIRMWARE_VERSION;
+  doc["hardware"] = "ESP8266 (ESP-12E/F) NodeMCU";
+  doc["freeHeap"] = ESP.getFreeHeap();
+  doc["sketchSize"] = ESP.getSketchSize();
+  doc["freeSketchSpace"] = ESP.getFreeSketchSpace();
+  doc["uptimeSec"] = millis() / 1000;
+  // ...
+  String json;
+  serializeJson(doc, json);
+  server.send(200, "application/json", json);
+}
+        </pre>
+      </div>
+
+      <!-- SECTION 4: PRE-FLIGHT & CRASH RESILIENCE CHECKLIST -->
+      <div>
+        <h3 style="font-size: 16px; margin: 0 0 10px 0; color: var(--accent-blue); display: flex; align-items: center; gap: 8px;">
+          <span>4. Pre-Flight Verification & Best Practices</span>
+        </h3>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; font-size: 12px;">
+          <div style="padding: 10px; background: rgba(34, 197, 94, 0.08); border-left: 3px solid var(--accent-green); border-radius: 4px;">
+            <strong>✅ ROM Flash Magic Byte 0xE9</strong>
+            <div style="color: var(--text-secondary); margin-top: 2px;">The Central Server and ESP both verify byte 0 is <code>0xE9</code>. This guarantees non-firmware files or HTML error pages are never written to flash.</div>
+          </div>
+          <div style="padding: 10px; background: rgba(59, 130, 246, 0.08); border-left: 3px solid var(--accent-blue); border-radius: 4px;">
+            <strong>✅ Free Dynamic RAM (&gt; 15 KB)</strong>
+            <div style="color: var(--text-secondary); margin-top: 2px;">Ensure node heap is healthy before flashing. The server will warn if free heap drops below 14 KB to avoid TCP buffer exhaustion.</div>
+          </div>
+          <div style="padding: 10px; background: rgba(245, 158, 11, 0.08); border-left: 3px solid #f59e0b; border-radius: 4px;">
+            <strong>✅ MD5 Checksum Integrity Check</strong>
+            <div style="color: var(--text-secondary); margin-top: 2px;">The Central Server transmits the <code>X-File-MD5</code> header. The ESP compares the MD5 upon completion before issuing a reboot.</div>
+          </div>
+          <div style="padding: 10px; background: rgba(168, 85, 247, 0.08); border-left: 3px solid #a855f7; border-radius: 4px;">
+            <strong>✅ Automated Pre-OTA Backup & Rollback</strong>
+            <div style="color: var(--text-secondary); margin-top: 2px;">Keep old firmware binaries in the catalog! If a newer release causes instability, use the wizard to select the historical version and downgrade with 1 click.</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  `;
 }

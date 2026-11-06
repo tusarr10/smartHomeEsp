@@ -14,14 +14,18 @@ class OtaService {
   }
 
   // --- HTTP HELPER ---
-  async httpGetJson(ip, endpoint, timeoutMs = 3500) {
+  async httpGetJson(ip, endpoint, timeoutMs = 3500, authHeader = null) {
     return new Promise((resolve, reject) => {
+      const headers = { 'User-Agent': 'SmartHome-Central-OTA/1.6.0', 'Accept': 'application/json' };
+      if (authHeader) {
+        headers['Authorization'] = authHeader;
+      }
       const req = http.request({
         hostname: ip,
         port: 80,
         path: endpoint,
         method: 'GET',
-        headers: { 'User-Agent': 'SmartHome-Central-OTA/1.6.0' },
+        headers,
         timeout: timeoutMs
       }, (res) => {
         let body = '';
@@ -56,26 +60,34 @@ class OtaService {
     }
 
     const ip = node.ip;
+    let authHeader = null;
+    if (node.auth_username && node.auth_password) {
+      authHeader = 'Basic ' + Buffer.from(`${node.auth_username}:${node.auth_password}`).toString('base64');
+    }
+
     const t0 = Date.now();
     let status = null;
     let gpios = [];
 
     try {
-      status = await this.httpGetJson(ip, '/api/status');
+      status = await this.httpGetJson(ip, '/api/status', 3500, authHeader);
     } catch (err) {
       throw new Error(`Failed to connect to node at ${ip}: ${err.message}`);
     }
 
     try {
-      gpios = await this.httpGetJson(ip, '/api/gpio');
+      gpios = await this.httpGetJson(ip, '/api/gpio', 2500, authHeader);
     } catch {}
 
     const rttMs = Date.now() - t0;
-    const freeSketchSpace = Number(status.freeSketchSpace) || 0;
-    const sketchSize = Number(status.sketchSize) || 0;
-    const flashSize = Number(status.flashSize) || 0;
-    const freeHeap = Number(status.freeHeap) || 0;
-    const maxFreeBlock = Number(status.maxFreeBlock) || 0;
+    const hwStr = status.hardware || node.hardware_type || 'ESP8266';
+    const isOneMb = hwStr.includes('ESP-01') || hwStr.includes('1MB');
+    
+    const freeSketchSpace = Number(status.freeSketchSpace) || (isOneMb ? 480000 : 1400000);
+    const sketchSize = Number(status.sketchSize) || (isOneMb ? 335000 : 480000);
+    const flashSize = Number(status.flashSize) || (isOneMb ? 1048576 : 4194304);
+    const freeHeap = Number(status.freeHeap) || 30000;
+    const maxFreeBlock = Number(status.maxFreeBlock) || freeHeap;
 
     return {
       nodeId: node.node_id,
@@ -394,7 +406,7 @@ class OtaService {
   }
 
   // --- 4. STREAM MULTIPART BINARY TO NODE ---
-  async streamFirmwareToNode(ip, filePath, filename, timeoutMs = 60000) {
+  async streamFirmwareToNode(ip, filePath, filename, timeoutMs = 60000, authHeader = null, md5 = null) {
     return new Promise((resolve, reject) => {
       const fileBuffer = fs.readFileSync(filePath);
       const boundary = '----SmartHomeOtaBoundary' + Math.random().toString(36).substring(2);
@@ -452,14 +464,14 @@ class OtaService {
   }
 
   // --- 5. POST-BOOT REBOOT HANDSHAKE VERIFICATION ---
-  async waitForNodeReboot(ip, targetVersion, maxWaitSec = 45) {
+  async waitForNodeReboot(ip, targetVersion, maxWaitSec = 45, authHeader = null) {
     const start = Date.now();
     // Allow initial reboot delay
     await new Promise(r => setTimeout(r, 4000));
 
     while ((Date.now() - start) < (maxWaitSec * 1000)) {
       try {
-        const status = await this.httpGetJson(ip, '/api/status', 2000);
+        const status = await this.httpGetJson(ip, '/api/status', 2000, authHeader);
         if (status && status.uptimeSec < 120) {
           // Node has rebooted!
           const actualVer = status.firmwareVersion || '';
@@ -550,7 +562,11 @@ class OtaService {
       this.db.updateOtaHistory(historyId, {
         details: { stage: 'FLASHING_STREAM' }
       });
-      uploadResult = await this.streamFirmwareToNode(node.ip, fw.file_path, fw.filename);
+      let authHeader = null;
+      if (node.auth_username && node.auth_password) {
+        authHeader = 'Basic ' + Buffer.from(`${node.auth_username}:${node.auth_password}`).toString('base64');
+      }
+      uploadResult = await this.streamFirmwareToNode(node.ip, fw.file_path, fw.filename, 60000, authHeader, fw.checksum_md5);
     } catch (uploadErr) {
       const totalDur = Date.now() - tStart;
       this.db.updateOtaHistory(historyId, {
@@ -569,7 +585,11 @@ class OtaService {
       this.db.updateOtaHistory(historyId, {
         details: { stage: 'AWAITING_REBOOT_HANDSHAKE' }
       });
-      handshakeResult = await this.waitForNodeReboot(node.ip, fw.version);
+      let authHeader = null;
+      if (node.auth_username && node.auth_password) {
+        authHeader = 'Basic ' + Buffer.from(`${node.auth_username}:${node.auth_password}`).toString('base64');
+      }
+      handshakeResult = await this.waitForNodeReboot(node.ip, fw.version, 45, authHeader);
     }
 
     const totalDuration = Date.now() - tStart;

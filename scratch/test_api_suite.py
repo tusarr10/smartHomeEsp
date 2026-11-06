@@ -47,7 +47,7 @@ if len(nodes) > 0:
     update_res = api_call(f'http://localhost:9100/api/v1/nodes/{node_id}/settings', 'PUT', {
         'name': node.get('name') or 'NodeMCU Controller',
         'auth_username': 'admin',
-        'auth_password': 'admin',
+        'auth_password': 'admin123',
         'room': 'Master Bedroom'
     })
     print('Update settings res:', update_res['success'])

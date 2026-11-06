@@ -8,6 +8,7 @@ const multer = require('multer');
 const {
   authenticateUser,
   requirePermission,
+  requireHomeRole,
   verifyDeviceScope,
   verifyPassword
 } = require('../auth');
@@ -48,7 +49,44 @@ function createV1Router(nodeManager, db) {
   // === AUTHENTICATION & SESSION ROUTES ===
   // ==========================================
 
+  const loginAttempts = new Map(); // ip -> { count, lockoutUntil }
+
+  function checkLoginRateLimit(ip) {
+    const now = Date.now();
+    const record = loginAttempts.get(ip);
+    if (record) {
+      if (record.lockoutUntil && record.lockoutUntil > now) {
+        const remainingSec = Math.ceil((record.lockoutUntil - now) / 1000);
+        return `Too many failed login attempts. Please try again in ${remainingSec} seconds.`;
+      }
+      if (record.lockoutUntil && record.lockoutUntil <= now) {
+        loginAttempts.delete(ip);
+      }
+    }
+    return null;
+  }
+
+  function recordFailedLogin(ip) {
+    const now = Date.now();
+    const record = loginAttempts.get(ip) || { count: 0, lockoutUntil: 0 };
+    record.count++;
+    if (record.count >= 5) {
+      record.lockoutUntil = now + 5 * 60 * 1000; // 5-minute temporary lockout
+    }
+    loginAttempts.set(ip, record);
+  }
+
+  function resetFailedLogins(ip) {
+    loginAttempts.delete(ip);
+  }
+
   router.post('/auth/login', (req, res) => {
+    const clientIp = req.ip || req.socket.remoteAddress || '';
+    const rateLimitError = checkLoginRateLimit(clientIp);
+    if (rateLimitError) {
+      return res.status(429).json({ success: false, error: rateLimitError });
+    }
+
     const { username, password } = req.body;
     if (!username || !password) {
       return res.status(400).json({ success: false, error: 'Username and password are required' });
@@ -56,6 +94,7 @@ function createV1Router(nodeManager, db) {
 
     const user = db.getUserByUsername(username);
     if (!user) {
+      recordFailedLogin(clientIp);
       return res.status(401).json({ success: false, error: 'Invalid username or password' });
     }
 
@@ -64,10 +103,12 @@ function createV1Router(nodeManager, db) {
     }
 
     if (!verifyPassword(password, user.password_hash)) {
+      recordFailedLogin(clientIp);
       return res.status(401).json({ success: false, error: 'Invalid username or password' });
     }
 
-    const clientIp = req.ip || req.socket.remoteAddress || '';
+    resetFailedLogins(clientIp);
+
     const userAgent = req.headers['user-agent'] || '';
     const session = db.createSession(user.id, clientIp, userAgent);
 
@@ -102,10 +143,20 @@ function createV1Router(nodeManager, db) {
     });
   });
 
-  router.post('/auth/logout', authenticateUser(db), (req, res) => {
-    if (req.sessionToken) {
-      db.revokeSession(req.sessionToken);
+  router.post('/auth/logout', (req, res) => {
+    let token = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.toLowerCase().startsWith('bearer ')) {
+      token = authHeader.substring(7).trim();
+    } else if (req.headers.cookie) {
+      const match = req.headers.cookie.match(/(?:^|;\s*)session=([a-f0-9]+)(?:;|$)/i);
+      if (match) token = match[1].trim();
     }
+
+    if (token) {
+      db.revokeSession(token);
+    }
+    res.setHeader('Set-Cookie', 'session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
     res.json({ success: true, message: 'Logged out successfully' });
   });
 
@@ -119,11 +170,12 @@ function createV1Router(nodeManager, db) {
     }
 
     const userWithHash = db.getUserByUsername(req.user.username);
-    if (!verifyPassword(oldPassword, userWithHash.password_hash)) {
+    if (!userWithHash || !verifyPassword(oldPassword, userWithHash.password_hash)) {
       return res.status(400).json({ success: false, error: 'Current password does not match' });
     }
 
     db.setUserPassword(req.user.id, newPassword);
+    res.setHeader('Set-Cookie', 'session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
     res.json({ success: true, message: 'Password changed successfully. Please log in again.' });
   });
 
@@ -253,14 +305,379 @@ function createV1Router(nodeManager, db) {
   });
 
   router.get('/nodes', authenticateUser(db), (req, res) => {
-    const { room, status, hardware, search } = req.query;
-    let nodes = db.getNodes({ room, status, hardware, search });
+    const { room, status, hardware, search, home_id, room_id, homeId, roomId } = req.query;
+    const targetHomeId = home_id ?? homeId;
+    const targetRoomId = room_id ?? roomId;
+    let nodes = db.getNodes({
+      room,
+      status,
+      hardware,
+      search,
+      home_id: targetHomeId,
+      room_id: targetRoomId
+    });
 
     // Enforce hierarchical scope-based filtering for non-superusers
     if (req.user && !req.user.is_superuser) {
-      nodes = nodes.filter(node => verifyDeviceScope(req.user, node));
+      nodes = nodes.filter(node => verifyDeviceScope(req.user, node, db));
     }
     res.json(nodes);
+  });
+
+  // ==========================================
+  // === HOME-CENTRIC MANAGEMENT APIS ===
+  // ==========================================
+
+  // --- Homes ---
+  router.get('/homes', authenticateUser(db), (req, res) => {
+    try {
+      const homes = db.getHomes(req.user.id, req.user.is_superuser);
+      res.json({ success: true, homes });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  router.post('/homes', requirePermission(db, 'homes:create'), (req, res) => {
+    try {
+      const { name, description, timezone, address } = req.body;
+      if (!name || !name.trim()) {
+        return res.status(400).json({ success: false, error: 'Home name is required' });
+      }
+      const home = db.createHome({
+        name: name.trim(),
+        description,
+        timezone,
+        address,
+        created_by: req.user.id,
+        owner_user_id: null // Ownerless bootstrap mode by default
+      });
+      res.json({ success: true, home });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  router.get('/homes/:homeId', authenticateUser(db), (req, res) => {
+    try {
+      const homeId = Number(req.params.homeId);
+      const home = db.getHomeById(homeId);
+      if (!home) return res.status(404).json({ success: false, error: 'Home not found' });
+
+      if (!req.user.is_superuser) {
+        const member = db.getHomeMember(homeId, req.user.id);
+        if (!member && home.owner_user_id !== req.user.id) {
+          return res.status(403).json({ success: false, error: 'Forbidden: You do not have access to this home' });
+        }
+      }
+
+      res.json({ success: true, home });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  router.put('/homes/:homeId', requireHomeRole(db, 'HOME_ADMIN'), (req, res) => {
+    try {
+      const homeId = Number(req.params.homeId);
+      const updated = db.updateHome(homeId, req.body);
+      res.json({ success: true, home: updated });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  router.delete('/homes/:homeId', requirePermission(db, 'homes:delete'), (req, res) => {
+    try {
+      const homeId = Number(req.params.homeId);
+      db.deleteHome(homeId);
+      res.json({ success: true, message: `Home ${homeId} archived and nodes unassigned` });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  // Appoint / Transfer Home Owner (Super Admin Only)
+  router.post('/homes/:homeId/owner', requirePermission(db, 'system:manage'), (req, res) => {
+    try {
+      const homeId = Number(req.params.homeId);
+      const targetUserId = Number(req.body.userId || req.body.user_id);
+      if (!targetUserId) {
+        return res.status(400).json({ success: false, error: 'userId is required to appoint a Home Owner' });
+      }
+      const home = db.appointHomeOwner(homeId, targetUserId, req.user.id);
+      res.json({ success: true, home, message: 'Home Owner appointed successfully' });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  // Home Members
+  router.get('/homes/:homeId/members', requireHomeRole(db, 'FAMILY_MEMBER'), (req, res) => {
+    try {
+      const homeId = Number(req.params.homeId);
+      const members = db.getHomeMembers(homeId);
+      res.json({ success: true, members });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  router.post('/homes/:homeId/members', requireHomeRole(db, 'HOME_ADMIN'), (req, res) => {
+    try {
+      const homeId = Number(req.params.homeId);
+      const userId = Number(req.body.userId || req.body.user_id);
+      const role = req.body.role || 'FAMILY_MEMBER';
+      if (!userId) return res.status(400).json({ success: false, error: 'userId is required' });
+
+      const member = db.addHomeMember(homeId, userId, role);
+      res.json({ success: true, member });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  router.put('/homes/:homeId/members/:userId', requireHomeRole(db, 'HOME_ADMIN'), (req, res) => {
+    try {
+      const homeId = Number(req.params.homeId);
+      const userId = Number(req.params.userId);
+      const role = req.body.role;
+      if (!role) return res.status(400).json({ success: false, error: 'role is required' });
+
+      const member = db.updateHomeMemberRole(homeId, userId, role);
+      res.json({ success: true, member });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  router.delete('/homes/:homeId/members/:userId', requireHomeRole(db, 'HOME_ADMIN'), (req, res) => {
+    try {
+      const homeId = Number(req.params.homeId);
+      const userId = Number(req.params.userId);
+      db.removeHomeMember(homeId, userId);
+      res.json({ success: true, message: 'Member removed from home' });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  // --- Rooms ---
+  router.get('/homes/:homeId/rooms', requireHomeRole(db, 'VIEWER'), (req, res) => {
+    try {
+      const homeId = Number(req.params.homeId);
+      const rooms = db.getRooms(homeId, req.user.id, req.user.is_superuser);
+      res.json({ success: true, rooms });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  router.post('/homes/:homeId/rooms', requireHomeRole(db, 'HOME_ADMIN'), (req, res) => {
+    try {
+      const homeId = Number(req.params.homeId);
+      const { name, floor, icon } = req.body;
+      if (!name || !name.trim()) return res.status(400).json({ success: false, error: 'Room name is required' });
+
+      const room = db.createRoom({ home_id: homeId, name: name.trim(), floor, icon });
+      res.json({ success: true, room });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  router.get('/rooms/:roomId', authenticateUser(db), (req, res) => {
+    try {
+      const roomId = Number(req.params.roomId);
+      const room = db.getRoomById(roomId);
+      if (!room) return res.status(404).json({ success: false, error: 'Room not found' });
+
+      if (!req.user.is_superuser) {
+        const member = db.getHomeMember(room.home_id, req.user.id);
+        if (!member) return res.status(403).json({ success: false, error: 'Forbidden' });
+      }
+
+      res.json({ success: true, room });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  router.put('/rooms/:roomId', authenticateUser(db), (req, res) => {
+    try {
+      const roomId = Number(req.params.roomId);
+      const room = db.getRoomById(roomId);
+      if (!room) return res.status(404).json({ success: false, error: 'Room not found' });
+
+      if (!req.user.is_superuser) {
+        const member = db.getHomeMember(room.home_id, req.user.id);
+        if (!member || (member.role !== 'HOME_OWNER' && member.role !== 'HOME_ADMIN')) {
+          return res.status(403).json({ success: false, error: 'Forbidden: Requires HOME_ADMIN role in this home' });
+        }
+      }
+
+      const updated = db.updateRoom(roomId, req.body);
+      res.json({ success: true, room: updated });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  router.delete('/rooms/:roomId', authenticateUser(db), (req, res) => {
+    try {
+      const roomId = Number(req.params.roomId);
+      const room = db.getRoomById(roomId);
+      if (!room) return res.status(404).json({ success: false, error: 'Room not found' });
+
+      if (!req.user.is_superuser) {
+        const member = db.getHomeMember(room.home_id, req.user.id);
+        if (!member || (member.role !== 'HOME_OWNER' && member.role !== 'HOME_ADMIN')) {
+          return res.status(403).json({ success: false, error: 'Forbidden: Requires HOME_ADMIN role in this home' });
+        }
+      }
+
+      db.deleteRoom(roomId);
+      res.json({ success: true, message: 'Room deleted successfully' });
+    } catch (err) {
+      // Handles assigned nodes rejection cleanly
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  router.get('/rooms/:roomId/members', authenticateUser(db), (req, res) => {
+    try {
+      const roomId = Number(req.params.roomId);
+      const members = db.getRoomMembers(roomId);
+      res.json({ success: true, members });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  router.post('/rooms/:roomId/members', authenticateUser(db), (req, res) => {
+    try {
+      const roomId = Number(req.params.roomId);
+      const room = db.getRoomById(roomId);
+      if (!room) return res.status(404).json({ success: false, error: 'Room not found' });
+
+      if (!req.user.is_superuser) {
+        const member = db.getHomeMember(room.home_id, req.user.id);
+        if (!member || (member.role !== 'HOME_OWNER' && member.role !== 'HOME_ADMIN')) {
+          return res.status(403).json({ success: false, error: 'Forbidden: Requires HOME_ADMIN role in this home' });
+        }
+      }
+
+      const userId = Number(req.body.userId || req.body.user_id);
+      const role = req.body.role || 'FAMILY_MEMBER';
+      db.assignRoomMember(roomId, userId, role);
+      res.json({ success: true, message: 'User assigned to room' });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  router.delete('/rooms/:roomId/members/:userId', authenticateUser(db), (req, res) => {
+    try {
+      const roomId = Number(req.params.roomId);
+      const room = db.getRoomById(roomId);
+      if (!room) return res.status(404).json({ success: false, error: 'Room not found' });
+
+      if (!req.user.is_superuser) {
+        const member = db.getHomeMember(room.home_id, req.user.id);
+        if (!member || (member.role !== 'HOME_OWNER' && member.role !== 'HOME_ADMIN')) {
+          return res.status(403).json({ success: false, error: 'Forbidden: Requires HOME_ADMIN role in this home' });
+        }
+      }
+
+      db.removeRoomMember(roomId, Number(req.params.userId));
+      res.json({ success: true, message: 'User removed from room' });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  // --- Node Assignments & Unassigned Queue ---
+  router.get('/nodes/unassigned', authenticateUser(db), (req, res) => {
+    try {
+      if (!req.user.is_superuser) {
+        const hasPerm = req.user.permissions && (req.user.permissions.includes('devices:assign') || req.user.permissions.includes('devices:manage'));
+        if (!hasPerm) {
+          return res.status(403).json({ success: false, error: 'Forbidden: Requires devices:assign permission to inspect unassigned nodes' });
+        }
+      }
+      const nodes = db.getUnassignedNodes();
+      res.json({ success: true, nodes });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  router.post('/nodes/:nodeId/assign', authenticateUser(db), (req, res) => {
+    try {
+      const { nodeId } = req.params;
+      const homeId = Number(req.body.homeId || req.body.home_id);
+      const roomId = Number(req.body.roomId || req.body.room_id);
+
+      if (!homeId || !roomId) {
+        return res.status(400).json({ success: false, error: 'homeId and roomId are required to assign a node' });
+      }
+
+      if (!req.user.is_superuser) {
+        const member = db.getHomeMember(homeId, req.user.id);
+        if (!member || (member.role !== 'HOME_OWNER' && member.role !== 'HOME_ADMIN')) {
+          return res.status(403).json({ success: false, error: 'Forbidden: Requires HOME_ADMIN role in target home' });
+        }
+      }
+
+      const node = db.assignNodeToRoom(nodeId, homeId, roomId);
+      res.json({ success: true, node, message: `Node '${nodeId}' assigned successfully` });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  router.post('/nodes/:nodeId/move', authenticateUser(db), (req, res) => {
+    try {
+      const { nodeId } = req.params;
+      const homeId = Number(req.body.homeId || req.body.home_id);
+      const roomId = Number(req.body.roomId || req.body.room_id);
+
+      if (!homeId || !roomId) {
+        return res.status(400).json({ success: false, error: 'homeId and roomId are required to move a node' });
+      }
+
+      if (!req.user.is_superuser) {
+        const member = db.getHomeMember(homeId, req.user.id);
+        if (!member || (member.role !== 'HOME_OWNER' && member.role !== 'HOME_ADMIN')) {
+          return res.status(403).json({ success: false, error: 'Forbidden: Requires HOME_ADMIN role in target home' });
+        }
+      }
+
+      const node = db.moveNode(nodeId, homeId, roomId);
+      res.json({ success: true, node, message: `Node '${nodeId}' moved successfully` });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  router.post('/nodes/:nodeId/unassign', authenticateUser(db), (req, res) => {
+    try {
+      const { nodeId } = req.params;
+      const existing = db.getNode(nodeId);
+      if (!existing) return res.status(404).json({ success: false, error: 'Node not found' });
+
+      if (!req.user.is_superuser && existing.home_id) {
+        const member = db.getHomeMember(existing.home_id, req.user.id);
+        if (!member || (member.role !== 'HOME_OWNER' && member.role !== 'HOME_ADMIN')) {
+          return res.status(403).json({ success: false, error: 'Forbidden: Requires HOME_ADMIN role in current home' });
+        }
+      }
+
+      const node = db.unassignNode(nodeId);
+      res.json({ success: true, node, message: `Node '${nodeId}' unassigned` });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
   });
 
   // Add / Register Node
@@ -374,7 +791,7 @@ function createV1Router(nodeManager, db) {
     if (!node) {
       return res.status(404).json({ error: 'Node not found' });
     }
-    if (!verifyDeviceScope(req.user, node)) {
+    if (!verifyDeviceScope(req.user, node, db)) {
       return res.status(403).json({ error: 'Forbidden: Node is outside your assigned scope' });
     }
     const history = db.getTelemetryHistory(req.params.nodeId, 20);
@@ -387,7 +804,7 @@ function createV1Router(nodeManager, db) {
     if (!node) {
       return res.status(404).json({ success: false, error: 'Node not found' });
     }
-    if (!verifyDeviceScope(req.user, node)) {
+    if (!verifyDeviceScope(req.user, node, db)) {
       return res.status(403).json({ success: false, error: 'Forbidden: Device outside assigned scope' });
     }
     const ok = db.deleteNode(req.params.nodeId);
@@ -450,58 +867,122 @@ function createV1Router(nodeManager, db) {
   router.post('/nodes/:nodeId/test-auth', requirePermission(db, 'devices:manage'), async (req, res) => {
     const { nodeId } = req.params;
     const node = db.getNode(nodeId);
-    if (!node || !node.ip) {
-      return res.status(404).json({ success: false, error: 'Node not found or has no IP address' });
+    if (!node) {
+      return res.status(404).json({ success: false, error: 'Node not found' });
+    }
+    const nodeIp = node.ip || node.ip_address;
+    if (!nodeIp) {
+      return res.status(404).json({ success: false, error: 'Node has no IP address recorded' });
     }
 
-    const user = (req.body.auth_username || node.auth_username || 'admin').trim();
-    const pass = req.body.auth_password !== undefined ? req.body.auth_password : (node.auth_password || 'admin');
+    const user = (req.body.auth_username || req.body.username || node.auth_username || 'admin').trim();
+    const pass = req.body.auth_password !== undefined ? req.body.auth_password : (req.body.password !== undefined ? req.body.password : (node.auth_password || 'admin'));
 
     const t0 = Date.now();
-    const headers = {
-      'Accept': 'application/json',
-      'Authorization': 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64')
-    };
 
     try {
-      const response = await fetch(`http://${node.ip}/api/status`, {
-        headers,
+      // 1. Primary probe: Authenticate against /api/auth/login with JSON credentials
+      const loginPayload = JSON.stringify({ username: user, password: pass });
+      const loginResp = await fetch(`http://${nodeIp}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: loginPayload,
         signal: AbortSignal.timeout(3000)
       });
       const latencyMs = Date.now() - t0;
 
-      if (response.status === 401) {
+      if (loginResp.status === 401) {
+        let errDetail = 'Invalid User ID or Password on node';
+        try {
+          const errJson = await loginResp.json();
+          if (errJson.error) errDetail = errJson.error;
+        } catch {}
         return res.json({
           success: false,
+          httpStatus: 401,
           statusCode: 401,
           latencyMs,
-          message: 'Authentication failed: Invalid User ID or Password on node'
+          error: `Authentication failed: ${errDetail} (HTTP 401)`,
+          message: `Authentication failed: ${errDetail}`
         });
       }
 
-      if (response.ok) {
-        let nodeData = {};
-        try { nodeData = await response.json(); } catch {}
+      if (loginResp.ok) {
+        let token = null;
+        try {
+          const json = await loginResp.json();
+          token = json.token;
+        } catch {}
+
+        // Fetch hardware info from status if possible
+        let hardware = node.hardware_type || node.hardware || 'ESP8266';
+        try {
+          const stResp = await fetch(`http://${nodeIp}/api/status`, { signal: AbortSignal.timeout(1500) });
+          if (stResp.ok) {
+            const stData = await stResp.json();
+            if (stData.hardware) hardware = stData.hardware;
+          }
+        } catch {}
+
         return res.json({
           success: true,
-          statusCode: response.status,
+          httpStatus: 200,
+          statusCode: 200,
           latencyMs,
-          message: `Successfully authenticated with ${node.name} (${node.ip})!`,
-          nodeData
+          hardware,
+          message: `Successfully authenticated with ${node.name} (${nodeIp})!`,
+          token
         });
+      }
+
+      // 2. Fallback: If /api/auth/login is 404 (e.g. sketch using HTTP Basic Auth only)
+      if (loginResp.status === 404) {
+        const basicAuth = 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
+        const probeResp = await fetch(`http://${nodeIp}/api/fs/list`, {
+          headers: { 'Authorization': basicAuth },
+          signal: AbortSignal.timeout(3000)
+        });
+        const latencyFallback = Date.now() - t0;
+
+        if (probeResp.status === 401) {
+          return res.json({
+            success: false,
+            httpStatus: 401,
+            statusCode: 401,
+            latencyMs: latencyFallback,
+            error: 'Authentication failed: Invalid credentials (HTTP 401 Unauthorized)',
+            message: 'Authentication failed: Invalid credentials'
+          });
+        }
+
+        if (probeResp.ok) {
+          return res.json({
+            success: true,
+            httpStatus: probeResp.status,
+            statusCode: probeResp.status,
+            latencyMs: latencyFallback,
+            hardware: node.hardware_type || node.hardware || 'ESP8266',
+            message: `Successfully authenticated with ${node.name} (${nodeIp})!`
+          });
+        }
       }
 
       return res.json({
         success: false,
-        statusCode: response.status,
+        httpStatus: loginResp.status,
+        statusCode: loginResp.status,
         latencyMs,
-        message: `Node responded with HTTP status ${response.status}: ${response.statusText}`
+        error: `Node responded with HTTP ${loginResp.status}: ${loginResp.statusText}`,
+        message: `Node responded with HTTP ${loginResp.status}`
       });
     } catch (err) {
       return res.json({
         success: false,
-        error: err.message,
-        message: `Failed to connect to node at http://${node.ip}: ${err.message}`
+        httpStatus: 0,
+        statusCode: 0,
+        latencyMs: Date.now() - t0,
+        error: `Cannot reach node at http://${nodeIp}: ${err.message}`,
+        message: `Connection failed: ${err.message}`
       });
     }
   });
@@ -517,7 +998,7 @@ function createV1Router(nodeManager, db) {
   });
 
   // === PER-NODE RELAY CONFIGURATION ===
-  router.post('/nodes/:nodeId/relays', requirePermission(db, 'devices:manage'), (req, res) => {
+  router.post('/nodes/:nodeId/relays', requirePermission(db, 'devices:manage'), async (req, res) => {
     const { nodeId } = req.params;
     const node = db.getNode(nodeId);
     if (!node) {
@@ -525,9 +1006,19 @@ function createV1Router(nodeManager, db) {
     }
 
     try {
-      const relay = db.addOrUpdateRelay(nodeId, req.body);
+      const payload = { ...req.body };
+      const rawCh = payload.channel_id ?? payload.id;
+      if (rawCh !== undefined) {
+        payload.channel_id = parseInt(String(rawCh).replace(/\D/g, '')) || 1;
+      }
+      const relay = db.addOrUpdateRelay(nodeId, payload);
       db.logAudit('RELAY_ADDED', nodeId, `Configured channel ${relay.channel_id} ('${relay.name}', Pin D${relay.pin}) on node '${node.name}'`);
       nodeManager.broadcast('relay_sync', { nodeId, channel_id: relay.channel_id, relay });
+
+      try {
+        await nodeManager.pushNodeConfig(nodeId);
+      } catch {}
+
       res.json({
         success: true,
         message: `Relay channel ${relay.channel_id} ('${relay.name}') configured successfully`,
@@ -559,19 +1050,25 @@ function createV1Router(nodeManager, db) {
     }
   });
 
-  router.delete('/nodes/:nodeId/relays/:channelId', requirePermission(db, 'devices:manage'), (req, res) => {
+  router.delete('/nodes/:nodeId/relays/:channelId', requirePermission(db, 'devices:manage'), async (req, res) => {
     const { nodeId, channelId } = req.params;
     const node = db.getNode(nodeId);
     if (!node) {
       return res.status(404).json({ success: false, error: `Node '${nodeId}' not found` });
     }
 
-    db.deleteRelay(nodeId, Number(channelId));
-    db.logAudit('RELAY_DELETED', nodeId, `Removed relay channel ${channelId} from node '${node.name}'`);
-    nodeManager.broadcast('relay_sync', { nodeId, channel_id: Number(channelId), deleted: true });
+    const numericChannelId = parseInt(String(channelId).replace(/\D/g, '')) || Number(channelId);
+    db.deleteRelay(nodeId, numericChannelId);
+    db.logAudit('RELAY_DELETED', nodeId, `Removed relay channel ${numericChannelId} from node '${node.name}'`);
+    nodeManager.broadcast('relay_sync', { nodeId, channel_id: numericChannelId, deleted: true });
+
+    try {
+      await nodeManager.pushNodeConfig(nodeId);
+    } catch {}
+
     res.json({
       success: true,
-      message: `Relay channel ${channelId} deleted from node '${node.name}'`
+      message: `Relay channel ${numericChannelId} deleted from node '${node.name}'`
     });
   });
 
@@ -579,7 +1076,7 @@ function createV1Router(nodeManager, db) {
   router.post('/nodes/:nodeId/restart', requirePermission(db, 'devices:reboot'), async (req, res) => {
     const node = db.getNode(req.params.nodeId);
     if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
-    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden: Node outside assigned scope' });
+    if (!verifyDeviceScope(req.user, node, db)) return res.status(403).json({ success: false, error: 'Forbidden: Node outside assigned scope' });
 
     const result = await nodeManager.dispatchCommand(req.params.nodeId, { action: 'reboot' }, req.user);
     res.json(result);
@@ -600,7 +1097,7 @@ function createV1Router(nodeManager, db) {
     if (req.user && !req.user.is_superuser) {
       relays = relays.filter(r => {
         const n = db.getNode(r.node_id);
-        return verifyDeviceScope(req.user, n);
+        return verifyDeviceScope(req.user, n, db);
       });
     }
     res.json(relays);
@@ -622,20 +1119,28 @@ function createV1Router(nodeManager, db) {
     }
   });
 
+  router.get('/nodes/:nodeId/pins', authenticateUser(db), (req, res) => {
+    const node = db.getNode(req.params.nodeId);
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
+    const catalog = nodeManager.getHardwarePinCatalog(req.params.nodeId);
+    res.json({ success: true, catalog });
+  });
+
   router.post('/nodes/:nodeId/sync-pins', requirePermission(db, 'devices:control'), async (req, res) => {
     const node = db.getNode(req.params.nodeId);
     if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
-    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden: Node outside assigned scope' });
+    if (!verifyDeviceScope(req.user, node, db)) return res.status(403).json({ success: false, error: 'Forbidden: Node outside assigned scope' });
 
     try {
       const result = await nodeManager.syncNodePins(req.params.nodeId);
-      const updatedRelays = db.getRelays({ node_id: req.params.nodeId });
+      const catalog = nodeManager.getHardwarePinCatalog(req.params.nodeId);
       res.json({
         success: true,
         message: `Synchronized ${result.count} pins from node ${req.params.nodeId}`,
         nodeId: req.params.nodeId,
         count: result.count,
-        relays: updatedRelays
+        catalog,
+        relays: catalog ? catalog.relays : []
       });
     } catch (err) {
       res.status(500).json({ success: false, error: err.message });
@@ -646,7 +1151,7 @@ function createV1Router(nodeManager, db) {
     const { nodeId, channelId } = req.params;
     const node = db.getNode(nodeId);
     if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
-    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden: Node outside assigned scope' });
+    if (!verifyDeviceScope(req.user, node, db)) return res.status(403).json({ success: false, error: 'Forbidden: Node outside assigned scope' });
 
     const action = req.body.action || 'setState';
     const state = Boolean(req.body.state);
@@ -687,7 +1192,7 @@ function createV1Router(nodeManager, db) {
   router.get('/nodes/:nodeId/fs', requirePermission(db, 'littlefs:view'), async (req, res) => {
     const node = db.getNode(req.params.nodeId);
     if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
-    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+    if (!verifyDeviceScope(req.user, node, db)) return res.status(403).json({ success: false, error: 'Forbidden' });
 
     try {
       const fsData = await littlefsService.fetchFilesystemList(req.params.nodeId);
@@ -700,7 +1205,7 @@ function createV1Router(nodeManager, db) {
   router.get('/nodes/:nodeId/fs/download', requirePermission(db, 'littlefs:download'), async (req, res) => {
     const node = db.getNode(req.params.nodeId);
     if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
-    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+    if (!verifyDeviceScope(req.user, node, db)) return res.status(403).json({ success: false, error: 'Forbidden' });
 
     const filePath = req.query.path;
     if (!filePath) return res.status(400).json({ success: false, error: 'path query parameter is required' });
@@ -719,7 +1224,7 @@ function createV1Router(nodeManager, db) {
   router.post('/nodes/:nodeId/fs/upload', requirePermission(db, 'littlefs:upload'), fsUpload.single('file'), async (req, res) => {
     const node = db.getNode(req.params.nodeId);
     if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
-    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+    if (!verifyDeviceScope(req.user, node, db)) return res.status(403).json({ success: false, error: 'Forbidden' });
 
     if (!req.file) {
       return res.status(400).json({ success: false, error: 'No file uploaded' });
@@ -741,7 +1246,7 @@ function createV1Router(nodeManager, db) {
   router.post('/nodes/:nodeId/fs/delete', requirePermission(db, 'littlefs:delete'), async (req, res) => {
     const node = db.getNode(req.params.nodeId);
     if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
-    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+    if (!verifyDeviceScope(req.user, node, db)) return res.status(403).json({ success: false, error: 'Forbidden' });
 
     const { path: filePath } = req.body;
     if (!filePath) return res.status(400).json({ success: false, error: 'path is required' });
@@ -757,7 +1262,7 @@ function createV1Router(nodeManager, db) {
   router.post('/nodes/:nodeId/fs/rename', requirePermission(db, 'littlefs:manage'), async (req, res) => {
     const node = db.getNode(req.params.nodeId);
     if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
-    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+    if (!verifyDeviceScope(req.user, node, db)) return res.status(403).json({ success: false, error: 'Forbidden' });
 
     const { oldPath, newPath } = req.body;
     if (!oldPath || !newPath) return res.status(400).json({ success: false, error: 'oldPath and newPath are required' });
@@ -773,7 +1278,7 @@ function createV1Router(nodeManager, db) {
   router.post('/nodes/:nodeId/fs/backup', requirePermission(db, 'littlefs:backup'), async (req, res) => {
     const node = db.getNode(req.params.nodeId);
     if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
-    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+    if (!verifyDeviceScope(req.user, node, db)) return res.status(403).json({ success: false, error: 'Forbidden' });
 
     try {
       const result = await littlefsService.createFilesystemBackup(req.params.nodeId, req.body.backupType || 'MANUAL');
@@ -786,9 +1291,69 @@ function createV1Router(nodeManager, db) {
   router.get('/nodes/:nodeId/fs/backups', requirePermission(db, 'littlefs:view'), (req, res) => {
     const node = db.getNode(req.params.nodeId);
     if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
-    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+    if (!verifyDeviceScope(req.user, node, db)) return res.status(403).json({ success: false, error: 'Forbidden' });
 
     res.json({ success: true, backups: db.getFilesystemBackups(req.params.nodeId) });
+  });
+
+  // LittleFS Live Sync: Synchronize filesystem and configuration tables
+  router.post('/nodes/:nodeId/fs/sync', requirePermission(db, 'littlefs:manage'), async (req, res) => {
+    const node = db.getNode(req.params.nodeId);
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
+    if (!verifyDeviceScope(req.user, node, db)) return res.status(403).json({ success: false, error: 'Forbidden' });
+
+    try {
+      const result = await littlefsService.syncLittlefsWithMaster(req.params.nodeId);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // LittleFS View/Inspect File Content (JSON/Text)
+  router.get('/nodes/:nodeId/fs/file-content', requirePermission(db, 'littlefs:view'), async (req, res) => {
+    const node = db.getNode(req.params.nodeId);
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
+    if (!verifyDeviceScope(req.user, node, db)) return res.status(403).json({ success: false, error: 'Forbidden' });
+
+    const filePath = req.query.path;
+    if (!filePath) return res.status(400).json({ success: false, error: 'path query parameter is required' });
+
+    try {
+      const fileData = await littlefsService.downloadFileFromNode(req.params.nodeId, filePath);
+      const isText = fileData.contentType.includes('text') || fileData.contentType.includes('json') ||
+                     /\.(json|txt|html|css|js|log|csv|conf|ini)$/i.test(filePath);
+      res.json({
+        success: true,
+        filename: fileData.filename,
+        path: fileData.path,
+        size: fileData.size,
+        contentType: fileData.contentType,
+        isText,
+        content: isText ? fileData.buffer.toString('utf-8') : null
+      });
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // Direct In-Browser File Edit & Save (Protected to < 5KB for Node Heap Safety)
+  router.post('/nodes/:nodeId/fs/save-content', requirePermission(db, 'littlefs:upload'), async (req, res) => {
+    const node = db.getNode(req.params.nodeId);
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
+    if (!verifyDeviceScope(req.user, node, db)) return res.status(403).json({ success: false, error: 'Forbidden' });
+
+    const { path: filePath, content } = req.body;
+    if (!filePath || content === undefined) {
+      return res.status(400).json({ success: false, error: 'path and content are required' });
+    }
+
+    try {
+      const result = await littlefsService.saveFileContent(req.params.nodeId, filePath, content);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
   });
 
   // ==========================================
@@ -810,7 +1375,7 @@ function createV1Router(nodeManager, db) {
 
     const node = db.getNode(node_id);
     if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
-    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden: Device outside assigned scope' });
+    if (!verifyDeviceScope(req.user, node, db)) return res.status(403).json({ success: false, error: 'Forbidden: Device outside assigned scope' });
 
     try {
       const result = await nodeManager.dispatchCommand(node_id, commandPayload, req.user);
@@ -834,7 +1399,7 @@ function createV1Router(nodeManager, db) {
   router.get('/nodes/:nodeId/config', requirePermission(db, 'config:view'), async (req, res) => {
     const node = db.getNode(req.params.nodeId);
     if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
-    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+    if (!verifyDeviceScope(req.user, node, db)) return res.status(403).json({ success: false, error: 'Forbidden' });
 
     try {
       const config = await configSyncService.getDeviceConfig(req.params.nodeId);
@@ -847,7 +1412,7 @@ function createV1Router(nodeManager, db) {
   router.put('/nodes/:nodeId/config', requirePermission(db, 'config:manage'), async (req, res) => {
     const node = db.getNode(req.params.nodeId);
     if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
-    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+    if (!verifyDeviceScope(req.user, node, db)) return res.status(403).json({ success: false, error: 'Forbidden' });
 
     const { config, summary } = req.body;
     if (!config) return res.status(400).json({ success: false, error: 'config object is required' });
@@ -863,7 +1428,7 @@ function createV1Router(nodeManager, db) {
   router.post('/nodes/:nodeId/config/sync', requirePermission(db, 'config:sync'), async (req, res) => {
     const node = db.getNode(req.params.nodeId);
     if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
-    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+    if (!verifyDeviceScope(req.user, node, db)) return res.status(403).json({ success: false, error: 'Forbidden' });
 
     try {
       const result = await configSyncService.syncDeviceConfig(req.params.nodeId, req.user ? req.user.id : null);
@@ -876,7 +1441,7 @@ function createV1Router(nodeManager, db) {
   router.get('/nodes/:nodeId/config/versions', requirePermission(db, 'config:view'), (req, res) => {
     const node = db.getNode(req.params.nodeId);
     if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
-    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+    if (!verifyDeviceScope(req.user, node, db)) return res.status(403).json({ success: false, error: 'Forbidden' });
 
     const versions = configSyncService.getConfigurationVersions(req.params.nodeId);
     res.json({ success: true, versions });
@@ -885,7 +1450,7 @@ function createV1Router(nodeManager, db) {
   router.post('/nodes/:nodeId/config/rollback/:version', requirePermission(db, 'config:rollback'), async (req, res) => {
     const node = db.getNode(req.params.nodeId);
     if (!node) return res.status(404).json({ success: false, error: 'Node not found' });
-    if (!verifyDeviceScope(req.user, node)) return res.status(403).json({ success: false, error: 'Forbidden' });
+    if (!verifyDeviceScope(req.user, node, db)) return res.status(403).json({ success: false, error: 'Forbidden' });
 
     try {
       const result = await configSyncService.rollbackDeviceConfig(req.params.nodeId, req.params.version, req.user ? req.user.id : null);
@@ -908,34 +1473,87 @@ function createV1Router(nodeManager, db) {
       return res.status(400).json({ success: false, error: 'No firmware binary file uploaded' });
     }
 
-    const { version, hardware, release_channel, notes } = req.body;
-    if (!version) {
-      return res.status(400).json({ success: false, error: 'Firmware version string is required (e.g. 1.6.0)' });
+    const { version, hardware, hardware_type, release_channel, notes } = req.body;
+    const hwTarget = hardware || hardware_type || 'ESP8266 (ESP-12E/F) NodeMCU';
+
+    // 1. Strict Semantic Version Validation (e.g. 1.6.0, 1.7.0, v2.0.0)
+    const semverRegex = /^v?([0-9]+).([0-9]+)(.([0-9]+))?(-[0-9A-Za-z.-]+)?$/;
+    const rawVer = (version || '').trim();
+    if (!rawVer || !semverRegex.test(rawVer)) {
+      if (req.file && fs.existsSync(req.file.path)) try { fs.unlinkSync(req.file.path); } catch {}
+      return res.status(400).json({
+        success: false,
+        error: `Invalid semantic version '${rawVer}'. Version must be formatted as X.Y.Z (e.g. 1.6.1, 1.7.0, or v2.0.0)`
+      });
     }
+    const normalizedVersion = rawVer.replace(/^v/i, '');
 
     const filePath = req.file.path;
     const buffer = fs.readFileSync(filePath);
+
+    // 2. ROM Flash Binary Magic Byte Verification (0xE9 for ESP8266 executable image)
+    const isEsp8266 = hwTarget.toLowerCase().includes('esp8266') || hwTarget.toLowerCase().includes('esp-01') || hwTarget.toLowerCase().includes('nodemcu');
+    if (isEsp8266) {
+      const magicByte = buffer[0];
+      if (magicByte !== 0xE9) {
+        if (fs.existsSync(filePath)) try { fs.unlinkSync(filePath); } catch {}
+        return res.status(400).json({
+          success: false,
+          error: `Binary verification failed: Magic byte 0x${magicByte.toString(16).toUpperCase()} does not match ESP8266 ROM flash signature (expected 0xE9). Ensure you exported a compiled sketch binary (.bin) from Arduino IDE or PlatformIO.`
+        });
+      }
+    }
+
+    // 3. Hardware Flash Partition Constraint Check (ESP-01 1MB ~480KB limit)
+    const isEsp01 = hwTarget.toLowerCase().includes('esp-01') || hwTarget.toLowerCase().includes('1mb');
+    if (isEsp01 && req.file.size > 512000) {
+      if (fs.existsSync(filePath)) try { fs.unlinkSync(filePath); } catch {}
+      return res.status(400).json({
+        success: false,
+        error: `Binary size (${(req.file.size / 1024).toFixed(1)} KB) exceeds the safe flash limit for ESP-01 1MB modules (~480 KB - 500 KB). Dual-slot OTA flashing would fail. Please compile with minimal libraries and 1MB (FS:64KB OTA:~470KB) partition scheme.`
+      });
+    }
+
+    // 4. Compute Checksums & Preserve All Historical Versions
     const md5Hash = crypto.createHash('md5').update(buffer).digest('hex');
     const sha256Hash = crypto.createHash('sha256').update(buffer).digest('hex');
 
+    // Create unique archival filename on disk (never overwrite older versions)
+    const hwSlug = hwTarget.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase();
+    const safeFilename = `firmware_${hwSlug}_v${normalizedVersion}_${Date.now()}.bin`;
+    const finalPath = path.join(firmwareDir, safeFilename);
+    try {
+      fs.renameSync(filePath, finalPath);
+    } catch {
+      // If rename across volumes fails, fallback to copy + delete
+      fs.copyFileSync(filePath, finalPath);
+      try { fs.unlinkSync(filePath); } catch {}
+    }
+
     const id = db.addFirmwareRecord({
-      filename: req.file.filename,
-      version: version.trim(),
-      hardware_type: hardware || 'ESP8266',
+      filename: safeFilename,
+      version: normalizedVersion,
+      hardware_type: hwTarget,
       release_channel: release_channel || 'LTS',
       notes: notes || '',
       file_size_bytes: req.file.size,
       checksum_md5: md5Hash,
       checksum_sha256: sha256Hash,
-      file_path: filePath
+      file_path: finalPath
     });
 
-    db.logAudit('FIRMWARE_UPLOAD', 'System', `Uploaded firmware v${version} (${req.file.size} bytes, MD5: ${md5Hash})`);
+    const registered = db.getFirmware(id);
+
+    db.logAudit(
+      'FIRMWARE_UPLOAD',
+      'System',
+      `Uploaded firmware v${normalizedVersion} for ${hwTarget} (${(req.file.size/1024).toFixed(1)} KB, MD5: ${md5Hash}, Latest: ${registered.is_latest ? 'YES' : 'NO'})`
+    );
 
     res.json({
       success: true,
-      message: 'Firmware uploaded and registered in catalog',
-      firmware: db.getFirmware(id)
+      message: `Firmware v${normalizedVersion} verified and registered in catalog`,
+      firmware: registered
     });
   });
 
@@ -963,23 +1581,38 @@ function createV1Router(nodeManager, db) {
     res.json({ success: true, message: 'Firmware removed from catalog' });
   });
 
-  // OTA Diagnostics & Pre-check
-  router.get('/ota/diagnostics/:nodeId', authenticateUser(db), async (req, res) => {
+  // OTA Diagnostics & Pre-check (With route aliases to prevent frontend fetch 404s)
+  const handleNodeDiagnostics = async (req, res) => {
     try {
       const diag = await otaService.fetchNodeDiagnostics(req.params.nodeId);
       res.json(diag);
     } catch (err) {
       res.status(500).json({ success: false, error: err.message });
     }
-  });
+  };
+  router.get('/ota/diagnostics/:nodeId', authenticateUser(db), handleNodeDiagnostics);
+  router.get('/ota/node-diagnostics/:nodeId', authenticateUser(db), handleNodeDiagnostics);
 
-  router.post('/ota/precheck', authenticateUser(db), async (req, res) => {
+  const handlePrecheck = async (req, res) => {
     const { nodeId, firmwareId } = req.body;
     if (!nodeId || !firmwareId) {
       return res.status(400).json({ success: false, error: 'nodeId and firmwareId are required' });
     }
     try {
       const result = await otaService.preCheckOta(nodeId, firmwareId);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  };
+  router.post('/ota/precheck', authenticateUser(db), handlePrecheck);
+  router.post('/ota/pre-check', authenticateUser(db), handlePrecheck);
+
+  // Standalone Node Backup Trigger
+  router.post('/ota/backup/:nodeId', authenticateUser(db), async (req, res) => {
+    try {
+      const type = req.body.backupType || 'MANUAL';
+      const result = await otaService.backupNode(req.params.nodeId, type);
       res.json(result);
     } catch (err) {
       res.status(500).json({ success: false, error: err.message });
@@ -1007,6 +1640,29 @@ function createV1Router(nodeManager, db) {
 
   router.get('/ota/backups', authenticateUser(db), (req, res) => {
     res.json(db.getNodeBackups(req.query.node_id));
+  });
+
+  router.get('/ota/backups/:id/download', authenticateUser(db), (req, res) => {
+    const b = db.getNodeBackup(req.params.id);
+    if (!b) return res.status(404).json({ success: false, error: 'Backup not found' });
+    if (b.backup_path && fs.existsSync(b.backup_path)) {
+      return res.download(b.backup_path, path.basename(b.backup_path));
+    }
+    if (b.snapshot_json) {
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', `attachment; filename="backup_${b.node_id}_${b.id}.json"`);
+      return res.send(typeof b.snapshot_json === 'string' ? b.snapshot_json : JSON.stringify(b.snapshot_json, null, 2));
+    }
+    res.status(404).json({ success: false, error: 'Backup snapshot data missing' });
+  });
+
+  router.post('/ota/backups/:backupId/restore/:nodeId', requirePermission(db, 'devices:manage'), async (req, res) => {
+    try {
+      const result = await otaService.restoreNodeConfig(req.params.nodeId, req.params.backupId);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err.message });
+    }
   });
 
   router.delete('/ota/backups/:id', requirePermission(db, 'system:manage'), (req, res) => {

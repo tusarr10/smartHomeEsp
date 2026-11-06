@@ -438,6 +438,84 @@ class FleetDatabase {
       )
     `);
 
+    // 29. Homes Table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS homes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        description TEXT DEFAULT '',
+        timezone TEXT DEFAULT 'UTC',
+        address TEXT DEFAULT '',
+        owner_user_id INTEGER DEFAULT NULL,
+        created_by INTEGER DEFAULT NULL,
+        is_archived INTEGER DEFAULT 0,
+        created_at REAL DEFAULT (unixepoch('now', 'subsec')),
+        updated_at REAL DEFAULT (unixepoch('now', 'subsec')),
+        FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE SET NULL,
+        FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+      )
+    `);
+
+    // 30. Home Members Table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS home_members (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        home_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        role TEXT NOT NULL DEFAULT 'VIEWER' CHECK (role IN ('HOME_OWNER', 'HOME_ADMIN', 'FAMILY_MEMBER', 'GUEST', 'VIEWER')),
+        joined_at REAL DEFAULT (unixepoch('now', 'subsec')),
+        created_at REAL DEFAULT (unixepoch('now', 'subsec')),
+        UNIQUE(home_id, user_id),
+        FOREIGN KEY (home_id) REFERENCES homes(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `);
+
+    // 31. Rooms Table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS rooms (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        home_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        floor TEXT DEFAULT 'Ground',
+        icon TEXT DEFAULT 'room',
+        created_at REAL DEFAULT (unixepoch('now', 'subsec')),
+        updated_at REAL DEFAULT (unixepoch('now', 'subsec')),
+        UNIQUE(home_id, name),
+        FOREIGN KEY (home_id) REFERENCES homes(id) ON DELETE CASCADE
+      )
+    `);
+
+    // 32. Room Members Table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS room_members (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        room_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        role TEXT NOT NULL DEFAULT 'FAMILY_MEMBER' CHECK (role IN ('HOME_ADMIN', 'FAMILY_MEMBER', 'GUEST', 'VIEWER')),
+        assigned_at REAL DEFAULT (unixepoch('now', 'subsec')),
+        UNIQUE(room_id, user_id),
+        FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `);
+
+    // 33. Device Permissions Table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS device_permissions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id TEXT NOT NULL,
+        user_id INTEGER NOT NULL,
+        can_control INTEGER DEFAULT 1,
+        can_view_telemetry INTEGER DEFAULT 1,
+        can_configure INTEGER DEFAULT 0,
+        created_at REAL DEFAULT (unixepoch('now', 'subsec')),
+        UNIQUE(device_id, user_id),
+        FOREIGN KEY (device_id) REFERENCES nodes(node_id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `);
+
     // Schema Migrations (backward-compatibility safe)
     try { this.db.exec(`ALTER TABLE automations ADD COLUMN description TEXT DEFAULT ''`); } catch {}
     try { this.db.exec(`ALTER TABLE automations ADD COLUMN trigger_type TEXT DEFAULT 'GPIO State Change'`); } catch {}
@@ -455,6 +533,7 @@ class FleetDatabase {
     try { this.db.exec(`ALTER TABLE firmware ADD COLUMN release_channel TEXT DEFAULT 'LTS'`); } catch {}
     try { this.db.exec(`ALTER TABLE firmware ADD COLUMN notes TEXT DEFAULT ''`); } catch {}
     try { this.db.exec(`ALTER TABLE firmware ADD COLUMN checksum_sha256 TEXT DEFAULT ''`); } catch {}
+    try { this.db.exec(`ALTER TABLE firmware ADD COLUMN is_latest INTEGER DEFAULT 0`); } catch {}
 
     try { this.db.exec(`ALTER TABLE notifications ADD COLUMN category TEXT DEFAULT 'SYSTEM'`); } catch {}
 
@@ -467,8 +546,13 @@ class FleetDatabase {
     try { this.db.exec(`ALTER TABLE nodes ADD COLUMN wifi_ssid TEXT DEFAULT ''`); } catch {}
     try { this.db.exec(`ALTER TABLE nodes ADD COLUMN auth_username TEXT DEFAULT 'admin'`); } catch {}
     try { this.db.exec(`ALTER TABLE nodes ADD COLUMN auth_password TEXT DEFAULT 'admin'`); } catch {}
+    try { this.db.exec(`ALTER TABLE nodes ADD COLUMN home_id INTEGER DEFAULT NULL`); } catch {}
+    try { this.db.exec(`ALTER TABLE nodes ADD COLUMN room_id INTEGER DEFAULT NULL`); } catch {}
+    try { this.db.exec(`ALTER TABLE nodes ADD COLUMN assigned_at REAL DEFAULT NULL`); } catch {}
 
     this.seedDefaults();
+    this.deduplicateFleetNodes();
+    try { this.updateLatestFirmwareFlags(); } catch {}
   }
 
   seedDefaults() {
@@ -589,20 +673,96 @@ class FleetDatabase {
 
       this.logAudit('USER_CREATED', 'System', 'Initial superuser admin initialized with SUPER_ADMIN role & GLOBAL scope');
     }
+
+    // 8. Seed Default Home and Room (if empty)
+    const homeCount = this.db.prepare('SELECT COUNT(*) as count FROM homes').get().count;
+    if (homeCount === 0) {
+      this.db.prepare(`
+        INSERT INTO homes (name, description, timezone, owner_user_id, created_by)
+        VALUES ('Primary Residence', 'Default Primary Home for Central Microcontroller Fleet', 'UTC', NULL, 1)
+      `).run();
+      const defaultHome = this.db.prepare("SELECT id FROM homes WHERE name = 'Primary Residence'").get();
+      if (defaultHome) {
+        this.db.prepare(`
+          INSERT INTO rooms (home_id, name, floor, icon)
+          VALUES (?, 'Master Bedroom', 'Ground', 'bed')
+        `).run(defaultHome.id);
+      }
+    }
   }
 
   // === NODE METHODS ===
 
+  deduplicateFleetNodes() {
+    try {
+      const allNodes = this.db.prepare('SELECT node_id, name, ip_address, mac_address, room, auth_password FROM nodes').all();
+      const byMac = new Map();
+      const byIp = new Map();
+
+      for (const node of allNodes) {
+        const mac = (node.mac_address || '').trim().toUpperCase();
+        const ip = (node.ip_address || '').trim();
+
+        let primary = null;
+        if (mac && mac.length >= 8) {
+          primary = byMac.get(mac);
+        } else if (ip && ip.length >= 7 && ip !== '0.0.0.0' && ip !== '127.0.0.1') {
+          primary = byIp.get(ip);
+        }
+
+        if (!primary) {
+          if (mac && mac.length >= 8) byMac.set(mac, node);
+          if (ip && ip.length >= 7 && ip !== '0.0.0.0' && ip !== '127.0.0.1') byIp.set(ip, node);
+        } else {
+          const primaryIsHardwareMac = /^NODE-[A-F0-9]{12}$/i.test(primary.node_id);
+          const currentIsHardwareMac = /^NODE-[A-F0-9]{12}$/i.test(node.node_id);
+
+          let winner = primary;
+          let loser = node;
+
+          if (!primaryIsHardwareMac && currentIsHardwareMac) {
+            winner = node;
+            loser = primary;
+          }
+
+          if ((!winner.room || winner.room === 'General') && loser.room && loser.room !== 'General') {
+            this.db.prepare('UPDATE nodes SET room = ? WHERE node_id = ?').run(loser.room, winner.node_id);
+          }
+          if ((!winner.auth_password || winner.auth_password === 'admin') && loser.auth_password && loser.auth_password !== 'admin') {
+            this.db.prepare('UPDATE nodes SET auth_password = ? WHERE node_id = ?').run(loser.auth_password, winner.node_id);
+          }
+
+          const winnerRelays = this.db.prepare('SELECT count(*) as c FROM relays WHERE node_id = ?').get(winner.node_id);
+          if (!winnerRelays || winnerRelays.c === 0) {
+            this.db.prepare('UPDATE relays SET node_id = ? WHERE node_id = ?').run(winner.node_id, loser.node_id);
+          } else {
+            this.db.prepare('DELETE FROM relays WHERE node_id = ?').run(loser.node_id);
+          }
+
+          this.db.prepare('DELETE FROM telemetry_logs WHERE node_id = ?').run(loser.node_id);
+          this.db.prepare('DELETE FROM commands WHERE node_id = ?').run(loser.node_id);
+          this.db.prepare('DELETE FROM system_events WHERE node_id = ?').run(loser.node_id);
+          this.db.prepare('DELETE FROM nodes WHERE node_id = ?').run(loser.node_id);
+
+          if (mac) byMac.set(mac, winner);
+          if (ip) byIp.set(ip, winner);
+        }
+      }
+    } catch (e) {
+      console.warn('Deduplication check error:', e.message);
+    }
+  }
+
   upsertNode(data) {
-    const nodeId = data.nodeId || data.node_id;
-    if (!nodeId) return false;
+    const rawNodeId = data.nodeId || data.node_id;
+    if (!rawNodeId) return false;
 
     const nowEpoch = Date.now() / 1000;
     const nowStr = new Date().toISOString();
     const channelsJson = JSON.stringify(data.channels || []);
-    const name = data.nodeName || data.name || nodeId;
-    const ip = data.ip || data.ip_address || '';
-    const mac = data.mac || data.mac_address || '';
+    const name = data.nodeName || data.name || rawNodeId;
+    const ip = (data.ip || data.ip_address || '').trim();
+    const mac = (data.mac || data.mac_address || '').trim();
     const fw = data.firmwareVersion || data.firmware_version || '1.6.0';
     const hw = data.hardware || data.hardware_type || 'ESP8266';
     const rssi = Number(data.rssi) || 0;
@@ -611,8 +771,56 @@ class FleetDatabase {
     const gateway = data.gateway || '';
     const group = data.device_group || data.group || 'DEFAULT';
 
-    const checkStmt = this.db.prepare('SELECT node_id FROM nodes WHERE node_id = ?');
-    const existing = checkStmt.get(nodeId);
+    // 1. Check if node exists by exact node_id
+    let existing = this.db.prepare('SELECT * FROM nodes WHERE node_id = ?').get(rawNodeId);
+
+    // 2. If not found by node_id, check by physical MAC address
+    if (!existing && mac.length >= 8) {
+      existing = this.db.prepare('SELECT * FROM nodes WHERE UPPER(mac_address) = UPPER(?)').get(mac);
+    }
+
+    // 3. If still not found by MAC, check by IP address
+    if (!existing && ip.length >= 7 && ip !== '0.0.0.0' && ip !== '127.0.0.1') {
+      existing = this.db.prepare('SELECT * FROM nodes WHERE ip_address = ?').get(ip);
+    }
+
+    let targetNodeId = rawNodeId;
+    if (existing) {
+      const existingIsHardwareMac = /^NODE-[A-F0-9]{12}$/i.test(existing.node_id);
+      const incomingIsHardwareMac = /^NODE-[A-F0-9]{12}$/i.test(rawNodeId);
+
+      if (!existingIsHardwareMac && incomingIsHardwareMac) {
+        targetNodeId = rawNodeId;
+        this.db.prepare('UPDATE relays SET node_id = ? WHERE node_id = ?').run(targetNodeId, existing.node_id);
+        this.db.prepare('UPDATE commands SET node_id = ? WHERE node_id = ?').run(targetNodeId, existing.node_id);
+        this.db.prepare('UPDATE telemetry_logs SET node_id = ? WHERE node_id = ?').run(targetNodeId, existing.node_id);
+        this.db.prepare('UPDATE system_events SET node_id = ? WHERE node_id = ?').run(targetNodeId, existing.node_id);
+        this.db.prepare('UPDATE nodes SET node_id = ? WHERE node_id = ?').run(targetNodeId, existing.node_id);
+      } else {
+        targetNodeId = existing.node_id;
+      }
+    }
+
+    // Prune any lingering duplicate rows sharing the exact same MAC or LAN IP
+    if (mac.length >= 8) {
+      const dups = this.db.prepare('SELECT node_id FROM nodes WHERE UPPER(mac_address) = UPPER(?) AND node_id != ?').all(mac, targetNodeId);
+      for (const d of dups) {
+        this.db.prepare('DELETE FROM relays WHERE node_id = ?').run(d.node_id);
+        this.db.prepare('DELETE FROM telemetry_logs WHERE node_id = ?').run(d.node_id);
+        this.db.prepare('DELETE FROM commands WHERE node_id = ?').run(d.node_id);
+        this.db.prepare('DELETE FROM system_events WHERE node_id = ?').run(d.node_id);
+        this.db.prepare('DELETE FROM nodes WHERE node_id = ?').run(d.node_id);
+      }
+    } else if (ip.length >= 7 && ip !== '0.0.0.0' && ip !== '127.0.0.1') {
+      const dups = this.db.prepare('SELECT node_id FROM nodes WHERE ip_address = ? AND node_id != ?').all(ip, targetNodeId);
+      for (const d of dups) {
+        this.db.prepare('DELETE FROM relays WHERE node_id = ?').run(d.node_id);
+        this.db.prepare('DELETE FROM telemetry_logs WHERE node_id = ?').run(d.node_id);
+        this.db.prepare('DELETE FROM commands WHERE node_id = ?').run(d.node_id);
+        this.db.prepare('DELETE FROM system_events WHERE node_id = ?').run(d.node_id);
+        this.db.prepare('DELETE FROM nodes WHERE node_id = ?').run(d.node_id);
+      }
+    }
 
     if (existing) {
       const updateStmt = this.db.prepare(`
@@ -634,7 +842,7 @@ class FleetDatabase {
           device_group = COALESCE(?, device_group)
         WHERE node_id = ?
       `);
-      updateStmt.run(name, hw, fw, ip, mac, mac, gateway, rssi, uptime, heap, nowEpoch, nowStr, channelsJson, group, nodeId);
+      updateStmt.run(name, hw, fw, ip, mac, mac, gateway, rssi, uptime, heap, nowEpoch, nowStr, channelsJson, group, targetNodeId);
     } else {
       const insertStmt = this.db.prepare(`
         INSERT INTO nodes (
@@ -643,7 +851,7 @@ class FleetDatabase {
           last_seen_epoch, last_seen_str, channels_json, created_at, device_group
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'Online', 'General', 'Home', 'Controller', ?, ?, ?, ?, ?)
       `);
-      insertStmt.run(nodeId, name, hw, fw, ip, mac, gateway, rssi, uptime, heap, nowEpoch, nowStr, channelsJson, nowEpoch, group);
+      insertStmt.run(targetNodeId, name, hw, fw, ip, mac, gateway, rssi, uptime, heap, nowEpoch, nowStr, channelsJson, nowEpoch, group);
     }
 
     const stateChanges = [];
@@ -653,7 +861,7 @@ class FleetDatabase {
         const chId = Number(ch.id ?? ch.channel_id);
         if (!isNaN(chId) && chId > 0) {
           activeChannelIds.push(chId);
-          const chRes = this.upsertRelayFromChannel(nodeId, ch);
+          const chRes = this.upsertRelayFromChannel(targetNodeId, ch);
           if (chRes && chRes.changed) {
             stateChanges.push(chRes);
           }
@@ -665,16 +873,16 @@ class FleetDatabase {
         this.db.prepare(`
           DELETE FROM relays 
           WHERE node_id = ? AND channel_id NOT IN (${placeholders})
-        `).run(nodeId, ...activeChannelIds);
+        `).run(targetNodeId, ...activeChannelIds);
       } else {
-        this.db.prepare('DELETE FROM relays WHERE node_id = ?').run(nodeId);
+        this.db.prepare('DELETE FROM relays WHERE node_id = ?').run(targetNodeId);
       }
     }
 
-    return { success: true, stateChanges };
+    return { success: true, stateChanges, nodeId: targetNodeId };
   }
 
-  syncNodeRelays(nodeId, channels) {
+    syncNodeRelays(nodeId, channels) {
     if (!Array.isArray(channels)) return 0;
     const activeChannelIds = [];
     for (const ch of channels) {
@@ -760,27 +968,47 @@ class FleetDatabase {
   }
 
   getNodes(filters = {}) {
-    let sql = 'SELECT * FROM nodes WHERE 1=1';
+    let sql = `
+      SELECT n.*, 
+             h.name AS home_name, 
+             r.name AS room_name 
+      FROM nodes n
+      LEFT JOIN homes h ON n.home_id = h.id
+      LEFT JOIN rooms r ON n.room_id = r.id
+      WHERE 1=1
+    `;
     const params = [];
 
+    if (filters.home_id !== undefined && filters.home_id !== null && filters.home_id !== '') {
+      if (filters.home_id === 'unassigned' || filters.home_id === 0) {
+        sql += ' AND n.home_id IS NULL';
+      } else {
+        sql += ' AND n.home_id = ?';
+        params.push(Number(filters.home_id));
+      }
+    }
+    if (filters.room_id !== undefined && filters.room_id !== null && filters.room_id !== '') {
+      sql += ' AND n.room_id = ?';
+      params.push(Number(filters.room_id));
+    }
     if (filters.room) {
-      sql += ' AND room = ?';
-      params.push(filters.room);
+      sql += ' AND (n.room = ? OR r.name = ?)';
+      params.push(filters.room, filters.room);
     }
     if (filters.status) {
-      sql += ' AND status = ?';
+      sql += ' AND n.status = ?';
       params.push(filters.status);
     }
     if (filters.hardware) {
-      sql += ' AND hardware_type = ?';
+      sql += ' AND n.hardware_type = ?';
       params.push(filters.hardware);
     }
     if (filters.search) {
-      sql += ' AND (name LIKE ? OR node_id LIKE ?)';
+      sql += ' AND (n.name LIKE ? OR n.node_id LIKE ?)';
       params.push(`%${filters.search}%`, `%${filters.search}%`);
     }
 
-    sql += ' ORDER BY is_online DESC, last_seen_epoch DESC';
+    sql += ' ORDER BY n.is_online DESC, n.last_seen_epoch DESC';
     const rows = this.db.prepare(sql).all(...params);
 
     return rows.map(n => {
@@ -811,7 +1039,13 @@ class FleetDatabase {
         status: Boolean(n.is_online) ? 'Online' : 'Offline',
         auth_username: n.auth_username || 'admin',
         auth_password: n.auth_password || 'admin',
-        room: n.room,
+        home_id: n.home_id ?? null,
+        home_name: n.home_name || null,
+        room_id: n.room_id ?? null,
+        room_name: n.room_name || n.room || 'General',
+        room: n.room_name || n.room || 'General',
+        assigned_at: n.assigned_at ?? null,
+        is_assigned: Boolean(n.home_id && n.room_id),
         location: n.location,
         category: n.category,
         device_group: n.device_group || 'DEFAULT',
@@ -827,7 +1061,15 @@ class FleetDatabase {
   }
 
   getNode(nodeId) {
-    const row = this.db.prepare('SELECT * FROM nodes WHERE node_id = ?').get(nodeId);
+    const row = this.db.prepare(`
+      SELECT n.*, 
+             h.name AS home_name, 
+             r.name AS room_name 
+      FROM nodes n
+      LEFT JOIN homes h ON n.home_id = h.id
+      LEFT JOIN rooms r ON n.room_id = r.id
+      WHERE n.node_id = ?
+    `).get(nodeId);
     if (!row) return null;
     let channels = [];
     try {
@@ -856,7 +1098,13 @@ class FleetDatabase {
       status: Boolean(row.is_online) ? 'Online' : 'Offline',
       auth_username: row.auth_username || 'admin',
       auth_password: row.auth_password || 'admin',
-      room: row.room,
+      home_id: row.home_id ?? null,
+      home_name: row.home_name || null,
+      room_id: row.room_id ?? null,
+      room_name: row.room_name || row.room || 'General',
+      room: row.room_name || row.room || 'General',
+      assigned_at: row.assigned_at ?? null,
+      is_assigned: Boolean(row.home_id && row.room_id),
       location: row.location,
       category: row.category,
       device_group: row.device_group || 'DEFAULT',
@@ -1332,8 +1580,50 @@ class FleetDatabase {
 
   // === FIRMWARE ===
 
+  updateLatestFirmwareFlags(targetHardware = null) {
+    try {
+      const rows = this.db.prepare('SELECT id, version, hardware_type FROM firmware').all();
+      const groups = {};
+      for (const r of rows) {
+        const hw = r.hardware_type || 'ESP8266';
+        if (!groups[hw]) groups[hw] = [];
+        groups[hw].push(r);
+      }
+
+      const parseSemver = (v) => {
+        const clean = String(v || '').replace(/^v/i, '').split('-')[0];
+        const parts = clean.split('.').map(n => parseInt(n, 10) || 0);
+        while (parts.length < 3) parts.push(0);
+        return parts;
+      };
+
+      const compareSemver = (a, b) => {
+        const pa = parseSemver(a.version);
+        const pb = parseSemver(b.version);
+        for (let i = 0; i < 3; i++) {
+          if (pa[i] > pb[i]) return 1;
+          if (pa[i] < pb[i]) return -1;
+        }
+        return (a.id || 0) - (b.id || 0);
+      };
+
+      const updateStmt = this.db.prepare('UPDATE firmware SET is_latest = ? WHERE id = ?');
+      for (const hw in groups) {
+        if (targetHardware && hw !== targetHardware) continue;
+        const sorted = groups[hw].sort(compareSemver); // ascending order
+        const latestItem = sorted[sorted.length - 1]; // highest version
+        for (const item of sorted) {
+          const isLatest = (item.id === latestItem.id) ? 1 : 0;
+          updateStmt.run(isLatest, item.id);
+        }
+      }
+    } catch (err) {
+      console.warn('[DB] Error updating latest firmware flags:', err.message);
+    }
+  }
+
   getFirmwareList() {
-    const rows = this.db.prepare('SELECT * FROM firmware ORDER BY id DESC').all();
+    const rows = this.db.prepare('SELECT * FROM firmware ORDER BY is_latest DESC, id DESC').all();
     return rows.map(r => ({
       id: r.id,
       filename: r.filename,
@@ -1345,7 +1635,8 @@ class FleetDatabase {
       checksum_md5: r.checksum_md5 || 'N/A',
       checksum_sha256: r.checksum_sha256 || 'N/A',
       file_path: r.file_path,
-      uploaded_at: r.uploaded_at
+      uploaded_at: r.uploaded_at,
+      is_latest: Boolean(r.is_latest)
     }));
   }
 
@@ -1363,7 +1654,8 @@ class FleetDatabase {
       checksum_md5: r.checksum_md5 || 'N/A',
       checksum_sha256: r.checksum_sha256 || 'N/A',
       file_path: r.file_path,
-      uploaded_at: r.uploaded_at
+      uploaded_at: r.uploaded_at,
+      is_latest: Boolean(r.is_latest)
     };
   }
 
@@ -1371,8 +1663,8 @@ class FleetDatabase {
     const nowStr = new Date().toISOString();
     const stmt = this.db.prepare(`
       INSERT INTO firmware (
-        filename, version, hardware_type, release_channel, notes, file_size_bytes, checksum_md5, checksum_sha256, file_path, uploaded_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        filename, version, hardware_type, release_channel, notes, file_size_bytes, checksum_md5, checksum_sha256, file_path, uploaded_at, is_latest
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const res = stmt.run(
       fw.filename,
@@ -1384,13 +1676,17 @@ class FleetDatabase {
       fw.checksum_md5 || '',
       fw.checksum_sha256 || '',
       fw.file_path || '',
-      nowStr
+      nowStr,
+      0
     );
-    return res.lastInsertRowid;
+    const newId = res.lastInsertRowid;
+    this.updateLatestFirmwareFlags(fw.hardware_type);
+    return newId;
   }
 
   deleteFirmware(id) {
     const res = this.db.prepare('DELETE FROM firmware WHERE id = ?').run(Number(id));
+    this.updateLatestFirmwareFlags();
     return res.changes > 0;
   }
 
@@ -1620,7 +1916,8 @@ class FleetDatabase {
   }
 
   getUserByUsername(username) {
-    return this.db.prepare('SELECT * FROM users WHERE username = ?').get(username.trim());
+    if (!username || typeof username !== 'string') return null;
+    return this.db.prepare('SELECT * FROM users WHERE LOWER(username) = LOWER(?)').get(username.trim());
   }
 
   getUsers() {
@@ -1730,7 +2027,7 @@ class FleetDatabase {
 
   // === SESSION MANAGEMENT ===
 
-  createSession(userId, ip = '', userAgent = '', expiresInDays = 7) {
+  createSession(userId, ip = '', userAgent = '', expiresInDays = 30) {
     const token = generateSessionToken();
     const now = new Date();
     const expires = new Date(now.getTime() + expiresInDays * 24 * 60 * 60 * 1000);
@@ -1861,10 +2158,17 @@ class FleetDatabase {
           updated_at = ?
         WHERE node_id = ?
       `).run(
-        caps.mcu_type, caps.flash_size_bytes, caps.ram_size_bytes,
-        caps.littlefs_total_bytes, caps.littlefs_used_bytes, caps.littlefs_free_bytes,
-        caps.ota_supported, caps.max_ota_sketch_size, caps.littlefs_supported,
-        nowStr, nodeId
+        caps.mcu_type ?? null,
+        caps.flash_size_bytes ?? null,
+        caps.ram_size_bytes ?? null,
+        caps.littlefs_total_bytes ?? null,
+        caps.littlefs_used_bytes ?? null,
+        caps.littlefs_free_bytes ?? null,
+        caps.ota_supported ?? null,
+        caps.max_ota_sketch_size ?? null,
+        caps.littlefs_supported ?? null,
+        nowStr,
+        nodeId
       );
     } else {
       this.db.prepare(`
@@ -1874,8 +2178,13 @@ class FleetDatabase {
           littlefs_supported, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
-        nodeId, caps.mcu_type || 'ESP8266', caps.flash_size_bytes || 4194304, caps.ram_size_bytes || 81920,
-        caps.littlefs_total_bytes || 0, caps.littlefs_used_bytes || 0, caps.littlefs_free_bytes || 0,
+        nodeId,
+        caps.mcu_type || 'ESP8266',
+        caps.flash_size_bytes || 4194304,
+        caps.ram_size_bytes || 81920,
+        caps.littlefs_total_bytes || 0,
+        caps.littlefs_used_bytes || 0,
+        caps.littlefs_free_bytes || 0,
         caps.ota_supported !== undefined ? caps.ota_supported : 1,
         caps.max_ota_sketch_size || 0,
         caps.littlefs_supported !== undefined ? caps.littlefs_supported : 1,
@@ -2175,6 +2484,428 @@ class FleetDatabase {
 
     const config = JSON.parse(row.config_json);
     return this.saveDeviceConfiguration(nodeId, config, userId, `Rollback to configuration v${targetVersion}`);
+  }
+
+  // ==========================================
+  // HOME-CENTRIC FLEET MANAGEMENT METHODS
+  // ==========================================
+
+  createHome({ name, description = '', timezone = 'UTC', address = '', owner_user_id = null, created_by = null }) {
+    if (!name || !name.trim()) throw new Error('Home name is required');
+    const cleanName = name.trim();
+    const nowEpoch = Date.now() / 1000;
+    const res = this.db.prepare(`
+      INSERT INTO homes (name, description, timezone, address, owner_user_id, created_by, is_archived, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+    `).run(
+      cleanName,
+      (description || '').trim(),
+      timezone || 'UTC',
+      (address || '').trim(),
+      owner_user_id ?? null,
+      created_by ?? null,
+      nowEpoch,
+      nowEpoch
+    );
+    const homeId = Number(res.lastInsertRowid);
+    if (owner_user_id) {
+      this.db.prepare(`
+        INSERT OR IGNORE INTO home_members (home_id, user_id, role, joined_at, created_at)
+        VALUES (?, ?, 'HOME_OWNER', ?, ?)
+      `).run(homeId, owner_user_id, nowEpoch, nowEpoch);
+    }
+    return this.getHomeById(homeId);
+  }
+
+  getHomes(userId = null, isSuperUser = false) {
+    let sql = `
+      SELECT h.*, 
+             u.username AS owner_username, 
+             u.email AS owner_email,
+             c.username AS creator_username,
+             (SELECT COUNT(*) FROM rooms r WHERE r.home_id = h.id) AS rooms_count,
+             (SELECT COUNT(*) FROM nodes n WHERE n.home_id = h.id) AS nodes_count,
+             (SELECT COUNT(*) FROM home_members hm WHERE hm.home_id = h.id) AS members_count
+      FROM homes h
+      LEFT JOIN users u ON h.owner_user_id = u.id
+      LEFT JOIN users c ON h.created_by = c.id
+      WHERE h.is_archived = 0
+    `;
+    const params = [];
+    if (!isSuperUser && userId) {
+      sql += ` AND (h.owner_user_id = ? OR h.id IN (SELECT home_id FROM home_members WHERE user_id = ?))`;
+      params.push(userId, userId);
+    }
+    sql += ' ORDER BY h.id ASC';
+    return this.db.prepare(sql).all(...params);
+  }
+
+  getHomeById(homeId) {
+    if (!homeId) return null;
+    const row = this.db.prepare(`
+      SELECT h.*, 
+             u.username AS owner_username, 
+             u.email AS owner_email,
+             c.username AS creator_username,
+             (SELECT COUNT(*) FROM rooms r WHERE r.home_id = h.id) AS rooms_count,
+             (SELECT COUNT(*) FROM nodes n WHERE n.home_id = h.id) AS nodes_count,
+             (SELECT COUNT(*) FROM home_members hm WHERE hm.home_id = h.id) AS members_count
+      FROM homes h
+      LEFT JOIN users u ON h.owner_user_id = u.id
+      LEFT JOIN users c ON h.created_by = c.id
+      WHERE h.id = ? AND h.is_archived = 0
+    `).get(Number(homeId));
+    return row || null;
+  }
+
+  updateHome(homeId, updates = {}) {
+    const existing = this.getHomeById(homeId);
+    if (!existing) throw new Error(`Home ${homeId} not found`);
+    const name = updates.name !== undefined ? updates.name.trim() : existing.name;
+    const desc = updates.description !== undefined ? updates.description.trim() : existing.description;
+    const tz = updates.timezone !== undefined ? updates.timezone.trim() : existing.timezone;
+    const addr = updates.address !== undefined ? updates.address.trim() : existing.address;
+    const nowEpoch = Date.now() / 1000;
+
+    this.db.prepare(`
+      UPDATE homes 
+      SET name = ?, description = ?, timezone = ?, address = ?, updated_at = ?
+      WHERE id = ?
+    `).run(name, desc, tz, addr, nowEpoch, Number(homeId));
+
+    return this.getHomeById(homeId);
+  }
+
+  deleteHome(homeId) {
+    const existing = this.getHomeById(homeId);
+    if (!existing) throw new Error(`Home ${homeId} not found`);
+    // Soft delete / archive
+    this.db.prepare('UPDATE homes SET is_archived = 1, updated_at = unixepoch(\'now\', \'subsec\') WHERE id = ?').run(Number(homeId));
+    // Unassign nodes from this home
+    this.db.prepare('UPDATE nodes SET home_id = NULL, room_id = NULL, assigned_at = NULL WHERE home_id = ?').run(Number(homeId));
+    return true;
+  }
+
+  appointHomeOwner(homeId, newOwnerUserId, appointedByUserId = null) {
+    const home = this.getHomeById(homeId);
+    if (!home) throw new Error(`Home ${homeId} not found`);
+    const targetUser = this.getUserById(newOwnerUserId);
+    if (!targetUser) throw new Error(`Target user ${newOwnerUserId} not found`);
+
+    const nowEpoch = Date.now() / 1000;
+    // Transactional appointment
+    this.db.exec('BEGIN TRANSACTION;');
+    try {
+      this.db.prepare(`
+        UPDATE homes SET owner_user_id = ?, updated_at = ? WHERE id = ?
+      `).run(Number(newOwnerUserId), nowEpoch, Number(homeId));
+
+      this.db.prepare(`
+        INSERT INTO home_members (home_id, user_id, role, joined_at, created_at)
+        VALUES (?, ?, 'HOME_OWNER', ?, ?)
+        ON CONFLICT(home_id, user_id) DO UPDATE SET role = 'HOME_OWNER'
+      `).run(Number(homeId), Number(newOwnerUserId), nowEpoch, nowEpoch);
+
+      this.logAudit(
+        'HOME_OWNER_APPOINTED',
+        'SECURITY',
+        `User '${targetUser.username}' (id: ${newOwnerUserId}) appointed as HOME_OWNER of '${home.name}' (id: ${homeId}) by user id ${appointedByUserId ?? 'SYSTEM'}`
+      );
+      this.db.exec('COMMIT;');
+    } catch (err) {
+      try { this.db.exec('ROLLBACK;'); } catch {}
+      throw err;
+    }
+
+    return this.getHomeById(homeId);
+  }
+
+  getHomeMembers(homeId) {
+    return this.db.prepare(`
+      SELECT hm.id, hm.home_id, hm.user_id, hm.role, hm.joined_at,
+             u.username, u.full_name, u.email
+      FROM home_members hm
+      JOIN users u ON hm.user_id = u.id
+      WHERE hm.home_id = ?
+      ORDER BY hm.id ASC
+    `).all(Number(homeId));
+  }
+
+  getHomeMember(homeId, userId) {
+    return this.db.prepare(`
+      SELECT hm.id, hm.home_id, hm.user_id, hm.role, hm.joined_at,
+             u.username, u.full_name, u.email
+      FROM home_members hm
+      JOIN users u ON hm.user_id = u.id
+      WHERE hm.home_id = ? AND hm.user_id = ?
+    `).get(Number(homeId), Number(userId)) || null;
+  }
+
+  addHomeMember(homeId, userId, role = 'FAMILY_MEMBER') {
+    const home = this.getHomeById(homeId);
+    if (!home) throw new Error(`Home ${homeId} not found`);
+    const validRoles = ['HOME_OWNER', 'HOME_ADMIN', 'FAMILY_MEMBER', 'GUEST', 'VIEWER'];
+    if (!validRoles.includes(role)) throw new Error(`Invalid role '${role}'`);
+
+    const nowEpoch = Date.now() / 1000;
+    this.db.prepare(`
+      INSERT INTO home_members (home_id, user_id, role, joined_at, created_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(home_id, user_id) DO UPDATE SET role = ?
+    `).run(Number(homeId), Number(userId), role, nowEpoch, nowEpoch, role);
+
+    return this.getHomeMember(homeId, userId);
+  }
+
+  updateHomeMemberRole(homeId, userId, newRole) {
+    const validRoles = ['HOME_OWNER', 'HOME_ADMIN', 'FAMILY_MEMBER', 'GUEST', 'VIEWER'];
+    if (!validRoles.includes(newRole)) throw new Error(`Invalid role '${newRole}'`);
+
+    this.db.prepare(`
+      UPDATE home_members SET role = ? WHERE home_id = ? AND user_id = ?
+    `).run(newRole, Number(homeId), Number(userId));
+
+    return this.getHomeMember(homeId, userId);
+  }
+
+  removeHomeMember(homeId, userId) {
+    const member = this.getHomeMember(homeId, userId);
+    if (!member) return false;
+    this.db.prepare('DELETE FROM home_members WHERE home_id = ? AND user_id = ?').run(Number(homeId), Number(userId));
+    // Clean up room assignments in this home
+    this.db.prepare(`
+      DELETE FROM room_members 
+      WHERE user_id = ? AND room_id IN (SELECT id FROM rooms WHERE home_id = ?)
+    `).run(Number(userId), Number(homeId));
+    return true;
+  }
+
+  // ==========================================
+  // ROOMS CRUD METHODS
+  // ==========================================
+
+  createRoom({ home_id, name, floor = 'Ground', icon = 'room' }) {
+    if (!home_id) throw new Error('home_id is required');
+    if (!name || !name.trim()) throw new Error('Room name is required');
+    const home = this.getHomeById(home_id);
+    if (!home) throw new Error(`Home ${home_id} not found`);
+
+    const cleanName = name.trim();
+    const nowEpoch = Date.now() / 1000;
+
+    const res = this.db.prepare(`
+      INSERT INTO rooms (home_id, name, floor, icon, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(Number(home_id), cleanName, floor || 'Ground', icon || 'room', nowEpoch, nowEpoch);
+
+    return this.getRoomById(Number(res.lastInsertRowid));
+  }
+
+  getRooms(homeId, userId = null, isSuperUser = false) {
+    let sql = `
+      SELECT r.*,
+             h.name AS home_name,
+             (SELECT COUNT(*) FROM nodes n WHERE n.room_id = r.id) AS nodes_count,
+             (SELECT COUNT(*) FROM room_members rm WHERE rm.room_id = r.id) AS members_count
+      FROM rooms r
+      JOIN homes h ON r.home_id = h.id
+      WHERE r.home_id = ?
+    `;
+    const params = [Number(homeId)];
+
+    if (!isSuperUser && userId) {
+      const member = this.getHomeMember(homeId, userId);
+      if (member && (member.role === 'FAMILY_MEMBER' || member.role === 'GUEST' || member.role === 'VIEWER')) {
+        const userRooms = this.getUserRoomsInHome(homeId, userId);
+        if (userRooms && userRooms.length > 0) {
+          const roomIds = userRooms.map(rm => rm.room_id || rm.id);
+          sql += ` AND r.id IN (${roomIds.join(',')})`;
+        }
+      }
+    }
+
+    sql += ' ORDER BY r.floor ASC, r.name ASC';
+    return this.db.prepare(sql).all(...params);
+  }
+
+  getRoomById(roomId) {
+    if (!roomId) return null;
+    return this.db.prepare(`
+      SELECT r.*,
+             h.name AS home_name,
+             (SELECT COUNT(*) FROM nodes n WHERE n.room_id = r.id) AS nodes_count,
+             (SELECT COUNT(*) FROM room_members rm WHERE rm.room_id = r.id) AS members_count
+      FROM rooms r
+      JOIN homes h ON r.home_id = h.id
+      WHERE r.id = ?
+    `).get(Number(roomId)) || null;
+  }
+
+  updateRoom(roomId, updates = {}) {
+    const existing = this.getRoomById(roomId);
+    if (!existing) throw new Error(`Room ${roomId} not found`);
+
+    const name = updates.name !== undefined ? updates.name.trim() : existing.name;
+    const floor = updates.floor !== undefined ? updates.floor.trim() : existing.floor;
+    const icon = updates.icon !== undefined ? updates.icon.trim() : existing.icon;
+    const nowEpoch = Date.now() / 1000;
+
+    this.db.prepare(`
+      UPDATE rooms SET name = ?, floor = ?, icon = ?, updated_at = ? WHERE id = ?
+    `).run(name, floor, icon, nowEpoch, Number(roomId));
+
+    // Update node room names if room name changed
+    if (name !== existing.name) {
+      this.db.prepare('UPDATE nodes SET room = ? WHERE room_id = ?').run(name, Number(roomId));
+    }
+
+    return this.getRoomById(roomId);
+  }
+
+  deleteRoom(roomId) {
+    const existing = this.getRoomById(roomId);
+    if (!existing) throw new Error(`Room ${roomId} not found`);
+
+    // CRITICAL REQUIREMENT: Prevent deletion if nodes are assigned!
+    const assignedCount = this.db.prepare('SELECT COUNT(*) as c FROM nodes WHERE room_id = ?').get(Number(roomId)).c;
+    if (assignedCount > 0) {
+      throw new Error(`Cannot delete room '${existing.name}' because ${assignedCount} node(s) are currently assigned to it. Move or unassign all nodes first.`);
+    }
+
+    this.db.prepare('DELETE FROM room_members WHERE room_id = ?').run(Number(roomId));
+    this.db.prepare('DELETE FROM rooms WHERE id = ?').run(Number(roomId));
+    return true;
+  }
+
+  getRoomMembers(roomId) {
+    return this.db.prepare(`
+      SELECT rm.id, rm.room_id, rm.user_id, rm.role, rm.assigned_at,
+             u.username, u.full_name, u.email
+      FROM room_members rm
+      JOIN users u ON rm.user_id = u.id
+      WHERE rm.room_id = ?
+    `).all(Number(roomId));
+  }
+
+  assignRoomMember(roomId, userId, role = 'FAMILY_MEMBER') {
+    const room = this.getRoomById(roomId);
+    if (!room) throw new Error(`Room ${roomId} not found`);
+    const validRoles = ['HOME_ADMIN', 'FAMILY_MEMBER', 'GUEST', 'VIEWER'];
+    if (!validRoles.includes(role)) throw new Error(`Invalid room role '${role}'`);
+
+    const nowEpoch = Date.now() / 1000;
+    this.db.prepare(`
+      INSERT INTO room_members (room_id, user_id, role, assigned_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(room_id, user_id) DO UPDATE SET role = ?
+    `).run(Number(roomId), Number(userId), role, nowEpoch, role);
+
+    return true;
+  }
+
+  removeRoomMember(roomId, userId) {
+    this.db.prepare('DELETE FROM room_members WHERE room_id = ? AND user_id = ?').run(Number(roomId), Number(userId));
+    return true;
+  }
+
+  getUserRoomsInHome(homeId, userId) {
+    return this.db.prepare(`
+      SELECT r.*, rm.role as room_role
+      FROM rooms r
+      JOIN room_members rm ON r.id = rm.room_id
+      WHERE r.home_id = ? AND rm.user_id = ?
+    `).all(Number(homeId), Number(userId));
+  }
+
+  // ==========================================
+  // NODE ASSIGNMENT & MOVING METHODS
+  // ==========================================
+
+  assignNodeToRoom(nodeId, homeId, roomId) {
+    const node = this.getNode(nodeId);
+    if (!node) throw new Error(`Node '${nodeId}' not found`);
+
+    const home = this.getHomeById(homeId);
+    if (!home) throw new Error(`Home ${homeId} not found`);
+
+    const room = this.getRoomById(roomId);
+    if (!room) throw new Error(`Room ${roomId} not found`);
+
+    // Strict validation: Room must belong to Home
+    if (Number(room.home_id) !== Number(homeId)) {
+      throw new Error(`Room '${room.name}' (id: ${roomId}) does not belong to Home '${home.name}' (id: ${homeId})`);
+    }
+
+    const nowEpoch = Date.now() / 1000;
+    this.db.prepare(`
+      UPDATE nodes 
+      SET home_id = ?, room_id = ?, room = ?, assigned_at = ?
+      WHERE node_id = ?
+    `).run(Number(homeId), Number(roomId), room.name, nowEpoch, nodeId);
+
+    this.logAudit(
+      'NODE_ASSIGNED',
+      'SYSTEM',
+      `Node '${nodeId}' assigned to Home '${home.name}' -> Room '${room.name}'`
+    );
+
+    return this.getNode(nodeId);
+  }
+
+  moveNode(nodeId, newHomeId, newRoomId) {
+    return this.assignNodeToRoom(nodeId, newHomeId, newRoomId);
+  }
+
+  unassignNode(nodeId) {
+    const node = this.getNode(nodeId);
+    if (!node) throw new Error(`Node '${nodeId}' not found`);
+
+    this.db.prepare(`
+      UPDATE nodes 
+      SET home_id = NULL, room_id = NULL, assigned_at = NULL
+      WHERE node_id = ?
+    `).run(nodeId);
+
+    this.logAudit(
+      'NODE_UNASSIGNED',
+      'SYSTEM',
+      `Node '${nodeId}' unassigned from Home and moved to Unassigned Nodes queue`
+    );
+
+    return this.getNode(nodeId);
+  }
+
+  getUnassignedNodes() {
+    return this.getNodes({ home_id: 'unassigned' });
+  }
+
+  getDevicePermission(nodeId, userId) {
+    return this.db.prepare(`
+      SELECT * FROM device_permissions WHERE device_id = ? AND user_id = ?
+    `).get(nodeId, Number(userId)) || null;
+  }
+
+  setDevicePermission(nodeId, userId, perms = {}) {
+    const canControl = perms.can_control !== undefined ? (perms.can_control ? 1 : 0) : 1;
+    const canViewTelemetry = perms.can_view_telemetry !== undefined ? (perms.can_view_telemetry ? 1 : 0) : 1;
+    const canConfigure = perms.can_configure !== undefined ? (perms.can_configure ? 1 : 0) : 0;
+    const nowEpoch = Date.now() / 1000;
+
+    this.db.prepare(`
+      INSERT INTO device_permissions (device_id, user_id, can_control, can_view_telemetry, can_configure, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(device_id, user_id) DO UPDATE SET
+        can_control = excluded.can_control,
+        can_view_telemetry = excluded.can_view_telemetry,
+        can_configure = excluded.can_configure
+    `).run(nodeId, Number(userId), canControl, canViewTelemetry, canConfigure, nowEpoch);
+
+    return this.getDevicePermission(nodeId, userId);
+  }
+
+  removeDevicePermission(nodeId, userId) {
+    this.db.prepare('DELETE FROM device_permissions WHERE device_id = ? AND user_id = ?').run(nodeId, Number(userId));
+    return true;
   }
 }
 

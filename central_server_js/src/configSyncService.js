@@ -128,14 +128,21 @@ class ConfigSyncService {
 
     this.db.updateDeviceConfigSyncStatus(nodeId, 'SYNCING');
 
+    const user = node.auth_username || this.nodeManager?.config?.node_auth?.username || 'admin';
+    const pass = node.auth_password || this.nodeManager?.config?.node_auth?.password || 'admin';
+    const authHeader = 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
+
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
+    const timeout = setTimeout(() => controller.abort(), 6000);
 
     try {
-      // Send directly via HTTP
+      // 1. Try unified commands execute endpoint
       const res = await fetch(`http://${ip}/api/commands/execute`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': authHeader
+        },
         body: JSON.stringify({
           action: 'syncConfig',
           command_uuid: crypto.randomUUID(),
@@ -147,30 +154,81 @@ class ConfigSyncService {
       });
       clearTimeout(timeout);
 
-      if (!res.ok) {
-        throw new Error(`Node HTTP ${res.status}: ${res.statusText}`);
+      if (res.ok) {
+        const ackData = await res.json().catch(() => ({}));
+        this.db.updateDeviceConfigSyncStatus(nodeId, 'SYNCED');
+        this.db.logAudit('CONFIG_SYNCED', nodeId, `Configuration v${conf.config_version} successfully pushed and acknowledged by node`);
+
+        this.nodeManager.broadcast('config_synced', {
+          node_id: nodeId,
+          version: conf.config_version,
+          sync_status: 'SYNCED',
+          ack: ackData
+        });
+
+        return {
+          success: true,
+          status: 'SYNCED',
+          version: conf.config_version,
+          message: 'Configuration successfully synchronized with microcontroller',
+          ack: ackData
+        };
       }
 
-      const ackData = await res.json().catch(() => ({}));
-      this.db.updateDeviceConfigSyncStatus(nodeId, 'SYNCED');
-      this.db.logAudit('CONFIG_SYNCED', nodeId, `Configuration v${conf.config_version} successfully pushed and acknowledged by node`);
+      // 2. If node returned 400 or 404 (e.g. ESP-01 where syncConfig action is not mapped), fallback to pushNodeConfig
+      if (res.status === 400 || res.status === 404) {
+        if (this.nodeManager?.pushNodeConfig) {
+          const pushRes = await this.nodeManager.pushNodeConfig(nodeId);
+          if (pushRes && pushRes.success) {
+            this.db.updateDeviceConfigSyncStatus(nodeId, 'SYNCED');
+            this.db.logAudit('CONFIG_SYNCED', nodeId, `Configuration v${conf.config_version} synchronized via GPIO/Receiver fallback`);
 
-      this.nodeManager.broadcast('config_synced', {
-        node_id: nodeId,
-        version: conf.config_version,
-        sync_status: 'SYNCED',
-        ack: ackData
-      });
+            this.nodeManager.broadcast('config_synced', {
+              node_id: nodeId,
+              version: conf.config_version,
+              sync_status: 'SYNCED',
+              ack: pushRes
+            });
 
-      return {
-        success: true,
-        status: 'SYNCED',
-        version: conf.config_version,
-        message: 'Configuration successfully synchronized with microcontroller',
-        ack: ackData
-      };
+            return {
+              success: true,
+              status: 'SYNCED',
+              version: conf.config_version,
+              message: 'Configuration synchronized via direct GPIO/Receiver channels',
+              ack: pushRes
+            };
+          }
+        }
+      }
+
+      throw new Error(`Node HTTP ${res.status}: ${res.statusText}`);
     } catch (err) {
       clearTimeout(timeout);
+
+      // Attempt second fallback to pushNodeConfig if fetch threw
+      if (this.nodeManager?.pushNodeConfig) {
+        try {
+          const pushRes = await this.nodeManager.pushNodeConfig(nodeId);
+          if (pushRes && pushRes.success) {
+            this.db.updateDeviceConfigSyncStatus(nodeId, 'SYNCED');
+            this.db.logAudit('CONFIG_SYNCED', nodeId, `Configuration v${conf.config_version} recovered via GPIO push fallback`);
+            this.nodeManager.broadcast('config_synced', {
+              node_id: nodeId,
+              version: conf.config_version,
+              sync_status: 'SYNCED',
+              ack: pushRes
+            });
+            return {
+              success: true,
+              status: 'SYNCED',
+              version: conf.config_version,
+              message: 'Configuration synchronized via GPIO push fallback',
+              ack: pushRes
+            };
+          }
+        } catch {}
+      }
+
       this.db.updateDeviceConfigSyncStatus(nodeId, 'FAILED');
       this.db.logSystemEvent(nodeId, 'CONFIG_SYNC', 'ERROR', `Sync failed: ${err.message}`);
 

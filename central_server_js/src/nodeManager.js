@@ -667,13 +667,37 @@ class NodeManager {
 
   async syncNodePins(nodeId) {
     const node = this.db.getNode(nodeId);
-    if (!node || !node.ip) {
+    if (!node || (!node.ip && !node.ip_address)) {
       throw new Error(`Node '${nodeId}' not found or has no IP address`);
     }
 
-    const ip = node.ip;
+    const ip = node.ip || node.ip_address;
+    const user = node.auth_username || this.config.node_auth?.username || 'admin';
+    const pass = node.auth_password || this.config.node_auth?.password || 'admin';
+
+    let token = this.nodeAuthTokens.get(ip);
+    if (!token && user && pass) {
+      try {
+        token = await this.authenticateNode(ip, user, pass);
+      } catch {}
+    }
+
+    const headers = { 'Accept': 'application/json' };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    } else if (user && pass) {
+      headers['Authorization'] = 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
+    }
+
     return new Promise((resolve, reject) => {
-      const req = http.get(`http://${ip}/api/gpio`, { timeout: 3500 }, (res) => {
+      const req = http.request({
+        hostname: ip,
+        port: 80,
+        path: '/api/gpio',
+        method: 'GET',
+        headers,
+        timeout: 3500
+      }, (res) => {
         let body = '';
         res.on('data', chunk => body += chunk);
         res.on('end', () => {
@@ -703,7 +727,76 @@ class NodeManager {
         reject(new Error('Connection timed out while querying node /api/gpio'));
       });
       req.on('error', (err) => reject(err));
+      req.end();
     });
+  }
+
+  getHardwarePinCatalog(nodeId) {
+    const node = this.db.getNode(nodeId);
+    if (!node) return null;
+
+    const relays = this.db.getRelays({ node_id: nodeId });
+    const hwUpper = (node.hardware_type || node.hardware || '').toUpperCase();
+    const isEsp01 = ['ESP-01', 'ESP01', '1MB'].some(k => hwUpper.includes(k));
+
+    const basePins = isEsp01 ? [
+      { pin: 0, dPin: 'GPIO 0', label: 'GPIO 0 (Pin 5)', safety: 'BOOT_SENSITIVE', bus: 'FLASH / RELAY 1', notes: 'Relay 1 / Flash Pin (must be HIGH on boot)' },
+      { pin: 2, dPin: 'GPIO 2', label: 'GPIO 2 (Pin 3)', safety: 'BOOT_SENSITIVE', bus: 'TXD1 / RELAY 2', notes: 'Relay 2 / TXD1 / Sensor (DHT, DS18B20)' },
+      { pin: 1, dPin: 'TX (GPIO 1)', label: 'TX (GPIO 1)', safety: 'SPECIAL', bus: 'UART TX', notes: 'Serial TX / Alternate GPIO 1' },
+      { pin: 3, dPin: 'RX (GPIO 3)', label: 'RX (GPIO 3)', safety: 'SPECIAL', bus: 'UART RX', notes: 'Serial RX / Alternate GPIO 3' }
+    ] : [
+      { pin: 5, dPin: 'D1', label: 'D1 (GPIO 5)', safety: 'SAFE', bus: 'I2C SCL', notes: 'Safe output, boot-neutral / I2C SCL' },
+      { pin: 4, dPin: 'D2', label: 'D2 (GPIO 4)', safety: 'SAFE', bus: 'I2C SDA', notes: 'Safe output, boot-neutral / I2C SDA' },
+      { pin: 14, dPin: 'D5', label: 'D5 (GPIO 14)', safety: 'SAFE', bus: 'SPI SCK / Sensor', notes: 'Safe output / SPI SCK / DS18B20 / DHT sensor' },
+      { pin: 12, dPin: 'D6', label: 'D6 (GPIO 12)', safety: 'SAFE', bus: 'SPI MISO / Sensor', notes: 'Safe output / SPI MISO / Sensor input' },
+      { pin: 13, dPin: 'D7', label: 'D7 (GPIO 13)', safety: 'SAFE', bus: 'SPI MOSI / Sensor', notes: 'Safe output / SPI MOSI / Sensor input' },
+      { pin: 15, dPin: 'D8', label: 'D8 (GPIO 15)', safety: 'BOOT_SENSITIVE', bus: 'SPI SS', notes: 'Must be LOW on boot (requires external pull-down)' },
+      { pin: 0, dPin: 'D3', label: 'D3 (GPIO 0)', safety: 'BOOT_SENSITIVE', bus: 'FLASH PIN', notes: 'Flash button, must be HIGH on boot' },
+      { pin: 2, dPin: 'D4', label: 'D4 (GPIO 2)', safety: 'BOOT_SENSITIVE', bus: 'TXD1 / LED', notes: 'Internal LED, must be HIGH on boot' },
+      { pin: 16, dPin: 'D0', label: 'D0 (GPIO 16)', safety: 'SPECIAL', bus: 'WAKE PIN', notes: 'Deep-sleep wake, HIGH on boot, no PWM' },
+      { pin: 17, dPin: 'A0', label: 'A0 (ADC0)', safety: 'SENSOR_ONLY', bus: 'ANALOG IN', notes: 'Analog sensor input (0-1.0V / 0-3.3V on NodeMCU)' }
+    ];
+
+    const relayByPin = new Map();
+    for (const r of relays) {
+      const p = Number(r.pin);
+      if (!isNaN(p) && p >= 0) {
+        relayByPin.set(p, r);
+      }
+    }
+
+    const pins = basePins.map(bp => {
+      const p = bp.pin;
+      const pinObj = { ...bp };
+      if (relayByPin.has(p)) {
+        const r = relayByPin.get(p);
+        pinObj.isRelay = true;
+        pinObj.role = 'RELAY';
+        pinObj.channelId = r.channel_id;
+        pinObj.relayName = r.name;
+        pinObj.room = r.room;
+        pinObj.function = r.function;
+        pinObj.state = Boolean(r.current_state);
+        pinObj.activeLow = r.active_low !== false;
+      } else {
+        pinObj.isRelay = false;
+        pinObj.role = bp.safety === 'SENSOR_ONLY' ? 'SENSOR' : 'FREE';
+        pinObj.channelId = null;
+        pinObj.relayName = null;
+      }
+      return pinObj;
+    });
+
+    return {
+      nodeId,
+      nodeName: node.name,
+      hardware: node.hardware_type || (isEsp01 ? 'ESP8266 ESP-01 / ESP-01S (1MB)' : 'ESP8266 (ESP-12E/F) NodeMCU'),
+      pins,
+      relays,
+      totalPins: pins.length,
+      activeRelays: relays.length,
+      freePins: pins.filter(p => p.role === 'FREE').length
+    };
   }
 
   async syncAllOnlineNodesPins() {
@@ -760,10 +853,20 @@ class NodeManager {
 
     const user = node.auth_username || this.config.node_auth?.username || 'admin';
     const pass = node.auth_password || this.config.node_auth?.password || 'admin';
+    const nodeIp = node.ip || node.ip_address;
+
+    let token = this.nodeAuthTokens.get(nodeIp);
+    if (!token) {
+      token = await this.authenticateNode(nodeIp, user, pass);
+    }
+
     const headers = {
       'Content-Type': 'application/json',
       'Authorization': 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64')
     };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
 
     const results = {};
 
