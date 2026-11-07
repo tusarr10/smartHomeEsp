@@ -4832,7 +4832,7 @@ async function viewFsFile(filePath) {
         </div>
       `}
 
-      <textarea id="fs-editor-textarea" ${isEditable ? '' : 'readonly'} onkeydown="handleEditorKeyDown(event)" class="code-editor-textarea" style="width:100%; height:370px; font-family:'Consolas','Fira Code','Monaco',monospace; font-size:13.5px; line-height:1.6; background-color:#0b1120 !important; color:#f8fafc !important; caret-color:#38bdf8 !important; border:1px solid rgba(56,189,248,0.4) !important; padding:12px; border-radius:6px; resize:vertical; tab-size:2;">${escapeHtml(displayContent)}</textarea>
+      <textarea id="fs-editor-textarea" ${isEditable ? '' : 'readonly'} onkeydown="handleEditorKeyDown(event)" class="code-editor-textarea" style="width:100%; height:370px; font-family:'Consolas','Fira Code','Monaco',monospace; font-size:13.5px; line-height:1.6; background-color:#0b1120 !important; color:#f8fafc !important; -webkit-text-fill-color:#f8fafc !important; caret-color:#38bdf8 !important; border:1px solid rgba(56,189,248,0.4) !important; padding:12px; border-radius:6px; resize:vertical; tab-size:2;">${escapeHtml(displayContent)}</textarea>
 
       <div style="display:flex; justify-content:space-between; align-items:center; margin-top:14px;">
         <div>
@@ -4879,11 +4879,13 @@ function toggleEditorTheme() {
   if (isLight) {
     ta.style.setProperty('background-color', '#ffffff', 'important');
     ta.style.setProperty('color', '#0f172a', 'important');
+    ta.style.setProperty('-webkit-text-fill-color', '#0f172a', 'important');
     ta.style.setProperty('border-color', '#94a3b8', 'important');
     ta.style.setProperty('caret-color', '#0f172a', 'important');
   } else {
     ta.style.setProperty('background-color', '#0b1120', 'important');
     ta.style.setProperty('color', '#f8fafc', 'important');
+    ta.style.setProperty('-webkit-text-fill-color', '#f8fafc', 'important');
     ta.style.setProperty('border-color', 'rgba(56, 189, 248, 0.4)', 'important');
     ta.style.setProperty('caret-color', '#38bdf8', 'important');
   }
@@ -5373,7 +5375,7 @@ async function refreshConfigDetails() {
           <h3 style="font-size: 15px;">Authoritative Configuration Payload (JSON)</h3>
           <span style="font-size: 12px; color: var(--text-muted);">Strict JSON schema validated</span>
         </div>
-        <textarea id="config-json-textarea" class="code-editor-textarea" style="width: 100%; height: 380px; font-family: 'Consolas', 'Monaco', monospace; font-size: 13.5px; line-height: 1.6; background-color: #0b1120 !important; color: #f8fafc !important; caret-color: #38bdf8 !important; border: 1px solid rgba(56, 189, 248, 0.4); padding: 12px; border-radius: 8px; resize: vertical;">${JSON.stringify(c.config, null, 2)}</textarea>
+        <textarea id="config-json-textarea" class="code-editor-textarea" style="width: 100%; height: 380px; font-family: 'Consolas', 'Monaco', monospace; font-size: 13.5px; line-height: 1.6; background-color: #0b1120 !important; color: #f8fafc !important; -webkit-text-fill-color: #f8fafc !important; caret-color: #38bdf8 !important; border: 1px solid rgba(56, 189, 248, 0.4); padding: 12px; border-radius: 8px; resize: vertical;">${JSON.stringify(c.config, null, 2)}</textarea>
       </div>
     `;
   } catch (err) {
