@@ -48,6 +48,12 @@ enum WifiSystemMode {
 #define RX 3
 #define TX 1
 #endif
+#ifndef SD2
+#define SD2 9
+#endif
+#ifndef SD3
+#define SD3 10
+#endif
 
 // Physical Factory Reset Button (NodeMCU Flash button is D3 / GPIO 0)
 #define FACTORY_RESET_PIN       D3
@@ -57,7 +63,7 @@ enum WifiSystemMode {
 #define ONBOARD_LED_PIN         D4
 
 // System Constraints
-#define MAX_GPIO_CHANNELS       8
+#define MAX_GPIO_CHANNELS       16
 #define MAX_AUTOMATION_RULES    10
 #define LOG_BUFFER_CAPACITY     50
 #define SESSION_TIMEOUT_SEC     3600
@@ -74,15 +80,19 @@ struct PinSafetyInfo {
 
 // NodeMCU Pin Reference Matrix
 static const PinSafetyInfo PIN_SAFETY_MAP[] = {
-    { D1, "D1 (GPIO5)",  true,  false, "Safe I2C SCL, boot-neutral" },
-    { D2, "D2 (GPIO4)",  true,  false, "Safe I2C SDA, boot-neutral" },
-    { D5, "D5 (GPIO14)", true,  false, "Safe SPI CLK, boot-neutral" },
-    { D6, "D6 (GPIO12)", true,  false, "Safe SPI MISO, boot-neutral" },
-    { D7, "D7 (GPIO13)", true,  false, "Safe SPI MOSI, boot-neutral" },
-    { D0, "D0 (GPIO16)", true,  true,  "WAKE pin, HIGH at boot" },
-    { D3, "D3 (GPIO0)",  false, true,  "Boot config (Flash button), must be HIGH at boot" },
-    { D4, "D4 (GPIO2)",  false, true,  "Boot config (TXD1/LED), must be HIGH at boot" },
-    { D8, "D8 (GPIO15)", false, true,  "Boot config (pulled LOW), must be LOW at boot" }
+    { D1,  "D1 (GPIO5)",   true,  false, "Safe I2C SCL, boot-neutral" },
+    { D2,  "D2 (GPIO4)",   true,  false, "Safe I2C SDA, boot-neutral" },
+    { D5,  "D5 (GPIO14)",  true,  false, "Safe SPI CLK, boot-neutral" },
+    { D6,  "D6 (GPIO12)",  true,  false, "Safe SPI MISO, boot-neutral" },
+    { D7,  "D7 (GPIO13)",  true,  false, "Safe SPI MOSI, boot-neutral" },
+    { D0,  "D0 (GPIO16)",  true,  true,  "WAKE pin, HIGH at boot" },
+    { D8,  "D8 (GPIO15)",  true,  true,  "Boot config (pulled LOW), must be LOW at boot" },
+    { D3,  "D3 (GPIO0)",   true,  true,  "Boot config (Flash button), must be HIGH at boot" },
+    { D4,  "D4 (GPIO2)",   true,  true,  "Boot config (TXD1/LED), must be HIGH at boot" },
+    { RX,  "RX (GPIO3)",   true,  true,  "UART0 RX, serial debug input" },
+    { TX,  "TX (GPIO1)",   true,  true,  "UART0 TX, serial debug output (HIGH at boot)" },
+    { SD2, "SD2 (GPIO9)",  true,  true,  "Flash IO SD2 (usable in DIO/DOUT mode)" },
+    { SD3, "SD3 (GPIO10)", true,  true,  "Flash IO SD3 (usable in DIO/DOUT mode)" }
 };
 static const size_t PIN_SAFETY_MAP_COUNT = sizeof(PIN_SAFETY_MAP) / sizeof(PIN_SAFETY_MAP[0]);
 

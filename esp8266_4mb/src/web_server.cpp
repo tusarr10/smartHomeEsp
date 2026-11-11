@@ -509,7 +509,7 @@ void WebServerManager::registerApiRoutes() {
     // === GPIO / RELAY MANAGEMENT ===
     _server.on("/api/gpio", HTTP_GET, [this]() {
         _server.sendHeader(F("Cache-Control"), F("no-cache, no-store, must-revalidate"));
-        DynamicJsonDocument doc(1536);
+        DynamicJsonDocument doc(3072);
         JsonArray arr = doc.to<JsonArray>();
         GpioManager::getInstance().toJson(arr);
         String out;
@@ -1159,7 +1159,7 @@ void WebServerManager::registerApiRoutes() {
     _server.on("/api/commands/execute", HTTP_POST, [this]() {
         if (!checkAuthOrReject()) return;
 
-        DynamicJsonDocument doc(1024);
+        DynamicJsonDocument doc(3072);
         DeserializationError err = deserializeJson(doc, _server.arg("plain"));
         if (err) {
             sendJsonResponse(400, false, F("Invalid JSON command"));

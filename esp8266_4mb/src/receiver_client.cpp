@@ -92,7 +92,7 @@ void ReceiverClient::loop() {
             }
 
             // Stream telemetry JSON directly into WiFiClient - zero intermediate String on heap!
-            DynamicJsonDocument doc(1536);
+            DynamicJsonDocument doc(3072);
             fillTelemetryDoc(doc, _activeEventType.c_str());
             serializeJson(doc, _tcpClient);
             _tcpClient.print('\n');
@@ -256,7 +256,7 @@ bool ReceiverClient::sendHttp(const char* eventType, String& outResponse, int& o
         http.addHeader(F("Authorization"), "Bearer " + _config.authToken);
     }
 
-    DynamicJsonDocument doc(1536);
+    DynamicJsonDocument doc(3072);
     fillTelemetryDoc(doc, eventType);
     String payload;
     serializeJson(doc, payload);
@@ -286,7 +286,7 @@ bool ReceiverClient::sendTcpSync(const char* eventType, String& outResponse, int
     }
 
     // Direct streaming to socket - no intermediate payload String!
-    DynamicJsonDocument doc(1536);
+    DynamicJsonDocument doc(3072);
     fillTelemetryDoc(doc, eventType);
     serializeJson(doc, client);
     client.print('\n');
@@ -367,8 +367,7 @@ bool ReceiverClient::pushTelemetry(const String& eventType, String& outResult, i
 void ReceiverClient::processServerCommands(const char* response) {
     if (!response || response[0] != '{') return;
 
-    // Fixed stack document: 384 bytes stack (safe on ESP8266 stack, zero heap allocation!)
-    StaticJsonDocument<384> doc;
+    DynamicJsonDocument doc(2048);
     DeserializationError err = deserializeJson(doc, response);
     if (err) return;
 

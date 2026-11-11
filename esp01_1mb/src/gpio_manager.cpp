@@ -65,8 +65,7 @@ bool GpioManager::begin() {
 
     for (size_t i = 0; i < _channelCount; i++) {
         applyPhysicalPin(i);
-        Serial.printf("[GPIO] Hardware ready: Channel %u (%s) on Pin %u = %s
-",
+        Serial.printf("[GPIO] Hardware ready: Channel %u (%s) on Pin %u = %s\n",
                       _channels[i].id, _channels[i].name.c_str(), _channels[i].pin,
                       _channels[i].currentState ? "ON" : "OFF");
     }

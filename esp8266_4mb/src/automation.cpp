@@ -234,7 +234,7 @@ void AutomationEngine::loadFromStorage() {
         _tzOffsetSec = 19800;
     }
 
-    DynamicJsonDocument doc(1024);
+    DynamicJsonDocument doc(2048);
     if (!StorageManager::getInstance().loadJsonFile(FILE_RULES_CONFIG, doc)) {
         return;
     }
@@ -264,7 +264,7 @@ void AutomationEngine::loadFromStorage() {
 }
 
 void AutomationEngine::saveToStorage() {
-    DynamicJsonDocument doc(1024);
+    DynamicJsonDocument doc(2048);
     JsonArray arr = doc.to<JsonArray>();
     toJson(arr);
     StorageManager::getInstance().saveJsonFile(FILE_RULES_CONFIG, doc);

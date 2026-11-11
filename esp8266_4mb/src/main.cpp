@@ -14,6 +14,11 @@ unsigned long resetBtnPressStart = 0;
 bool resetBtnPressed = false;
 
 void checkResetButton() {
+    // Only monitor physical factory reset if D3 is NOT assigned as a relay channel
+    if (GpioManager::getInstance().isPinAssigned(FACTORY_RESET_PIN)) {
+        return;
+    }
+
     // NodeMCU FLASH button (D3 / GPIO 0) is pulled HIGH; pressing pulls to GND (LOW)
     if (digitalRead(FACTORY_RESET_PIN) == LOW) {
         if (!resetBtnPressed) {

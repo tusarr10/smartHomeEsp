@@ -47,10 +47,15 @@ void GpioManager::applyPhysicalPin(const GpioChannel& channel) {
 bool GpioManager::begin() {
     loadFromStorage();
     if (_channels.empty()) {
-        // Create initial default safe outputs on NodeMCU (D1 & D2) if none exist
-        String err;
-        addChannel(D1, F("Living Room Light"), F("Living Room"), F("Light"), true, INITIAL_MODE_RESTORE_LAST, err);
-        addChannel(D2, F("Bedroom Fan"), F("Bedroom"), F("Fan"), true, INITIAL_MODE_RESTORE_LAST, err);
+        // Only create initial default safe outputs if /config/gpio.json does NOT exist on flash
+        if (!LittleFS.exists(FILE_GPIO_CONFIG)) {
+            Serial.println(F("[GPIO] No saved config found, creating initial default outputs (D1 & D2)"));
+            String err;
+            addChannel(D1, F("Living Room Light"), F("Living Room"), F("Light"), true, INITIAL_MODE_RESTORE_LAST, err);
+            addChannel(D2, F("Bedroom Fan"), F("Bedroom"), F("Fan"), true, INITIAL_MODE_RESTORE_LAST, err);
+        } else {
+            Serial.println(F("[GPIO] Existing gpio.json file found but 0 channels loaded. Preserving file."));
+        }
     } else {
         // Initialize all loaded channels according to power-on behavior
         for (auto& ch : _channels) {
@@ -88,7 +93,7 @@ void GpioManager::loop() {
 bool GpioManager::addChannel(uint8_t pin, const String& name, const String& room, const String& function,
                             bool activeLow, uint8_t initialMode, String& outError) {
     if (_channels.size() >= MAX_GPIO_CHANNELS) {
-        outError = F("Maximum GPIO channels reached (limit: 8)");
+        outError = String(F("Maximum GPIO channels reached (limit: ")) + String(MAX_GPIO_CHANNELS) + F(")");
         return false;
     }
 
@@ -243,7 +248,7 @@ void GpioManager::toJson(JsonArray& arr) {
 }
 
 void GpioManager::loadFromStorage() {
-    DynamicJsonDocument doc(1024);
+    DynamicJsonDocument doc(4096);
     if (!StorageManager::getInstance().loadJsonFile(FILE_GPIO_CONFIG, doc)) {
         return;
     }
@@ -253,7 +258,7 @@ void GpioManager::loadFromStorage() {
     JsonArray arr = doc.as<JsonArray>();
     for (JsonObject obj : arr) {
         GpioChannel ch;
-        ch.id = obj["id"] | 1;
+        ch.id = obj["id"] | (uint8_t)(obj["channel_id"] | (maxId + 1));
         ch.pin = obj["pin"] | D1;
         String loadedName = obj["name"] | "";
         ch.name = (loadedName.length() > 0) ? loadedName : String(F("Output ")) + String(ch.id);
@@ -261,20 +266,21 @@ void GpioManager::loadFromStorage() {
         ch.room = (loadedRoom.length() > 0) ? loadedRoom : F("General");
         String loadedFunc = obj["function"] | "";
         ch.function = (loadedFunc.length() > 0) ? loadedFunc : F("Relay");
-        ch.activeLow = obj["activeLow"] | true;
-        ch.initialMode = obj["initialMode"] | 0;
-        ch.enabled = obj["enabled"] | true;
-        ch.currentState = obj["state"] | false;
+        ch.activeLow = obj.containsKey("activeLow") ? obj["activeLow"].as<bool>() : (obj.containsKey("active_low") ? obj["active_low"].as<bool>() : true);
+        ch.initialMode = obj.containsKey("initialMode") ? obj["initialMode"].as<uint8_t>() : (obj.containsKey("initial_mode") ? obj["initial_mode"].as<uint8_t>() : 0);
+        ch.enabled = obj.containsKey("enabled") ? obj["enabled"].as<bool>() : true;
+        ch.currentState = obj.containsKey("state") ? obj["state"].as<bool>() : false;
         ch.pulseEndTime = 0;
 
         if (ch.id > maxId) maxId = ch.id;
         _channels.push_back(ch);
     }
     _nextId = maxId + 1;
+    Serial.printf("[GPIO] Loaded %u channel(s) from LittleFS storage.\n", (unsigned int)_channels.size());
 }
 
 void GpioManager::saveToStorage() {
-    DynamicJsonDocument doc(1024);
+    DynamicJsonDocument doc(4096);
     JsonArray arr = doc.to<JsonArray>();
     toJson(arr);
     StorageManager::getInstance().saveJsonFile(FILE_GPIO_CONFIG, doc);

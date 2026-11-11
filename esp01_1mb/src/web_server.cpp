@@ -102,8 +102,8 @@ bool WebServerManager::isAuthorized(bool allowUnauthenticatedDiscovery) {
 }
 
 void WebServerManager::sendJsonResponse(int code, bool success, const String& message) {
-    String out = String(F("{"success":")) + (success ? F("true") : F("false")) +
-                 F(","") + (success ? F("message") : F("error")) + F("":"") + message + F(""}");
+    String out = String(F("{\"success\":")) + (success ? F("true") : F("false")) +
+                 F(",\"") + (success ? F("message") : F("error")) + F("\":\"") + message + F("\"}");
     _server.send(code, "application/json", out);
 }
 
@@ -119,7 +119,7 @@ void WebServerManager::registerRoutes() {
             _server.send(302, F("text/plain"), F(""));
             return;
         }
-        _server.send(404, F("application/json"), F("{"error":"Not Found"}"));
+        _server.send(404, F("application/json"), F("{\"error\":\"Not Found\"}"));
     });
 }
 
