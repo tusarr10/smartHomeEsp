@@ -321,6 +321,10 @@ function createV1Router(nodeManager, db) {
     if (req.user && !req.user.is_superuser) {
       nodes = nodes.filter(node => verifyDeviceScope(req.user, node, db));
     }
+    nodes = nodes.map(n => ({
+      ...n,
+      pcf8574: nodeManager.getNodeExpanderStatus(n.node_id)
+    }));
     res.json(nodes);
   });
 
@@ -690,8 +694,15 @@ function createV1Router(nodeManager, db) {
       return res.status(400).json({ success: false, error: 'IP address is required to probe and add a node' });
     }
 
+    const probeUser = (req.body.auth_username || req.body.username || 'admin').trim();
+    const probePass = req.body.auth_password || req.body.password || 'admin';
+    const probeHeaders = { 'Accept': 'application/json' };
+    if (probeUser && probePass) {
+      probeHeaders['Authorization'] = 'Basic ' + Buffer.from(`${probeUser}:${probePass}`).toString('base64');
+    }
+
     const probeNode = () => new Promise((resolve) => {
-      const clientReq = http.get(`http://${ip}/api/status`, { timeout: 3000 }, (targetRes) => {
+      const clientReq = http.get(`http://${ip}/api/status`, { headers: probeHeaders, timeout: 3000 }, (targetRes) => {
         let raw = '';
         targetRes.on('data', chunk => raw += chunk);
         targetRes.on('end', () => {
@@ -707,7 +718,7 @@ function createV1Router(nodeManager, db) {
     });
 
     const probeGpios = () => new Promise((resolve) => {
-      const clientReq = http.get(`http://${ip}/api/gpio`, { timeout: 3000 }, (targetRes) => {
+      const clientReq = http.get(`http://${ip}/api/gpio`, { headers: probeHeaders, timeout: 3000 }, (targetRes) => {
         let raw = '';
         targetRes.on('data', chunk => raw += chunk);
         targetRes.on('end', () => {
@@ -733,7 +744,13 @@ function createV1Router(nodeManager, db) {
     let rssi = 0;
     let uptime = 0;
     let heap = 0;
-    let channels = Array.isArray(gpios.data) ? gpios.data : [];
+    let channels = Array.isArray(gpios.data)
+      ? gpios.data
+      : (gpios.data && Array.isArray(gpios.data.channels) ? gpios.data.channels : []);
+    let pcf8574Detected;
+    let pcf8574Address;
+    let pcf8574Output;
+    let freeSketchSpace;
 
     if (probe.ok && probe.data) {
       const d = probe.data;
@@ -747,6 +764,11 @@ function createV1Router(nodeManager, db) {
       if (d.rssi) rssi = d.rssi;
       if (d.uptimeSec) uptime = d.uptimeSec;
       if (d.freeHeap) heap = d.freeHeap;
+      if (d.freeSketchSpace !== undefined) freeSketchSpace = Number(d.freeSketchSpace);
+      if (d.pcf8574Detected !== undefined) pcf8574Detected = Boolean(d.pcf8574Detected);
+      if (d.pcf8574Address !== undefined) pcf8574Address = String(d.pcf8574Address);
+      if (d.pcf8574Output !== undefined) pcf8574Output = Number(d.pcf8574Output);
+      if (channels.length === 0 && Array.isArray(d.channels)) channels = d.channels;
     }
 
     const nodePayload = {
@@ -759,6 +781,10 @@ function createV1Router(nodeManager, db) {
       rssi,
       uptimeSec: uptime,
       freeHeap: heap,
+      freeSketchSpace,
+      pcf8574Detected,
+      pcf8574Address,
+      pcf8574Output,
       room,
       channels
     };
@@ -796,7 +822,8 @@ function createV1Router(nodeManager, db) {
     }
     const history = db.getTelemetryHistory(req.params.nodeId, 20);
     const capabilities = db.getDeviceCapabilities(req.params.nodeId);
-    res.json({ node, capabilities, history });
+    const pcf8574 = nodeManager.getNodeExpanderStatus(req.params.nodeId);
+    res.json({ node: { ...node, pcf8574 }, capabilities, history });
   });
 
   router.delete('/nodes/:nodeId', requirePermission(db, 'devices:delete'), (req, res) => {
@@ -843,6 +870,16 @@ function createV1Router(nodeManager, db) {
     }
 
     const updated = db.updateNodeSettings(nodeId, req.body);
+    if (nodeManager.nodeAuthMismatch) nodeManager.nodeAuthMismatch.delete(nodeId);
+    const oldIp = existing.ip || existing.ip_address;
+    const newIp = updated.ip || updated.ip_address;
+    if (nodeManager.nodeAuthTokens) {
+      if (oldIp) nodeManager.nodeAuthTokens.delete(oldIp);
+      if (newIp) nodeManager.nodeAuthTokens.delete(newIp);
+    }
+    if (typeof nodeManager.pollSingleNode === 'function' && newIp) {
+      nodeManager.pollSingleNode(updated).catch(() => {});
+    }
     db.logAudit('NODE_CONFIG_UPDATE', nodeId, `Updated configuration settings for node '${updated.name}'`);
     nodeManager.broadcast('node_status', {
       node_id: nodeId,
@@ -1012,7 +1049,7 @@ function createV1Router(nodeManager, db) {
         payload.channel_id = parseInt(String(rawCh).replace(/\D/g, '')) || 1;
       }
       const relay = db.addOrUpdateRelay(nodeId, payload);
-      db.logAudit('RELAY_ADDED', nodeId, `Configured channel ${relay.channel_id} ('${relay.name}', Pin D${relay.pin}) on node '${node.name}'`);
+      db.logAudit('RELAY_ADDED', nodeId, `Configured channel ${relay.channel_id} ('${relay.name}', ${nodeManager.formatPinName(relay.pin)}) on node '${node.name}'`);
       nodeManager.broadcast('relay_sync', { nodeId, channel_id: relay.channel_id, relay });
 
       try {
@@ -1038,7 +1075,7 @@ function createV1Router(nodeManager, db) {
 
     try {
       const relay = db.addOrUpdateRelay(nodeId, { ...req.body, channel_id: Number(channelId) });
-      db.logAudit('RELAY_UPDATED', nodeId, `Updated channel ${channelId} ('${relay.name}', Pin D${relay.pin}) on node '${node.name}'`);
+      db.logAudit('RELAY_UPDATED', nodeId, `Updated channel ${channelId} ('${relay.name}', ${nodeManager.formatPinName(relay.pin)}) on node '${node.name}'`);
       nodeManager.broadcast('relay_sync', { nodeId, channel_id: relay.channel_id, relay });
       res.json({
         success: true,
@@ -1504,8 +1541,8 @@ function createV1Router(nodeManager, db) {
       }
     }
 
-    // 3. Hardware Flash Partition Constraint Check (ESP-01 1MB ~480KB limit)
-    const isEsp01 = hwTarget.toLowerCase().includes('esp-01') || hwTarget.toLowerCase().includes('1mb');
+    // 3. Hardware Flash Partition Constraint Check (ESP-01 / PCF8574 1MB ~480KB limit)
+    const isEsp01 = hwTarget.toLowerCase().includes('esp-01') || hwTarget.toLowerCase().includes('1mb') || hwTarget.toLowerCase().includes('pcf8574');
     if (isEsp01 && req.file.size > 512000) {
       if (fs.existsSync(filePath)) try { fs.unlinkSync(filePath); } catch {}
       return res.status(400).json({

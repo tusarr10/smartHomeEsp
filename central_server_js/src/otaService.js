@@ -81,7 +81,7 @@ class OtaService {
 
     const rttMs = Date.now() - t0;
     const hwStr = status.hardware || node.hardware_type || 'ESP8266';
-    const isOneMb = hwStr.includes('ESP-01') || hwStr.includes('1MB');
+    const isOneMb = hwStr.includes('ESP-01') || hwStr.includes('1MB') || hwStr.includes('PCF8574');
     
     const freeSketchSpace = Number(status.freeSketchSpace) || (isOneMb ? 480000 : 1400000);
     const sketchSize = Number(status.sketchSize) || (isOneMb ? 335000 : 480000);
@@ -301,7 +301,7 @@ class OtaService {
     const marginKb = Math.round(marginBytes / 1024);
 
     // ESP-01 1MB Flash Partition Constraint Check
-    const isOneMbFlash = flashTotal <= 1048576 || (diagnostics.hardware && diagnostics.hardware.includes('ESP-01'));
+    const isOneMbFlash = flashTotal <= 1048576 || (diagnostics.hardware && (diagnostics.hardware.includes('ESP-01') || diagnostics.hardware.includes('PCF8574')));
     if (isOneMbFlash && fwSize > freeSpace) {
       checks.push({
         id: 'esp01_flash_barrier',

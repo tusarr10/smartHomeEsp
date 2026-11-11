@@ -763,8 +763,12 @@ class FleetDatabase {
     const name = data.nodeName || data.name || rawNodeId;
     const ip = (data.ip || data.ip_address || '').trim();
     const mac = (data.mac || data.mac_address || '').trim();
-    const fw = data.firmwareVersion || data.firmware_version || '1.6.0';
-    const hw = data.hardware || data.hardware_type || 'ESP8266';
+    const incomingFw = (data.firmwareVersion || data.firmware_version || '').trim();
+    const incomingHw = (data.hardware || data.hardware_type || '').trim();
+    const hasPcfPins = Array.isArray(data.channels) && data.channels.some(ch => {
+      const p = Number(ch.pin);
+      return Number.isFinite(p) && p >= 100 && p <= 107;
+    });
     const rssi = Number(data.rssi) || 0;
     const uptime = Number(data.uptimeSec || data.uptime_sec) || 0;
     const heap = Number(data.freeHeap || data.free_heap) || 0;
@@ -823,6 +827,10 @@ class FleetDatabase {
     }
 
     if (existing) {
+      const existingHw = (existing.hardware_type || '').trim();
+      const resolvedHw = incomingHw ||
+        (hasPcfPins && !existingHw.toUpperCase().includes('PCF8574') ? 'ESP8266 ESP-01 + PCF8574T (1MB)' : (existingHw || 'ESP8266'));
+      const resolvedFw = incomingFw || existing.firmware_version || '1.6.0';
       const updateStmt = this.db.prepare(`
         UPDATE nodes SET
           name = COALESCE(?, name),
@@ -842,8 +850,10 @@ class FleetDatabase {
           device_group = COALESCE(?, device_group)
         WHERE node_id = ?
       `);
-      updateStmt.run(name, hw, fw, ip, mac, mac, gateway, rssi, uptime, heap, nowEpoch, nowStr, channelsJson, group, targetNodeId);
+      updateStmt.run(name, resolvedHw, resolvedFw, ip, mac, mac, gateway, rssi, uptime, heap, nowEpoch, nowStr, channelsJson, group, targetNodeId);
     } else {
+      const resolvedHw = incomingHw || (hasPcfPins ? 'ESP8266 ESP-01 + PCF8574T (1MB)' : 'ESP8266');
+      const resolvedFw = incomingFw || '1.6.0';
       const insertStmt = this.db.prepare(`
         INSERT INTO nodes (
           node_id, name, hardware_type, firmware_version, ip_address, mac_address, gateway,
@@ -851,7 +861,7 @@ class FleetDatabase {
           last_seen_epoch, last_seen_str, channels_json, created_at, device_group
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'Online', 'General', 'Home', 'Controller', ?, ?, ?, ?, ?)
       `);
-      insertStmt.run(targetNodeId, name, hw, fw, ip, mac, gateway, rssi, uptime, heap, nowEpoch, nowStr, channelsJson, nowEpoch, group);
+      insertStmt.run(targetNodeId, name, resolvedHw, resolvedFw, ip, mac, gateway, rssi, uptime, heap, nowEpoch, nowStr, channelsJson, nowEpoch, group);
     }
 
     const stateChanges = [];

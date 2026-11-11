@@ -17,6 +17,22 @@ class NodeManager {
     this.pollInterval = null;
     this.isPollingActive = false;
     this.lastPollEpoch = 0;
+    this.nodeExpanderStatus = new Map(); // nodeId -> { type, detected, address, outputByte, updatedAt }
+    this.nodeAuthMismatch = new Map(); // nodeId -> boolean
+  }
+
+  getNodeExpanderStatus(nodeId) {
+    return this.nodeExpanderStatus.get(nodeId) || null;
+  }
+
+  formatPinName(pin) {
+    const p = Number(pin);
+    if (!Number.isFinite(p)) return `Pin ${pin}`;
+    if (p >= 100 && p <= 107) {
+      return `P${p - 100} (PCF8574 #${p})`;
+    }
+    const dMap = { 5: 'D1', 4: 'D2', 14: 'D5', 12: 'D6', 13: 'D7', 15: 'D8', 0: 'GPIO0', 2: 'GPIO2', 16: 'D0', 1: 'TX', 3: 'RX', 9: 'SD2', 10: 'SD3', 17: 'A0' };
+    return dMap[p] ? `${dMap[p]} (GPIO ${p})` : `GPIO ${p}`;
   }
 
   broadcastNotification(title, message, severity = 'INFO', category = 'SYSTEM', metadata = {}) {
@@ -168,10 +184,27 @@ class NodeManager {
       headers['X-Session-Token'] = this.nodeAuthTokens.get(ip);
     }
 
+    const fetchWithFallback = async (endpoint) => {
+      const r = await fetch(`http://${ip}${endpoint}`, { headers, signal: AbortSignal.timeout(2500) });
+      if (r.status === 401 && headers['Authorization']) {
+        // Retry without stale Basic header (esp-01 /api/status allows discovery / receiverHost without wrong auth)
+        this.nodeAuthMismatch.set(nodeId, true);
+        const rOpen = await fetch(`http://${ip}${endpoint}`, {
+          headers: { 'Accept': 'application/json' },
+          signal: AbortSignal.timeout(2500)
+        });
+        if (!rOpen.ok) throw new Error(`HTTP ${rOpen.status}`);
+        return rOpen.json();
+      }
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      if (endpoint === '/api/status') this.nodeAuthMismatch.delete(nodeId);
+      return r.json();
+    };
+
     // Concurrently fetch GPIO channels and status diagnostics
     const [gpioRes, statusRes] = await Promise.allSettled([
-      fetch(`http://${ip}/api/gpio`, { headers, signal: AbortSignal.timeout(2500) }).then(r => r.json()),
-      fetch(`http://${ip}/api/status`, { headers, signal: AbortSignal.timeout(2500) }).then(r => r.json())
+      fetchWithFallback('/api/gpio'),
+      fetchWithFallback('/api/status')
     ]);
 
     // If both failed, node is unreachable via HTTP
@@ -188,7 +221,7 @@ class NodeManager {
 
     const telemetryPayload = {
       nodeId: nodeId,
-      name: statusData.deviceName || node.name || nodeId,
+      name: (node.name && node.name !== nodeId) ? node.name : (statusData.deviceName || node.name || nodeId),
       ip: ip,
       rssi: Number(statusData.rssi) || node.rssi || 0,
       uptimeSec: Number(statusData.uptimeSec) || node.uptime_sec || 0,
@@ -203,6 +236,11 @@ class NodeManager {
     if (statusData.firmwareVersion) telemetryPayload.firmwareVersion = statusData.firmwareVersion;
     if (statusData.mac) telemetryPayload.mac = statusData.mac;
     if (statusData.staGateway) telemetryPayload.gateway = statusData.staGateway;
+    if (statusData.freeSketchSpace !== undefined) telemetryPayload.freeSketchSpace = Number(statusData.freeSketchSpace);
+    if (statusData.sketchSize !== undefined) telemetryPayload.sketchSize = Number(statusData.sketchSize);
+    if (statusData.pcf8574Detected !== undefined) telemetryPayload.pcf8574Detected = Boolean(statusData.pcf8574Detected);
+    if (statusData.pcf8574Address !== undefined) telemetryPayload.pcf8574Address = String(statusData.pcf8574Address);
+    if (statusData.pcf8574Output !== undefined) telemetryPayload.pcf8574Output = Number(statusData.pcf8574Output);
 
     // Process through the central telemetry and notification engine
     await this.processTelemetry(telemetryPayload, ip, 'HTTP_POLL');
@@ -300,10 +338,11 @@ class NodeManager {
     if (upsertRes && Array.isArray(upsertRes.stateChanges)) {
       for (const change of upsertRes.stateChanges) {
         const stateStr = change.newState ? 'ON' : 'OFF';
-        this.db.logAudit(change.newState ? 'PIN_ON' : 'PIN_OFF', nodeId, `Channel ${change.channelId} ('${change.name}', Pin D${change.pin}) switched ${stateStr} on node '${nodeName}' (Hardware sync)`);
+        const pinLabel = this.formatPinName(change.pin);
+        this.db.logAudit(change.newState ? 'PIN_ON' : 'PIN_OFF', nodeId, `Channel ${change.channelId} ('${change.name}', ${pinLabel}) switched ${stateStr} on node '${nodeName}' (Hardware sync)`);
         this.broadcastNotification(
           `Pin Switched ${stateStr}`,
-          `'${change.name}' (Pin D${change.pin}, Ch ${change.channelId}) on '${nodeName}' switched ${stateStr}.`,
+          `'${change.name}' (${pinLabel}, Ch ${change.channelId}) on '${nodeName}' switched ${stateStr}.`,
           'INFO',
           'PIN',
           { nodeId, channelId: change.channelId, state: Boolean(change.newState) }
@@ -354,22 +393,37 @@ class NodeManager {
       }
     }
 
-    // Ingest LittleFS / Flash metrics if present
-    if (data.littlefs_total || data.fs_total || data.flash_size || data.flashSize) {
+    // Track PCF8574T I2C Expander telemetry if present
+    if (data.pcf8574Detected !== undefined || data.pcf8574Address !== undefined) {
+      this.nodeExpanderStatus.set(nodeId, {
+        type: 'PCF8574T',
+        detected: Boolean(data.pcf8574Detected),
+        address: data.pcf8574Address || '0x27',
+        outputByte: data.pcf8574Output !== undefined ? Number(data.pcf8574Output) : 255,
+        updatedAt: Date.now()
+      });
+    }
+
+    // Ingest LittleFS / Flash / Hardware capabilities if present
+    if (data.littlefs_total || data.fs_total || data.flash_size || data.flashSize || data.freeSketchSpace) {
       const fsTotal = Number(data.littlefs_total || data.fs_total) || 0;
       const fsUsed = Number(data.littlefs_used || data.fs_used) || 0;
       const fsFree = Number(data.littlefs_free || data.fs_free) || (fsTotal - fsUsed);
+      const hwModel = data.hardware || data.hardware_type || 'ESP8266';
+      const is1Mb = hwModel.toUpperCase().includes('1MB') || hwModel.toUpperCase().includes('ESP-01');
       this.db.upsertDeviceCapabilities(nodeId, {
-        littlefs_total_bytes: fsTotal,
-        littlefs_used_bytes: fsUsed,
-        littlefs_free_bytes: fsFree,
-        flash_size_bytes: Number(data.flash_size || data.flashSize) || 4194304,
+        littlefs_total_bytes: fsTotal || undefined,
+        littlefs_used_bytes: fsUsed || undefined,
+        littlefs_free_bytes: fsFree || undefined,
+        flash_size_bytes: Number(data.flash_size || data.flashSize) || (is1Mb ? 1048576 : 4194304),
+        max_ota_sketch_size: data.freeSketchSpace ? Number(data.freeSketchSpace) : undefined,
         ram_size_bytes: Number(data.freeHeap || data.free_heap) || 81920,
-        mcu_type: data.hardware || data.hardware_type || 'ESP8266'
+        mcu_type: hwModel
       });
     }
 
     // Live telemetry update broadcast
+    const expanderInfo = this.nodeExpanderStatus.get(nodeId) || null;
     this.broadcast('telemetry_update', {
       node_id: nodeId,
       nodeId: nodeId,
@@ -379,6 +433,7 @@ class NodeManager {
       uptime_sec: data.uptimeSec || data.uptime_sec,
       free_heap: data.freeHeap || data.free_heap,
       channels: data.channels || [],
+      pcf8574: expanderInfo,
       eventType,
       timestamp: data.timestamp
     });
@@ -448,10 +503,11 @@ class NodeManager {
         this.db.logRelayEvent(nodeId, channelId, !nextState, nextState, 'LAN_DIRECT_CMD');
         const relay = this.db.getRelay(nodeId, channelId) || { name: `Channel ${channelId}`, pin: channelId };
         const stateStr = nextState ? 'ON' : 'OFF';
-        this.db.logAudit(nextState ? 'PIN_ON' : 'PIN_OFF', nodeId, `Channel ${channelId} ('${relay.name}', Pin D${relay.pin}) turned ${stateStr} on node '${node.name}' via Central Server`);
+        const pinLabel = this.formatPinName(relay.pin);
+        this.db.logAudit(nextState ? 'PIN_ON' : 'PIN_OFF', nodeId, `Channel ${channelId} ('${relay.name}', ${pinLabel}) turned ${stateStr} on node '${node.name}' via Central Server`);
         this.broadcastNotification(
           `Pin Switched ${stateStr}`,
-          `'${relay.name}' (Pin D${relay.pin}, Ch ${channelId}) on '${node.name}' turned ${stateStr}.`,
+          `'${relay.name}' (${pinLabel}, Ch ${channelId}) on '${node.name}' turned ${stateStr}.`,
           'INFO',
           'PIN',
           { nodeId, channelId, state: nextState }
@@ -463,10 +519,11 @@ class NodeManager {
         this.db.logRelayEvent(nodeId, channelId, !nextState, nextState, 'LAN_DIRECT_TOGGLE');
         const relay = curr || { name: `Channel ${channelId}`, pin: channelId };
         const stateStr = nextState ? 'ON' : 'OFF';
-        this.db.logAudit(nextState ? 'PIN_ON' : 'PIN_OFF', nodeId, `Channel ${channelId} ('${relay.name}', Pin D${relay.pin}) toggled to ${stateStr} on node '${node.name}' via Central Server`);
+        const pinLabel = this.formatPinName(relay.pin);
+        this.db.logAudit(nextState ? 'PIN_ON' : 'PIN_OFF', nodeId, `Channel ${channelId} ('${relay.name}', ${pinLabel}) toggled to ${stateStr} on node '${node.name}' via Central Server`);
         this.broadcastNotification(
           `Pin Switched ${stateStr}`,
-          `'${relay.name}' (Pin D${relay.pin}, Ch ${channelId}) on '${node.name}' toggled to ${stateStr}.`,
+          `'${relay.name}' (${pinLabel}, Ch ${channelId}) on '${node.name}' toggled to ${stateStr}.`,
           'INFO',
           'PIN',
           { nodeId, channelId, state: nextState }
@@ -703,10 +760,13 @@ class NodeManager {
         res.on('end', () => {
           if (res.statusCode >= 200 && res.statusCode < 300) {
             try {
-              const channels = JSON.parse(body);
+              const parsed = JSON.parse(body);
+              const channels = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.channels) ? parsed.channels : null);
               if (Array.isArray(channels)) {
                 const count = this.db.syncNodeRelays(nodeId, channels);
                 this.db.touchNode(nodeId);
+                // Also pull /api/status silently to refresh hardware_type & PCF8574 expander metadata
+                this.pollSingleNode(node).catch(() => {});
                 this.db.logAudit('PINS_SYNCED', nodeId, `Synchronized ${count} GPIO pins directly from node '${node.name}' (${ip})`);
                 this.broadcast('relay_sync', { nodeId, count, channels });
                 resolve({ success: true, count, channels });
@@ -736,26 +796,54 @@ class NodeManager {
     if (!node) return null;
 
     const relays = this.db.getRelays({ node_id: nodeId });
+    const expander = this.nodeExpanderStatus.get(nodeId) || null;
     const hwUpper = (node.hardware_type || node.hardware || '').toUpperCase();
-    const isEsp01 = ['ESP-01', 'ESP01', '1MB'].some(k => hwUpper.includes(k));
+    const isEsp01Pcf = hwUpper.includes('PCF8574') ||
+                       Boolean(expander && expander.detected) ||
+                       relays.some(r => Number(r.pin) >= 100 && Number(r.pin) <= 107);
+    const isEsp01 = !isEsp01Pcf && ['ESP-01', 'ESP01', '1MB'].some(k => hwUpper.includes(k));
 
-    const basePins = isEsp01 ? [
-      { pin: 0, dPin: 'GPIO 0', label: 'GPIO 0 (Pin 5)', safety: 'BOOT_SENSITIVE', bus: 'FLASH / RELAY 1', notes: 'Relay 1 / Flash Pin (must be HIGH on boot)' },
-      { pin: 2, dPin: 'GPIO 2', label: 'GPIO 2 (Pin 3)', safety: 'BOOT_SENSITIVE', bus: 'TXD1 / RELAY 2', notes: 'Relay 2 / TXD1 / Sensor (DHT, DS18B20)' },
-      { pin: 1, dPin: 'TX (GPIO 1)', label: 'TX (GPIO 1)', safety: 'SPECIAL', bus: 'UART TX', notes: 'Serial TX / Alternate GPIO 1' },
-      { pin: 3, dPin: 'RX (GPIO 3)', label: 'RX (GPIO 3)', safety: 'SPECIAL', bus: 'UART RX', notes: 'Serial RX / Alternate GPIO 3' }
-    ] : [
-      { pin: 5, dPin: 'D1', label: 'D1 (GPIO 5)', safety: 'SAFE', bus: 'I2C SCL', notes: 'Safe output, boot-neutral / I2C SCL' },
-      { pin: 4, dPin: 'D2', label: 'D2 (GPIO 4)', safety: 'SAFE', bus: 'I2C SDA', notes: 'Safe output, boot-neutral / I2C SDA' },
-      { pin: 14, dPin: 'D5', label: 'D5 (GPIO 14)', safety: 'SAFE', bus: 'SPI SCK / Sensor', notes: 'Safe output / SPI SCK / DS18B20 / DHT sensor' },
-      { pin: 12, dPin: 'D6', label: 'D6 (GPIO 12)', safety: 'SAFE', bus: 'SPI MISO / Sensor', notes: 'Safe output / SPI MISO / Sensor input' },
-      { pin: 13, dPin: 'D7', label: 'D7 (GPIO 13)', safety: 'SAFE', bus: 'SPI MOSI / Sensor', notes: 'Safe output / SPI MOSI / Sensor input' },
-      { pin: 15, dPin: 'D8', label: 'D8 (GPIO 15)', safety: 'BOOT_SENSITIVE', bus: 'SPI SS', notes: 'Must be LOW on boot (requires external pull-down)' },
-      { pin: 0, dPin: 'D3', label: 'D3 (GPIO 0)', safety: 'BOOT_SENSITIVE', bus: 'FLASH PIN', notes: 'Flash button, must be HIGH on boot' },
-      { pin: 2, dPin: 'D4', label: 'D4 (GPIO 2)', safety: 'BOOT_SENSITIVE', bus: 'TXD1 / LED', notes: 'Internal LED, must be HIGH on boot' },
-      { pin: 16, dPin: 'D0', label: 'D0 (GPIO 16)', safety: 'SPECIAL', bus: 'WAKE PIN', notes: 'Deep-sleep wake, HIGH on boot, no PWM' },
-      { pin: 17, dPin: 'A0', label: 'A0 (ADC0)', safety: 'SENSOR_ONLY', bus: 'ANALOG IN', notes: 'Analog sensor input (0-1.0V / 0-3.3V on NodeMCU)' }
-    ];
+    let basePins;
+    if (isEsp01Pcf) {
+      basePins = [
+        { pin: 100, dPin: 'P0', label: 'P0 (Pin 100)', safety: 'SAFE', bus: 'I2C EXPANDER', notes: 'PCF8574T Expander Pin P0 (Relay 1, Active-Low)' },
+        { pin: 101, dPin: 'P1', label: 'P1 (Pin 101)', safety: 'SAFE', bus: 'I2C EXPANDER', notes: 'PCF8574T Expander Pin P1 (Relay 2, Active-Low)' },
+        { pin: 102, dPin: 'P2', label: 'P2 (Pin 102)', safety: 'SAFE', bus: 'I2C EXPANDER', notes: 'PCF8574T Expander Pin P2 (Relay 3, Active-Low)' },
+        { pin: 103, dPin: 'P3', label: 'P3 (Pin 103)', safety: 'SAFE', bus: 'I2C EXPANDER', notes: 'PCF8574T Expander Pin P3 (Relay 4, Active-Low)' },
+        { pin: 104, dPin: 'P4', label: 'P4 (Pin 104)', safety: 'SAFE', bus: 'I2C EXPANDER', notes: 'PCF8574T Expander Pin P4 (Relay 5, Active-Low)' },
+        { pin: 105, dPin: 'P5', label: 'P5 (Pin 105)', safety: 'SAFE', bus: 'I2C EXPANDER', notes: 'PCF8574T Expander Pin P5 (Relay 6, Active-Low)' },
+        { pin: 106, dPin: 'P6', label: 'P6 (Pin 106)', safety: 'SAFE', bus: 'I2C EXPANDER', notes: 'PCF8574T Expander Pin P6 (Relay 7, Active-Low)' },
+        { pin: 107, dPin: 'P7', label: 'P7 (Pin 107)', safety: 'SAFE', bus: 'I2C EXPANDER', notes: 'PCF8574T Expander Pin P7 (Relay 8, Active-Low)' },
+        { pin: 3,   dPin: 'RX', label: 'RX (GPIO 3)',  safety: 'SPECIAL', bus: 'UART0 RX', notes: 'UART0 RX / Optional native GPIO (usable if Serial disabled)' },
+        { pin: 1,   dPin: 'TX', label: 'TX (GPIO 1)',  safety: 'SPECIAL', bus: 'UART0 TX', notes: 'UART0 TX / Optional native GPIO (HIGH at boot)' },
+        { pin: 0,   dPin: 'GPIO 0 (SDA)', label: 'GPIO 0 (I2C SDA)', safety: 'RESERVED', bus: 'I2C SDA', notes: 'Dedicated I2C SDA line to PCF8574T (4.7k pull-up to 3.3V)' },
+        { pin: 2,   dPin: 'GPIO 2 (SCL)', label: 'GPIO 2 (I2C SCL)', safety: 'RESERVED', bus: 'I2C SCL', notes: 'Dedicated I2C SCL line to PCF8574T / ESP-01S Onboard LED' }
+      ];
+    } else if (isEsp01) {
+      basePins = [
+        { pin: 0, dPin: 'GPIO 0', label: 'GPIO 0 (Pin 5)', safety: 'BOOT_SENSITIVE', bus: 'FLASH / RELAY 1', notes: 'Relay 1 / Flash Pin (must be HIGH on boot)' },
+        { pin: 2, dPin: 'GPIO 2', label: 'GPIO 2 (Pin 3)', safety: 'BOOT_SENSITIVE', bus: 'TXD1 / RELAY 2', notes: 'Relay 2 / TXD1 / Sensor (DHT, DS18B20)' },
+        { pin: 1, dPin: 'TX (GPIO 1)', label: 'TX (GPIO 1)', safety: 'SPECIAL', bus: 'UART TX', notes: 'Serial TX / Alternate GPIO 1' },
+        { pin: 3, dPin: 'RX (GPIO 3)', label: 'RX (GPIO 3)', safety: 'SPECIAL', bus: 'UART RX', notes: 'Serial RX / Alternate GPIO 3' }
+      ];
+    } else {
+      basePins = [
+        { pin: 5,  dPin: 'D1',  label: 'D1 (GPIO 5)',   safety: 'SAFE', bus: 'I2C SCL', notes: 'Safe output, boot-neutral / I2C SCL' },
+        { pin: 4,  dPin: 'D2',  label: 'D2 (GPIO 4)',   safety: 'SAFE', bus: 'I2C SDA', notes: 'Safe output, boot-neutral / I2C SDA' },
+        { pin: 14, dPin: 'D5',  label: 'D5 (GPIO 14)',  safety: 'SAFE', bus: 'SPI SCK / Sensor', notes: 'Safe output / SPI SCK / DS18B20 / DHT sensor' },
+        { pin: 12, dPin: 'D6',  label: 'D6 (GPIO 12)',  safety: 'SAFE', bus: 'SPI MISO / Sensor', notes: 'Safe output / SPI MISO / Sensor input' },
+        { pin: 13, dPin: 'D7',  label: 'D7 (GPIO 13)',  safety: 'SAFE', bus: 'SPI MOSI / Sensor', notes: 'Safe output / SPI MOSI / Sensor input' },
+        { pin: 15, dPin: 'D8',  label: 'D8 (GPIO 15)',  safety: 'BOOT_SENSITIVE', bus: 'SPI SS', notes: 'Must be LOW on boot (requires external pull-down)' },
+        { pin: 0,  dPin: 'D3',  label: 'D3 (GPIO 0)',   safety: 'BOOT_SENSITIVE', bus: 'FLASH PIN', notes: 'Flash button, must be HIGH on boot' },
+        { pin: 2,  dPin: 'D4',  label: 'D4 (GPIO 2)',   safety: 'BOOT_SENSITIVE', bus: 'TXD1 / LED', notes: 'Internal LED, must be HIGH on boot' },
+        { pin: 16, dPin: 'D0',  label: 'D0 (GPIO 16)',  safety: 'SPECIAL', bus: 'WAKE PIN', notes: 'Deep-sleep wake, HIGH on boot, no PWM' },
+        { pin: 3,  dPin: 'RX',  label: 'RX (GPIO 3)',   safety: 'BOOT_SENSITIVE', bus: 'UART0 RX', notes: 'UART0 RX, serial debug input (usable as GPIO)' },
+        { pin: 1,  dPin: 'TX',  label: 'TX (GPIO 1)',   safety: 'BOOT_SENSITIVE', bus: 'UART0 TX', notes: 'UART0 TX, serial debug output (HIGH at boot)' },
+        { pin: 9,  dPin: 'SD2', label: 'SD2 (GPIO 9)',  safety: 'BOOT_SENSITIVE', bus: 'FLASH IO', notes: 'Flash IO SD2 (usable in DIO/DOUT flash mode)' },
+        { pin: 10, dPin: 'SD3', label: 'SD3 (GPIO 10)', safety: 'BOOT_SENSITIVE', bus: 'FLASH IO', notes: 'Flash IO SD3 (usable in DIO/DOUT flash mode)' },
+        { pin: 17, dPin: 'A0',  label: 'A0 (ADC0)',     safety: 'SENSOR_ONLY', bus: 'ANALOG IN', notes: 'Analog sensor input (0-1.0V / 0-3.3V on NodeMCU)' }
+      ];
+    }
 
     const relayByPin = new Map();
     for (const r of relays) {
@@ -780,7 +868,7 @@ class NodeManager {
         pinObj.activeLow = r.active_low !== false;
       } else {
         pinObj.isRelay = false;
-        pinObj.role = bp.safety === 'SENSOR_ONLY' ? 'SENSOR' : 'FREE';
+        pinObj.role = bp.safety === 'SENSOR_ONLY' ? 'SENSOR' : (bp.safety === 'RESERVED' ? 'RESERVED_I2C' : 'FREE');
         pinObj.channelId = null;
         pinObj.relayName = null;
       }
@@ -790,7 +878,10 @@ class NodeManager {
     return {
       nodeId,
       nodeName: node.name,
-      hardware: node.hardware_type || (isEsp01 ? 'ESP8266 ESP-01 / ESP-01S (1MB)' : 'ESP8266 (ESP-12E/F) NodeMCU'),
+      hardware: node.hardware_type || (isEsp01Pcf ? 'ESP8266 ESP-01 + PCF8574T (1MB)' : (isEsp01 ? 'ESP8266 ESP-01 / ESP-01S (1MB)' : 'ESP8266 (ESP-12E/F) NodeMCU')),
+      isPcf8574: isEsp01Pcf,
+      pcf8574: expander,
+      authMismatch: Boolean(this.nodeAuthMismatch.get(nodeId)),
       pins,
       relays,
       totalPins: pins.length,

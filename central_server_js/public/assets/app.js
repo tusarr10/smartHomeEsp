@@ -884,7 +884,18 @@ function renderRoomNodeSections({ activeRoomTab, currentHome, rooms, homeNodes, 
   return html;
 }
 
+function formatPinBadge(pin) {
+  const p = Number(pin);
+  if (!Number.isFinite(p)) return `Pin ${pin}`;
+  if (p >= 100 && p <= 107) {
+    return `PCF8574 P${p - 100} (#${p})`;
+  }
+  const dMap = { 5: 'D1', 4: 'D2', 14: 'D5', 12: 'D6', 13: 'D7', 15: 'D8', 0: 'GPIO0', 2: 'GPIO2', 16: 'D0', 1: 'TX', 3: 'RX', 9: 'SD2', 10: 'SD3', 17: 'A0' };
+  return dMap[p] ? `${dMap[p]} (GPIO ${p})` : `GPIO ${p}`;
+}
+
 function renderNodeCard(n, isUnassigned = false) {
+  const isPcf = (n.hardware_type || '').toUpperCase().includes('PCF8574') || Boolean(n.pcf8574 && n.pcf8574.detected);
   return `
     <div class="node-card">
       <div class="card-header">
@@ -902,6 +913,7 @@ function renderNodeCard(n, isUnassigned = false) {
         ${n.home_name ? `<span class="badge-home">🏡 ${escapeHtml(n.home_name)}</span>` : '<span class="badge-unassigned">⚠️ Unassigned Home</span>'}
         ${n.room_name ? `<span class="badge-room">🚪 ${escapeHtml(n.room_name)}</span>` : '<span class="badge-unassigned">⚠️ No Room</span>'}
         <span class="status-badge" style="font-size: 11px; padding: 2px 6px;">${escapeHtml(n.hardware_type || 'ESP8266')}</span>
+        ${isPcf ? `<span class="status-badge badge-info" style="font-size: 11px; padding: 2px 6px;">🔌 I2C PCF8574T${n.pcf8574 && n.pcf8574.address ? ` (${escapeHtml(n.pcf8574.address)})` : ''}</span>` : ''}
       </div>
 
       <div style="font-size: 12.5px; display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 10px 0;">
@@ -1879,9 +1891,10 @@ async function runDiscoveryScan() {
               ${d.hardware && d.hardware.includes('ESP32') ? '⚡' : '📡'}
             </div>
             <div>
-              <div style="display: flex; align-items: center; gap: 8px;">
+              <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
                 <span style="font-weight: 600; font-size: 14px;">${escapeHtml(nodeName)}</span>
                 ${(d.protected || d.isProtected) ? '<span class="status-badge badge-warning" style="font-size: 11px;">🔒 Protected</span>' : '<span class="status-badge badge-online" style="font-size: 11px;">Open</span>'}
+                ${d.pcf8574Detected ? `<span class="status-badge badge-info" style="font-size: 11px;">🔌 PCF8574T (${escapeHtml(d.pcf8574Address || '0x27')})</span>` : ''}
                 ${isAdded ? '<span class="status-badge badge-info" style="font-size: 11px;">✓ In Fleet</span>' : ''}
               </div>
               <div style="font-size: 12px; color: var(--text-secondary); margin-top: 4px; display: flex; gap: 12px; flex-wrap: wrap;">
@@ -2096,6 +2109,36 @@ async function showNodeSettingsModal(nodeId, activeTab = 'general') {
               </div>
             </div>
 
+            ${(pinCatalog && pinCatalog.authMismatch) ? `
+              <div style="background: rgba(239, 68, 68, 0.12); border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 6px; padding: 8px 12px; margin-bottom: 10px; font-size: 12px; color: #fca5a5;">
+                🔐 <strong>Node Credentials Mismatch (HTTP 401):</strong> Stored Central Server password was rejected by this node. Update it in the <strong>User ID &amp; Password</strong> tab (fresh ESP-01 firmware defaults to <code>admin</code> / <code>admin</code>).
+              </div>
+            ` : ''}
+
+            ${(pinCatalog && (pinCatalog.isPcf8574 || pinCatalog.pcf8574)) ? (
+              pinCatalog.pcf8574?.detected === false ? `
+                <div style="background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.38); border-radius: 6px; padding: 8px 12px; margin-bottom: 12px; font-size: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+                  <div style="color: #fde68a;">
+                    ⚠️ <strong>PCF8574T I2C Chip Not Detected:</strong> Firmware supports PCF8574T (pins 100–107), but no I2C expander replied at <code>0x20–0x27</code> / <code>0x38–0x3F</code>. Check SDA=GPIO 0, SCL=GPIO 2 wiring, or remove native GPIO 0/2 relays to free the I2C bus.
+                  </div>
+                  <div style="color: var(--text-secondary); font-size: 11px;">
+                    Configured Addr: <code>${escapeHtml(pinCatalog.pcf8574?.address || '0x27')}</code> &bull; Output Mask: <code>0x${Number(pinCatalog.pcf8574?.outputByte ?? 255).toString(16).toUpperCase().padStart(2, '0')}</code>
+                  </div>
+                </div>
+              ` : `
+                <div style="background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.3); border-radius: 6px; padding: 8px 12px; margin-bottom: 12px; font-size: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+                  <div>
+                    🔌 <strong>PCF8574T I2C Expander Connected:</strong> Address <code>${escapeHtml(pinCatalog.pcf8574?.address || '0x27')}</code> &bull;
+                    Status: <strong style="color: #34d399;">Detected on I2C</strong> &bull;
+                    Output Mask: <code>0x${Number(pinCatalog.pcf8574?.outputByte ?? 255).toString(16).toUpperCase().padStart(2, '0')}</code>
+                  </div>
+                  <div style="color: var(--text-secondary); font-size: 11px;">
+                    I2C Bus: SDA=GPIO 0, SCL=GPIO 2 (Pins 100–107 = P0–P7)
+                  </div>
+                </div>
+              `
+            ) : ''}
+
             <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px;">
               ${(pinCatalog ? pinCatalog.pins : []).map(p => {
                 let badgeClass = 'badge-info';
@@ -2106,19 +2149,26 @@ async function showNodeSettingsModal(nodeId, activeTab = 'general') {
                 } else if (p.role === 'SENSOR') {
                   badgeClass = 'badge-warning';
                   roleLabel = '🌡️ Sensor Input';
+                } else if (p.role === 'RESERVED_I2C' || p.safety === 'RESERVED') {
+                  badgeClass = 'badge-info';
+                  roleLabel = '🔗 I2C Bus (Reserved)';
                 } else if (p.safety === 'BOOT_SENSITIVE') {
                   badgeClass = 'badge-warning';
                   roleLabel = '⚠️ Free (Boot-Sensitive)';
                 }
+
+                const pinSubLabel = p.pin >= 100 && p.pin <= 107
+                  ? `Virtual Pin ${p.pin}`
+                  : `GPIO ${p.pin}`;
 
                 return `
                   <div style="background: rgba(255,255,255,0.025); border: 1px solid var(--border-color); border-radius: 8px; padding: 10px; display: flex; flex-direction: column; justify-content: space-between; gap: 8px;">
                     <div>
                       <div style="display: flex; justify-content: space-between; align-items: center; gap: 6px;">
                         <div style="font-size: 13px; font-weight: 600; color: var(--text-primary); display: flex; align-items: center; gap: 5px;">
-                          <span>${p.dPin.includes('A0') ? '📈' : (p.isRelay ? '🔌' : '📍')}</span>
+                          <span>${p.dPin.includes('A0') ? '📈' : (p.isRelay ? '🔌' : (p.safety === 'RESERVED' ? '🔗' : '📍'))}</span>
                           <span>${escapeHtml(p.dPin)}</span>
-                          <span style="font-size: 11px; color: var(--text-muted); font-weight: normal;">(GPIO ${p.pin})</span>
+                          <span style="font-size: 11px; color: var(--text-muted); font-weight: normal;">(${pinSubLabel})</span>
                         </div>
                         <span class="status-badge ${badgeClass}" style="font-size: 10px; white-space: nowrap;">
                           ${roleLabel}
@@ -2135,11 +2185,13 @@ async function showNodeSettingsModal(nodeId, activeTab = 'general') {
                           <button class="btn btn-secondary" style="padding: 2px 7px; font-size: 11px;" onclick="showAddRelayModal('${node.node_id}', '${p.channelId}')">✏️ Edit</button>
                           <button class="btn btn-danger" style="padding: 2px 7px; font-size: 11px;" onclick="deleteRelayChannel('${node.node_id}', '${p.channelId}')">🗑️ Remove</button>
                         </div>
+                      ` : (p.safety === 'RESERVED' ? `
+                        <span style="font-size: 11px; color: var(--text-muted);">Dedicated I2C Expander Bus</span>
                       ` : (p.safety !== 'SENSOR_ONLY' ? `
                         <button class="btn btn-primary" style="padding: 2px 8px; font-size: 11px; background: rgba(59, 130, 246, 0.15); border: 1px solid rgba(59, 130, 246, 0.35); color: #93c5fd;" onclick="showAddRelayModal('${node.node_id}', null, ${p.pin})">
                           + Assign Relay
                         </button>
-                      ` : `<span style="font-size: 11px; color: var(--text-muted);">Analog ADC Input</span>`)}
+                      ` : `<span style="font-size: 11px; color: var(--text-muted);">Analog ADC Input</span>`))}
                     </div>
                   </div>
                 `;
@@ -2157,7 +2209,7 @@ async function showNodeSettingsModal(nodeId, activeTab = 'general') {
               <thead>
                 <tr>
                   <th>Channel</th>
-                  <th>GPIO Pin</th>
+                  <th>Pin / Port</th>
                   <th>Relay Name</th>
                   <th>Room</th>
                   <th>Type</th>
@@ -2177,7 +2229,7 @@ async function showNodeSettingsModal(nodeId, activeTab = 'general') {
                 ` : channels.map(c => `
                   <tr>
                     <td><code>Ch ${escapeHtml(c.id || c.channel_id)}</code></td>
-                    <td><span class="status-badge badge-info" style="font-size: 11px;">GPIO ${c.pin}</span></td>
+                    <td><span class="status-badge badge-info" style="font-size: 11px;">${escapeHtml(formatPinBadge(c.pin))}</span></td>
                     <td style="font-weight: 500;">${escapeHtml(c.name || 'Relay')}</td>
                     <td>${escapeHtml(c.room || node.room || 'General')}</td>
                     <td><span style="text-transform: capitalize;">${escapeHtml(c.function || c.type || 'relay')}</span></td>
@@ -2212,6 +2264,173 @@ async function showNodeSettingsModal(nodeId, activeTab = 'general') {
     openModal(html);
   } catch (err) {
     alert("Error loading node settings: " + err.message);
+  }
+}
+
+// Test per-node credentials against live node firmware
+async function testNodeAuth(nodeId) {
+  const btn = document.getElementById("btn-test-auth");
+  const resultBox = document.getElementById("auth-test-result");
+  const authUsername = document.getElementById("setting-auth-user")?.value?.trim() || "admin";
+  const authPassword = document.getElementById("setting-auth-pass")?.value ?? "";
+
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "⏳ Testing...";
+  }
+  if (resultBox) {
+    resultBox.style.padding = "6px 10px";
+    resultBox.style.borderRadius = "6px";
+    resultBox.style.background = "rgba(59, 130, 246, 0.15)";
+    resultBox.style.border = "1px solid rgba(59, 130, 246, 0.35)";
+    resultBox.style.color = "var(--accent-blue)";
+    resultBox.textContent = "Testing connection & credentials against node...";
+  }
+
+  try {
+    const res = await fetch(`${API_BASE}/nodes/${encodeURIComponent(nodeId)}/test-auth`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        auth_username: authUsername,
+        auth_password: authPassword
+      })
+    });
+    const data = await res.json().catch(() => ({}));
+
+    if (res.ok && data.success) {
+      const latencyNote = typeof data.latencyMs === "number" ? ` (${data.latencyMs} ms)` : "";
+      const hwNote = data.hardware ? ` • ${data.hardware}` : "";
+      if (resultBox) {
+        resultBox.style.background = "rgba(16, 185, 129, 0.15)";
+        resultBox.style.border = "1px solid rgba(16, 185, 129, 0.35)";
+        resultBox.style.color = "var(--accent-green)";
+        resultBox.textContent = `✅ ${data.message || "Authenticated successfully"}${latencyNote}${hwNote}`;
+      }
+      if (typeof showToast === "function") {
+        showToast({
+          severity: "SUCCESS",
+          title: "Node Auth Verified",
+          message: `${data.message || "Credentials verified"}${latencyNote}`
+        });
+      }
+    } else {
+      const errMsg = data.error || data.message || `Authentication test failed (HTTP ${res.status})`;
+      if (resultBox) {
+        resultBox.style.background = "rgba(239, 68, 68, 0.15)";
+        resultBox.style.border = "1px solid rgba(239, 68, 68, 0.35)";
+        resultBox.style.color = "var(--accent-red)";
+        resultBox.textContent = `❌ ${errMsg}`;
+      }
+    }
+  } catch (err) {
+    if (resultBox) {
+      resultBox.style.background = "rgba(239, 68, 68, 0.15)";
+      resultBox.style.border = "1px solid rgba(239, 68, 68, 0.35)";
+      resultBox.style.color = "var(--accent-red)";
+      resultBox.textContent = `❌ Request failed: ${err.message}`;
+    }
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "🧪 Test Connection & Authentication";
+    }
+  }
+}
+
+// Save general, network, and authentication settings for a node
+async function saveNodeSettings(nodeId) {
+  const btn = document.getElementById("btn-save-settings");
+  const statusBox = document.getElementById("node-settings-status");
+
+  const name = document.getElementById("setting-name")?.value?.trim() || "";
+  const room = document.getElementById("setting-room")?.value?.trim() || "General";
+  const category = document.getElementById("setting-category")?.value?.trim() || "Controller";
+  const ipAddress = document.getElementById("setting-ip")?.value?.trim() || "";
+  const location = document.getElementById("setting-location")?.value?.trim() || "";
+  const authUsername = document.getElementById("setting-auth-user")?.value?.trim() || "";
+  const authPassword = document.getElementById("setting-auth-pass")?.value ?? "";
+
+  const showStatus = (text, tone) => {
+    if (!statusBox) return;
+    statusBox.style.display = "block";
+    if (tone === "success") {
+      statusBox.style.background = "rgba(16, 185, 129, 0.15)";
+      statusBox.style.border = "1px solid rgba(16, 185, 129, 0.35)";
+      statusBox.style.color = "var(--accent-green)";
+    } else if (tone === "error") {
+      statusBox.style.background = "rgba(239, 68, 68, 0.15)";
+      statusBox.style.border = "1px solid rgba(239, 68, 68, 0.35)";
+      statusBox.style.color = "var(--accent-red)";
+    } else {
+      statusBox.style.background = "rgba(59, 130, 246, 0.15)";
+      statusBox.style.border = "1px solid rgba(59, 130, 246, 0.35)";
+      statusBox.style.color = "var(--accent-blue)";
+    }
+    statusBox.textContent = text;
+  };
+
+  if (!name) {
+    showStatus("❌ Friendly Device Name is required.", "error");
+    return;
+  }
+  if (!ipAddress) {
+    showStatus("❌ LAN IP Address is required.", "error");
+    return;
+  }
+  if (!authUsername) {
+    showStatus("❌ Node User ID / Username is required.", "error");
+    return;
+  }
+
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "⏳ Saving...";
+  }
+  showStatus("Saving node settings...", "info");
+
+  try {
+    const res = await fetch(`${API_BASE}/nodes/${encodeURIComponent(nodeId)}/settings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name,
+        room,
+        category,
+        ip_address: ipAddress,
+        location,
+        auth_username: authUsername,
+        auth_password: authPassword
+      })
+    });
+    const data = await res.json().catch(() => ({}));
+
+    if (res.ok && data.success) {
+      const msg = data.message || `Node '${name}' settings saved successfully.`;
+      showStatus(`✅ ${msg}`, "success");
+      if (typeof showToast === "function") {
+        showToast({
+          severity: "SUCCESS",
+          title: "Settings Saved",
+          message: msg
+        });
+      }
+      if (typeof loadNodes === "function") {
+        loadNodes();
+      }
+      setTimeout(() => {
+        closeModal();
+      }, 600);
+    } else {
+      showStatus(`❌ ${data.error || `Failed to save settings (HTTP ${res.status})`}`, "error");
+    }
+  } catch (err) {
+    showStatus(`❌ Error saving settings: ${err.message}`, "error");
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "💾 Save Settings";
+    }
   }
 }
 
@@ -2314,7 +2533,7 @@ async function showAddRelayModal(nodeId, editChannelId = null, preselectedPin = 
   // Build pin options from hardware catalog
   let pinOptionsHtml = '';
   if (pinCatalog && Array.isArray(pinCatalog.pins)) {
-    pinOptionsHtml = pinCatalog.pins.filter(p => p.safety !== 'SENSOR_ONLY').map(p => {
+    pinOptionsHtml = pinCatalog.pins.filter(p => p.safety !== 'SENSOR_ONLY' && p.safety !== 'RESERVED').map(p => {
       const isSelected = p.pin == pin;
       const isOccupied = p.isRelay && String(p.channelId) !== String(channelId);
       let desc = p.notes;
@@ -2326,7 +2545,7 @@ async function showAddRelayModal(nodeId, editChannelId = null, preselectedPin = 
         desc = '⚠️ FREE (Boot-Sensitive)';
       }
       return `<option value="${p.pin}" ${isSelected ? 'selected' : ''} ${isOccupied ? 'disabled style="color: #64748b;"' : ''}>
-        ${escapeHtml(p.dPin)} - ${desc}
+        ${escapeHtml(p.dPin)} (${p.pin >= 100 && p.pin <= 107 ? `Pin ${p.pin}` : `GPIO ${p.pin}`}) - ${desc}
       </option>`;
     }).join('');
   } else {
@@ -2566,8 +2785,8 @@ function renderRelayCard(r) {
     <div class="relay-card">
       <div class="card-header">
         <div>
-          <div class="card-title">${r.name}</div>
-          <div class="card-meta">${r.node_name} | Pin D${r.pin} (GPIO${r.pin})</div>
+          <div class="card-title">${escapeHtml(r.name)}</div>
+          <div class="card-meta">${escapeHtml(r.node_name)} | ${escapeHtml(formatPinBadge(r.pin))}</div>
         </div>
         <label class="switch">
           <input type="checkbox" id="relay-toggle-${r.node_id}-${r.channel_id}" 
@@ -3596,6 +3815,7 @@ async function showUploadFirmwareModal(preselectedHw = null) {
 
             <optgroup label="⚙️ Standard Hardware Platforms">
               <option value="ESP8266 (ESP-12E/F) NodeMCU">ESP8266 (ESP-12E/F) NodeMCU (4MB Flash)</option>
+              <option value="ESP8266 ESP-01 + PCF8574T (1MB)">ESP8266 ESP-01 + PCF8574T I2C (1MB Flash)</option>
               <option value="ESP8266 ESP-01 / ESP-01S (1MB)">ESP8266 ESP-01 / ESP-01S (1MB Flash)</option>
               <option value="ESP8266 (Generic)">ESP8266 Generic</option>
               <option value="ESP32">ESP32 (WROOM / WROVER)</option>
@@ -3732,7 +3952,7 @@ function onFwFileSelected() {
   const isCustom = customBox && customBox.style.display !== "none";
   const hwVal = isCustom ? (document.getElementById("fw-custom-hardware")?.value || '') : (document.getElementById("fw-hardware")?.value || '');
 
-  if (hwVal.includes("ESP-01") && file.size > 512000) {
+  if ((hwVal.includes("ESP-01") || hwVal.includes("PCF8574")) && file.size > 512000) {
     statusBox.style.display = "block";
     statusBox.style.background = "rgba(245, 158, 11, 0.15)";
     statusBox.style.color = "#fde047";
@@ -6086,6 +6306,9 @@ function refreshActiveMetrics() {
 function getNodeHardwareCategory(node) {
   if (!node) return 'ESP8266-NodeMCU';
   const hw = (node.hardware || node.hardware_type || '').toLowerCase();
+  if (hw.includes('pcf8574')) {
+    return 'ESP-01-PCF8574';
+  }
   if (hw.includes('esp-01') || hw.includes('esp01') || hw.includes('1mb')) {
     return 'ESP-01';
   }
@@ -6101,6 +6324,9 @@ function getNodeHardwareCategory(node) {
 function getFirmwareHardwareCategory(fw) {
   if (!fw) return 'ESP8266-NodeMCU';
   const hw = (fw.hardware_type || fw.hardware || '').toLowerCase();
+  if (hw.includes('pcf8574')) {
+    return 'ESP-01-PCF8574';
+  }
   if (hw.includes('esp-01') || hw.includes('esp01') || hw.includes('1mb')) {
     return 'ESP-01';
   }
@@ -6115,6 +6341,13 @@ function getFirmwareHardwareCategory(fw) {
 
 function getHardwareProfileDetails(cat) {
   switch (cat) {
+    case 'ESP-01-PCF8574':
+      return {
+        key: 'ESP-01-PCF8574',
+        title: 'ESP8266 ESP-01 + PCF8574T (1MB)',
+        badge: '<span class="status-badge" style="background: rgba(56, 189, 248, 0.2); color: #38bdf8; font-weight: 600;">ESP-01 + PCF8574T (8-Ch I2C, 1MB)</span>',
+        uploadHw: 'ESP8266 ESP-01 + PCF8574T (1MB)'
+      };
     case 'ESP-01':
       return {
         key: 'ESP-01',
@@ -6325,6 +6558,13 @@ function renderOtaDeveloperGuide() {
               <td><code>4MB (FS:2MB OTA:~1019KB)</code> or <code>4MB (FS:1MB OTA:~1400KB)</code></td>
               <td>~1,044,480 B (1.0 MB)</td>
               <td><span class="status-badge badge-online">Safe Margin (+1,000 KB)</span></td>
+            </tr>
+            <tr>
+              <td><strong>ESP8266 ESP-01 + PCF8574T</strong></td>
+              <td>1 MB (1,048,576 B)</td>
+              <td><code>1MB (FS:128KB OTA:~440KB)</code> (<code>eagle.flash.1m128.ld</code>)</td>
+              <td>~440,000 B (430 KB)</td>
+              <td><span class="status-badge badge-lts">8-Ch I2C Expander (&lt; 440 KB)</span></td>
             </tr>
             <tr>
               <td><strong>ESP8266 ESP-01 / ESP-01S</strong></td>

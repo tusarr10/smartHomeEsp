@@ -92,7 +92,11 @@ class DiscoveryService {
                   rssi: data.rssi || 0,
                   freeHeap: data.freeHeap || data.free_heap || 0,
                   uptimeSec: data.uptimeSec || data.uptime_sec || 0,
-                  receiverServer: data.receiverServer || ''
+                  receiverServer: data.receiverServer || '',
+                  pcf8574Detected: data.pcf8574Detected !== undefined ? Boolean(data.pcf8574Detected) : undefined,
+                  pcf8574Address: data.pcf8574Address || undefined,
+                  pcf8574Output: data.pcf8574Output !== undefined ? Number(data.pcf8574Output) : undefined,
+                  channelsCount: Array.isArray(data.channels) ? data.channels.length : undefined
                 });
                 return;
               }
