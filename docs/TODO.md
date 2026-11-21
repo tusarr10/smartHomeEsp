@@ -1,6 +1,6 @@
 # SmartHome System Architecture: Changelog, Root Causes & Implementation Guide (TODO.md)
 
-**Generated Date & Time**: `2026-11-10 22:38:00 IST` (UTC +5:30)  
+**Generated Date & Time**: `2026-11-17 23:45:00 IST` (UTC +5:30) (Initial: `2026-11-10 22:38:00 IST`)  
 **Target Hardware Context**: ESP8266 NodeMCU (ESP-12E / ESP-12F, 4MB Flash), ESP-01 (1MB), and Future ESP32 modules.
 
 ---
@@ -322,5 +322,119 @@ The node exposes direct HTTP endpoints for controlling and configuring the 8 PCF
 2. **Web Portal "Invalid Password" on Clean Boot**:
    * *Root Cause*: The chip's flash EEPROM held stale data from previous firmware with a different struct memory offset, causing `_adminUser` to read misaligned bytes.
    * *Fix*: Bumped `CONFIG_MAGIC` to `0xA55C` / `CONFIG_VERSION 2` in `storage_manager.cpp` to force an automatic factory credential refresh on boot, and added an unconditional master fallback for `admin` / `admin` in `auth_manager.cpp`.
+
+---
+
+## 6. Multi-Node SoftAP Collision Prevention: Unique Hardware SSID Suffix
+
+**Generated Date & Time**: `2026-11-17 23:45:00 IST` (UTC +5:30)  
+**Target Hardware Context**: ESP8266 NodeMCU (ESP-12E / ESP-12F, 4MB Flash) & Future Multi-Node Deployments
+
+### 6.1 Problem Audit & Root Cause
+
+#### Symptom:
+When deploying multiple ESP8266 nodes in the same environment (or booting multiple unconfigured nodes simultaneously), every node broadcast the identical SoftAP hotspot name: `SmartHome-NodeMCU` (or `SmartHome-Setup`). On mobile phones and laptops, Wi-Fi networks would either merge into a single unstable entry or show indistinguishable duplicate names, making it impossible to determine which hotspot corresponded to which physical room or device.
+
+#### Root Causes:
+1. **Generic Hardcoded Defaults**:
+   * `esp8266_4mb/src/config.h` defined `#define DEFAULT_AP_SSID "SmartHome-Setup"`.
+   * `WifiManager::WifiManager()` initialized `_config.apSsid = DEFAULT_AP_SSID;`.
+   * The LittleFS filesystem template [`esp8266_4mb/data/config/wifi.json`](file:///e:/projectSmartHome/admincontrol/Portal-Controll-main/esp8266_4mb/data/config/wifi.json) stored `"apSsid": "SmartHome-NodeMCU"`.
+2. **No Hardware Identity Binding**:
+   * Unlike the Central Receiver telemetry (`ReceiverClient::getHardwareNodeId()`) which generated `NODE-<MAC>`, the Wi-Fi subsystem never consulted the silicon OTP eFuse MAC address when forming its default SoftAP SSID.
+3. **Stale Flash Storage Precedence**:
+   * Even if the code default was modified, `WifiManager::loadFromStorage()` blindly accepted whatever string was stored in `/config/wifi.json`, perpetuating the generic `SmartHome-NodeMCU` across reboots.
+
+---
+
+### 6.2 Architectural Solution
+
+Every ESP8266 has a globally unique 48-bit MAC address burned into read-only OTP eFuse registers. We leverage the last 4 characters of the uncoloned MAC address to create a collision-free default SSID format:
+$$\text{SSID} = \text{"SmartHome-NodeMCU-"} + \text{MAC}[-4:]$$
+
+For our detected devices:
+* **Device 1** (`8C:4F:00:57:A6:FA` / `NODE-8C4F0057A6FA`) $\rightarrow$ `SmartHome-NodeMCU-A6FA`
+* **Device 2** (`1C:8F:57:F4:24:7F` / `NODE-1C8F57F4247F`) $\rightarrow$ `SmartHome-NodeMCU-247F`
+* **Device 3** (`BC:DD:C2:23:38:6C` / `NODE-BCDDC223386C`) $\rightarrow$ `SmartHome-NodeMCU-386C`
+
+#### Key Design Decisions:
+1. **Correspondence with Node ID**: The last 4 characters of the SoftAP SSID match the last 4 characters of the node's Central Server ID, allowing immediate cross-referencing between the physical board label, server dashboard, and Wi-Fi scanner.
+2. **Seamless Automatic Migration**: `loadFromStorage()` detects whether the stored SSID is empty or one of the legacy generic defaults (`"SmartHome-NodeMCU"`, `"SmartHome-Setup"`, or `DEFAULT_AP_SSID`). If so, it dynamically upgrades to `getDefaultApSsid()`.
+3. **User Preference Preservation**: If a user explicitly names their node in the Web UI (e.g., `"Kitchen-Light-Node"`), this custom string is preserved and never overwritten.
+4. **mDNS & OTA Integration**: `main.cpp` calls `OtaManager::getInstance().begin(WifiManager::getInstance().getApSsid())`, which automatically names the ArduinoOTA and mDNS local hostname to match (e.g., `smarthome-nodemcu-a6fa.local`), preventing mDNS hostname collisions on the local network.
+
+---
+
+### 6.3 Code Modifications & Files Affected
+
+#### 1. [`esp8266_4mb/src/wifi_manager.h`](file:///e:/projectSmartHome/admincontrol/Portal-Controll-main/esp8266_4mb/src/wifi_manager.h)
+* **Change**: Added public static declaration `static String getDefaultApSsid();`.
+* **Reason**: Exposes hardware-derived unique SSID generation as a clean static method accessible across all subsystems without instantiation overhead.
+
+#### 2. [`esp8266_4mb/src/wifi_manager.cpp`](file:///e:/projectSmartHome/admincontrol/Portal-Controll-main/esp8266_4mb/src/wifi_manager.cpp)
+* **Change 1 (Implementation)**:
+  ```cpp
+  String WifiManager::getDefaultApSsid() {
+      String mac = WiFi.macAddress();
+      mac.replace(":", "");
+      mac.toUpperCase();
+      String suffix = "";
+      if (mac.length() >= 4 && !mac.startsWith("000000")) {
+          suffix = mac.substring(mac.length() - 4);
+      } else {
+          char chipBuf[10];
+          snprintf(chipBuf, sizeof(chipBuf), "%06X", (uint32_t)ESP.getChipId());
+          suffix = String(chipBuf);
+          if (suffix.length() > 4) {
+              suffix = suffix.substring(suffix.length() - 4);
+          }
+      }
+      suffix.toUpperCase();
+      return String(F("SmartHome-NodeMCU-")) + suffix;
+  }
+  ```
+* **Change 2 (Constructor)**: Initialized `_config.apSsid = getDefaultApSsid();`.
+* **Change 3 (Migration in `loadFromStorage`)**:
+  ```cpp
+  if (_config.apSsid.length() == 0 || 
+      _config.apSsid.equalsIgnoreCase("SmartHome-NodeMCU") || 
+      _config.apSsid.equalsIgnoreCase("SmartHome-Setup") || 
+      _config.apSsid == DEFAULT_AP_SSID) {
+      _config.apSsid = getDefaultApSsid();
+  }
+  ```
+* **Change 4 (`setApConfig` & `resetWifiCredentials`)**: If SSID is empty or set to legacy default, fallback automatically to `getDefaultApSsid()`.
+
+#### 3. [`esp8266_4mb/data/config/wifi.json`](file:///e:/projectSmartHome/admincontrol/Portal-Controll-main/esp8266_4mb/data/config/wifi.json)
+* **Change**: Set `"apSsid": ""` (empty string).
+* **Reason**: Prevents initial LittleFS image flashing from forcing a static generic SSID into flash storage.
+
+#### 4. [`esp8266_4mb/data/index.html`](file:///e:/projectSmartHome/admincontrol/Portal-Controll-main/esp8266_4mb/data/index.html) & [`esp8266_4mb/data/app.js`](file:///e:/projectSmartHome/admincontrol/Portal-Controll-main/esp8266_4mb/data/app.js)
+* **Change**: Updated input placeholder to `SmartHome-NodeMCU-XXXX` and updated Wi-Fi reset alert message.
+
+---
+
+### 6.4 Porting Guide for Other Modules (ESP-01 / ESP32)
+
+To replicate this feature on any other microcontroller:
+
+1. **For ESP-01 (1MB)**:
+   * Replace the prefix with `"SmartHome-ESP01-"`:
+     ```cpp
+     String mac = WiFi.macAddress();
+     mac.replace(":", "");
+     mac.toUpperCase();
+     String suffix = mac.substring(mac.length() - 4);
+     return "SmartHome-ESP01-" + suffix;
+     ```
+2. **For ESP32 (4MB / 8MB / 16MB)**:
+   * Use `WiFi.macAddress()` or `ESP.getEfuseMac()`:
+     ```cpp
+     uint64_t chipId = ESP.getEfuseMac();
+     char suffix[5];
+     snprintf(suffix, sizeof(suffix), "%04X", (uint16_t)(chipId >> 32));
+     return "SmartHome-ESP32-" + String(suffix);
+     ```
+3. **In `loadFromStorage()`**: Always check for legacy generic names (`equalsIgnoreCase("SmartHome-Setup")`) so existing deployed units upgrade seamlessly on next firmware boot.
 
 

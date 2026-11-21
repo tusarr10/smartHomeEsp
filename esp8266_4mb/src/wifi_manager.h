@@ -68,6 +68,7 @@ public:
 
     String getApSsid() const { return _config.apSsid; }
     void setApConfig(const String& ssid, const String& password);
+    static String getDefaultApSsid();
 
     void getStatusJson(JsonObject& obj);
     void resetWifiCredentials();
