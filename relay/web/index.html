@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SmartHome Edge Broker &bull; MT7986A</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <!-- HEADER -->
+  <header class="header">
+    <div class="header-left">
+      <div class="logo">⚡</div>
+      <div>
+        <h1 class="title">SmartHome <span class="tag">Edge Broker (Go)</span></h1>
+        <div class="subtitle">Jio AX6000 &bull; Filogic 830 / ARM64</div>
+      </div>
+    </div>
+    <div class="header-right">
+      <div id="central-status" class="pill pill-offline">
+        <span class="dot"></span>
+        <span id="central-status-text">Central: Checking...</span>
+      </div>
+      <div id="ws-status" class="pill pill-info">
+        <span>📡</span> <span id="ws-status-text">WS: Connecting...</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- NAVIGATION TABS -->
+  <nav class="nav">
+    <button class="nav-btn active" data-tab="switches">🔌 Switches (<span id="switch-count">0</span>)</button>
+    <button class="nav-btn" data-tab="breaker">⚡ Smart Breaker</button>
+    <button class="nav-btn" data-tab="events">📜 Event Spool</button>
+    <button class="nav-btn" data-tab="system">🖧 Edge Diagnostics</button>
+  </nav>
+
+  <!-- MAIN VIEWS -->
+  <main class="content">
+
+    <!-- 1. SWITCHES VIEW -->
+    <section id="view-switches" class="view active">
+      <div class="view-header">
+        <h2>Live Relays & Channels</h2>
+        <button class="btn" onclick="fetchNodes()">🔄 Refresh</button>
+      </div>
+      <div id="switches-grid" class="grid">
+        <div class="empty">Waiting for ESP8266 node telemetry on port 2000...</div>
+      </div>
+    </section>
+
+    <!-- 2. CIRCUIT BREAKER VIEW -->
+    <section id="view-breaker" class="view">
+      <div class="view-header">
+        <h2>Wi-Fi Smart Circuit Breaker</h2>
+        <button class="btn" onclick="fetchBreaker()">🔄 Refresh</button>
+      </div>
+
+      <div class="breaker-card">
+        <div class="breaker-info">
+          <div class="breaker-icon">⚡</div>
+          <div>
+            <div class="breaker-name" id="breaker-name">Smart Circuit Breaker</div>
+            <div class="breaker-sub" id="breaker-ip">IP: 192.168.1.164 &bull; DP 108 Contact Switch</div>
+          </div>
+        </div>
+        <div class="breaker-ctrl">
+          <span class="breaker-state" id="breaker-state-text">CLOSED (ON)</span>
+          <button id="breaker-trip-btn" class="btn btn-trip" onclick="toggleBreaker()">Trip Breaker</button>
+        </div>
+      </div>
+
+      <div class="metrics-grid">
+        <div class="metric">
+          <div class="m-label">Mains Voltage</div>
+          <div class="m-val" id="val-v">-- <small>V</small></div>
+        </div>
+        <div class="metric">
+          <div class="m-label">Load Current</div>
+          <div class="m-val" id="val-i">-- <small>A</small></div>
+        </div>
+        <div class="metric">
+          <div class="m-label">Active Power</div>
+          <div class="m-val" id="val-p">-- <small>W</small></div>
+        </div>
+        <div class="metric">
+          <div class="m-label">Total Energy</div>
+          <div class="m-val" id="val-e">-- <small>kWh</small></div>
+        </div>
+        <div class="metric">
+          <div class="m-label">Grid Frequency</div>
+          <div class="m-val" id="val-f">-- <small>Hz</small></div>
+        </div>
+        <div class="metric">
+          <div class="m-label">Internal Temp</div>
+          <div class="m-val" id="val-t">-- <small>°C</small></div>
+        </div>
+        <div class="metric">
+          <div class="m-label">Earth Leakage</div>
+          <div class="m-val" id="val-l">-- <small>mA</small></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 3. EVENT SPOOL VIEW -->
+    <section id="view-events" class="view">
+      <div class="view-header">
+        <h2>Bounded Event Spool (Disk)</h2>
+        <button class="btn" onclick="fetchEvents()">🔄 Refresh</button>
+      </div>
+      <div id="events-list" class="events-box">
+        <div class="empty">No events spooled yet.</div>
+      </div>
+    </section>
+
+    <!-- 4. EDGE SYSTEM VIEW -->
+    <section id="view-system" class="view">
+      <div class="view-header">
+        <h2>Edge Broker Diagnostics</h2>
+      </div>
+      <div class="diag-card">
+        <div class="d-item"><span>Platform Architecture:</span> <b>MediaTek MT7986A / ARM64</b></div>
+        <div class="d-item"><span>Runtime:</span> <b>Pure Native Go (Zero Dependencies)</b></div>
+        <div class="d-item"><span>Broker Memory (Allocated):</span> <b id="diag-mem">-- MB</b></div>
+        <div class="d-item"><span>Uptime:</span> <b id="diag-uptime">-- sec</b></div>
+        <div class="d-item"><span>Central Server PC Link:</span> <b id="diag-central">--</b></div>
+        <div class="d-item"><span>Connected ESP Nodes:</span> <b id="diag-nodes">0</b></div>
+      </div>
+    </section>
+
+  </main>
+
+  <div id="toast" class="toast"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

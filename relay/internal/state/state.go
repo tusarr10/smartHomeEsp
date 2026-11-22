@@ -1,0 +1,389 @@
+package state
+
+import (
+	"encoding/json"
+	"fmt"
+	"sync"
+	"time"
+)
+
+type Channel struct {
+	ID        int    `json:"id"`
+	ChannelID int    `json:"channelId,omitempty"`
+	Pin       int    `json:"pin"`
+	Name      string `json:"name"`
+	Room      string `json:"room,omitempty"`
+	Function  string `json:"function,omitempty"`
+	State     bool   `json:"state"`
+}
+
+type Sensor struct {
+	Type  string  `json:"type"`
+	Name  string  `json:"name"`
+	Value float64 `json:"value"`
+	Unit  string  `json:"unit"`
+}
+
+type Node struct {
+	NodeID          string    `json:"nodeId"`
+	NodeName        string    `json:"nodeName"`
+	IP              string    `json:"ip"`
+	MAC             string    `json:"mac,omitempty"`
+	RSSI            int       `json:"rssi,omitempty"`
+	UptimeSec       int64     `json:"uptimeSec"`
+	FreeHeap        int64     `json:"freeHeap,omitempty"`
+	FirmwareVersion string    `json:"firmwareVersion,omitempty"`
+	IsOnline        bool      `json:"isOnline"`
+	Protocol        string    `json:"protocol,omitempty"`
+	LastSeenEpoch   int64     `json:"lastSeenEpoch"`
+	Channels        []Channel `json:"channels"`
+	Sensors         []Sensor  `json:"sensors"`
+}
+
+type Command struct {
+	CommandUUID string `json:"command_uuid"`
+	Action      string `json:"action"` // "SET_STATE", "setState"
+	ChannelID   int    `json:"channelId,omitempty"`
+	Pin         int    `json:"pin,omitempty"`
+	Value       int    `json:"value"`
+	ExpiresAt   int64  `json:"expiresAt,omitempty"`
+}
+
+type BreakerTelemetry struct {
+	Online     bool      `json:"online"`
+	DeviceID   string    `json:"deviceId"`
+	DeviceName string    `json:"deviceName"`
+	IP         string    `json:"ip"`
+	Timestamp  time.Time `json:"timestamp"`
+	Decoded    struct {
+		SwitchState         bool    `json:"switch_state"`
+		VoltageV            float64 `json:"voltage_v"`
+		CurrentA            float64 `json:"current_a"`
+		PowerW              float64 `json:"power_w"`
+		FrequencyHz         float64 `json:"frequency_hz"`
+		TemperatureC        float64 `json:"temperature_c"`
+		LeakageCurrentMA    float64 `json:"leakage_current_ma"`
+		TotalEnergyKWh      float64 `json:"total_energy_kwh"`
+		ChildLock           bool    `json:"child_lock"`
+		PowerFactor         float64 `json:"power_factor"`
+		OvercurrentLimitA   float64 `json:"overcurrent_limit_a"`
+		HighTempThresholdC  float64 `json:"high_temp_threshold_c"`
+		LeakageThresholdMA float64 `json:"leakage_threshold_ma"`
+	} `json:"decoded"`
+}
+
+type EventListener func(eventType string, data interface{})
+
+type StateManager struct {
+	mu           sync.RWMutex
+	nodes        map[string]*Node
+	commandQueue map[string][]*Command
+	breaker      BreakerTelemetry
+	listeners    []EventListener
+}
+
+func NewStateManager() *StateManager {
+	sm := &StateManager{
+		nodes:        make(map[string]*Node),
+		commandQueue: make(map[string][]*Command),
+	}
+	// Initial default breaker reading
+	sm.breaker.Online = false
+	sm.breaker.DeviceID = "NODE-30487DE85D5C"
+	sm.breaker.DeviceName = "Wi-Fi Smart Circuit Breaker"
+	sm.breaker.Decoded.VoltageV = 230.0
+	sm.breaker.Decoded.FrequencyHz = 50.0
+	sm.breaker.Decoded.SwitchState = true
+	return sm
+}
+
+func (sm *StateManager) AddListener(listener EventListener) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.listeners = append(sm.listeners, listener)
+}
+
+func (sm *StateManager) emit(eventType string, data interface{}) {
+	for _, l := range sm.listeners {
+		go l(eventType, data)
+	}
+}
+
+// IngestRawTelemetry parses incoming JSON from ESP8266 or HTTP and updates in-memory state
+func (sm *StateManager) IngestRawTelemetry(raw []byte, clientIP string, protocol string) ([]*Command, error) {
+	var payload struct {
+		NodeID          string `json:"nodeId"`
+		LegacyNodeID    string `json:"node_id"`
+		NodeName        string `json:"nodeName"`
+		Name            string `json:"name"`
+		IP              string `json:"ip"`
+		MAC             string `json:"mac"`
+		RSSI            int    `json:"rssi"`
+		UptimeSec       int64  `json:"uptimeSec"`
+		LegacyUptimeSec int64  `json:"uptime_sec"`
+		FreeHeap        int64  `json:"freeHeap"`
+		FirmwareVersion string `json:"firmwareVersion"`
+		// Both channel formats supported
+		Channels []struct {
+			ID        int    `json:"id"`
+			ChannelID int    `json:"channelId"`
+			Pin       int    `json:"pin"`
+			Name      string `json:"name"`
+			Room      string `json:"room"`
+			Function  string `json:"function"`
+			State     any    `json:"state"` // can be bool, 0/1
+		} `json:"channels"`
+		States []struct {
+			Pin   int `json:"pin"`
+			State int `json:"state"`
+		} `json:"states"`
+		Sensors []Sensor `json:"sensors"`
+	}
+
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("unmarshal telemetry: %w", err)
+	}
+
+	nodeID := payload.NodeID
+	if nodeID == "" {
+		nodeID = payload.LegacyNodeID
+	}
+	if nodeID == "" {
+		return nil, fmt.Errorf("missing nodeId in telemetry")
+	}
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	node, exists := sm.nodes[nodeID]
+	wasOnline := false
+	if exists {
+		wasOnline = node.IsOnline
+	} else {
+		node = &Node{
+			NodeID:   nodeID,
+			Channels: make([]Channel, 0),
+			Sensors:  make([]Sensor, 0),
+		}
+		sm.nodes[nodeID] = node
+	}
+
+	// Update metadata
+	if payload.NodeName != "" {
+		node.NodeName = payload.NodeName
+	} else if payload.Name != "" {
+		node.NodeName = payload.Name
+	} else if node.NodeName == "" {
+		node.NodeName = nodeID
+	}
+
+	if clientIP != "" {
+		node.IP = clientIP
+	} else if payload.IP != "" && payload.IP != "0.0.0.0" {
+		node.IP = payload.IP
+	}
+
+	if payload.MAC != "" {
+		node.MAC = payload.MAC
+	}
+	node.RSSI = payload.RSSI
+
+	uptime := payload.UptimeSec
+	if uptime == 0 {
+		uptime = payload.LegacyUptimeSec
+	}
+	node.UptimeSec = uptime
+	node.FreeHeap = payload.FreeHeap
+	if payload.FirmwareVersion != "" {
+		node.FirmwareVersion = payload.FirmwareVersion
+	}
+	node.Protocol = protocol
+	node.IsOnline = true
+	node.LastSeenEpoch = time.Now().Unix()
+
+	// Update channels (if channels array provided)
+	if len(payload.Channels) > 0 {
+		channels := make([]Channel, len(payload.Channels))
+		for i, c := range payload.Channels {
+			chID := c.ChannelID
+			if chID == 0 {
+				chID = c.ID
+			}
+			if chID == 0 {
+				chID = i + 1
+			}
+
+			chState := false
+			switch v := c.State.(type) {
+			case bool:
+				chState = v
+			case float64:
+				chState = v > 0
+			case int:
+				chState = v > 0
+			}
+
+			name := c.Name
+			if name == "" {
+				name = fmt.Sprintf("Channel %d", chID)
+			}
+
+			channels[i] = Channel{
+				ID:        chID,
+				ChannelID: chID,
+				Pin:       c.Pin,
+				Name:      name,
+				Room:      c.Room,
+				Function:  c.Function,
+				State:     chState,
+			}
+		}
+		node.Channels = channels
+	} else if len(payload.States) > 0 {
+		// Legacy states format: [{pin: 100, state: 1}]
+		channels := make([]Channel, len(payload.States))
+		for i, s := range payload.States {
+			channels[i] = Channel{
+				ID:        i + 1,
+				ChannelID: i + 1,
+				Pin:       s.Pin,
+				Name:      fmt.Sprintf("Pin %d", s.Pin),
+				State:     s.State > 0,
+			}
+		}
+		node.Channels = channels
+	}
+
+	if len(payload.Sensors) > 0 {
+		node.Sensors = payload.Sensors
+	}
+
+	if !wasOnline {
+		sm.emit("node_status", map[string]interface{}{
+			"nodeId":   nodeID,
+			"isOnline": true,
+			"name":     node.NodeName,
+		})
+	}
+
+	// Pop queued commands for this node
+	var pending []*Command
+	if q, ok := sm.commandQueue[nodeID]; ok && len(q) > 0 {
+		pending = q
+		delete(sm.commandQueue, nodeID)
+	}
+
+	return pending, nil
+}
+
+func (sm *StateManager) GetNode(nodeID string) (*Node, bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	n, ok := sm.nodes[nodeID]
+	if !ok {
+		return nil, false
+	}
+	// Return copy
+	copyNode := *n
+	return &copyNode, true
+}
+
+func (sm *StateManager) GetAllNodes() []*Node {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	list := make([]*Node, 0, len(sm.nodes))
+	for _, n := range sm.nodes {
+		cp := *n
+		list = append(list, &cp)
+	}
+	return list
+}
+
+func (sm *StateManager) QueueCommand(nodeID string, cmd *Command) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.commandQueue[nodeID] = append(sm.commandQueue[nodeID], cmd)
+}
+
+func (sm *StateManager) SetChannelState(nodeID string, channelID int, state bool) (*Command, error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	node, ok := sm.nodes[nodeID]
+	if !ok {
+		return nil, fmt.Errorf("node %s not found", nodeID)
+	}
+
+	var pin int
+	found := false
+	for i := range node.Channels {
+		if node.Channels[i].ID == channelID || node.Channels[i].ChannelID == channelID {
+			node.Channels[i].State = state
+			pin = node.Channels[i].Pin
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("channel %d not found on node %s", channelID, nodeID)
+	}
+
+	val := 0
+	if state {
+		val = 1
+	}
+
+	cmd := &Command{
+		CommandUUID: fmt.Sprintf("cmd-%d", time.Now().UnixNano()),
+		Action:      "SET_STATE",
+		ChannelID:   channelID,
+		Pin:         pin,
+		Value:       val,
+		ExpiresAt:   time.Now().Unix() + 30,
+	}
+
+	sm.commandQueue[nodeID] = append(sm.commandQueue[nodeID], cmd)
+
+	sm.emit("pin_update", map[string]interface{}{
+		"nodeId":    nodeID,
+		"channelId": channelID,
+		"pin":       pin,
+		"state":     state,
+	})
+
+	return cmd, nil
+}
+
+func (sm *StateManager) UpdateBreaker(b BreakerTelemetry) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.breaker = b
+	sm.emit("breaker_update", b)
+}
+
+func (sm *StateManager) GetBreaker() BreakerTelemetry {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.breaker
+}
+
+func (sm *StateManager) StartOfflineWatcher(timeoutSec int) {
+	ticker := time.NewTicker(5 * time.Second)
+	go func() {
+		for range ticker.C {
+			now := time.Now().Unix()
+			sm.mu.Lock()
+			for nodeID, node := range sm.nodes {
+				if node.IsOnline && now-node.LastSeenEpoch > int64(timeoutSec) {
+					node.IsOnline = false
+					sm.emit("node_status", map[string]interface{}{
+						"nodeId":   nodeID,
+						"isOnline": false,
+						"name":     node.NodeName,
+					})
+				}
+			}
+			sm.mu.Unlock()
+		}
+	}()
+}
