@@ -13,6 +13,7 @@ import (
 
 	"smarthome-edge/internal/config"
 	"smarthome-edge/internal/state"
+	"smarthome-edge/internal/tuya"
 )
 
 type CentralSyncer struct {
@@ -23,6 +24,7 @@ type CentralSyncer struct {
 	isCentralAlive  bool
 	lastPingEpoch   int64
 	activePortalURL string
+	tuyaClient      *tuya.Client
 }
 
 func NewCentralSyncer(cfg *config.Config, sm *state.StateManager) *CentralSyncer {
@@ -30,6 +32,13 @@ func NewCentralSyncer(cfg *config.Config, sm *state.StateManager) *CentralSyncer
 	if portalURL == "" {
 		portalURL = "http://192.168.1.10:8085"
 	}
+
+	var tc *tuya.Client
+	if cfg.Breaker.DirectIP != "" && cfg.Breaker.DeviceID != "" && cfg.Breaker.LocalKey != "" {
+		tc = tuya.NewClient(cfg.Breaker.DirectIP, cfg.Breaker.DeviceID, cfg.Breaker.LocalKey)
+		log.Printf("[Central Syncer] Initialized Native Tuya v3.5 Direct Socket Client for %s (%s)", cfg.Breaker.DirectIP, cfg.Breaker.DeviceID)
+	}
+
 	return &CentralSyncer{
 		cfg: cfg,
 		sm:  sm,
@@ -37,6 +46,7 @@ func NewCentralSyncer(cfg *config.Config, sm *state.StateManager) *CentralSyncer
 			Timeout: time.Duration(cfg.Central.TimeoutMS) * time.Millisecond,
 		},
 		activePortalURL: portalURL,
+		tuyaClient:      tc,
 	}
 }
 
@@ -134,7 +144,6 @@ func (s *CentralSyncer) ForwardTelemetry(raw []byte) {
 			Commands []*state.Command `json:"commands"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&responseData); err == nil {
-			// If Central Server queued commands, forward them to the local node queue
 			if len(responseData.Commands) > 0 {
 				var targetNodeID struct {
 					NodeID string `json:"nodeId"`
@@ -166,6 +175,22 @@ func (s *CentralSyncer) breakerPollLoop() {
 }
 
 func (s *CentralSyncer) pollBreaker() {
+	// PRIMARY: Direct native Go TCP socket connection (Tuya protocol v3.5)
+	s.mu.RLock()
+	tc := s.tuyaClient
+	s.mu.RUnlock()
+
+	if tc != nil {
+		data, err := tc.QueryStatus()
+		if err == nil {
+			s.sm.UpdateBreaker(data)
+			return
+		}
+		// Direct query failed; log and fall through to fallback options
+		// log.Printf("[Central Syncer] Direct Tuya socket poll: %v (trying fallback)", err)
+	}
+
+	// SECONDARY FALLBACK: HTTP Portal / Central Server
 	currentPortal := s.getActivePortalURL()
 	candidates := []string{
 		currentPortal,
@@ -244,6 +269,27 @@ func (s *CentralSyncer) pollBreaker() {
 }
 
 func (s *CentralSyncer) SetBreakerDP(dp string, val interface{}) error {
+	// PRIMARY: Direct native Go TCP socket connection
+	s.mu.RLock()
+	tc := s.tuyaClient
+	s.mu.RUnlock()
+
+	if tc != nil {
+		err := tc.SetDP(dp, val)
+		if err == nil {
+			cur := s.sm.GetBreaker()
+			if cur.Reading.DPS == nil {
+				cur.Reading.DPS = make(map[string]interface{})
+			}
+			cur.Reading.DPS[dp] = val
+			applyDecodedDP(&cur, dp, val)
+			s.sm.UpdateBreaker(cur)
+			return nil
+		}
+		log.Printf("[Central Syncer] Direct Tuya SetDP(%s) error: %v (falling back to portal)", dp, err)
+	}
+
+	// FALLBACK: HTTP Portal
 	portalURL := s.getActivePortalURL()
 	endpoint := fmt.Sprintf("%s/api/control", strings.TrimRight(portalURL, "/"))
 
@@ -255,65 +301,17 @@ func (s *CentralSyncer) SetBreakerDP(dp string, val interface{}) error {
 	b, _ := json.Marshal(payload)
 	resp, err := s.httpClient.Post(endpoint, "application/json", bytes.NewReader(b))
 	if err != nil {
-		return fmt.Errorf("failed to reach breaker portal at %s: %w", portalURL, err)
+		return fmt.Errorf("failed to control breaker via direct socket or portal: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		// Optimistic update of local state
 		cur := s.sm.GetBreaker()
 		if cur.Reading.DPS == nil {
 			cur.Reading.DPS = make(map[string]interface{})
 		}
 		cur.Reading.DPS[dp] = val
-
-		switch dp {
-		case "108":
-			if bVal, ok := val.(bool); ok {
-				cur.Reading.Decoded.SwitchState = bVal
-			}
-		case "40":
-			if bVal, ok := val.(bool); ok {
-				cur.Reading.Decoded.ChildLock = bVal
-			}
-		case "38":
-			if sVal, ok := val.(string); ok {
-				cur.Reading.Decoded.PowerOnBehavior = sVal
-			}
-		case "115":
-			if fVal, ok := toFloat(val); ok {
-				cur.Reading.Decoded.HighTempThresholdC = fVal
-			}
-		case "121":
-			if fVal, ok := toFloat(val); ok {
-				cur.Reading.Decoded.OvervoltageThreshold = fVal
-			}
-		case "132":
-			if fVal, ok := toFloat(val); ok {
-				cur.Reading.Decoded.LeakageThresholdMA = fVal
-			}
-		case "127":
-			if bVal, ok := val.(bool); ok {
-				cur.Reading.Decoded.LeakageMasterEnabled = bVal
-			}
-		case "130":
-			if fVal, ok := toFloat(val); ok {
-				cur.Reading.Decoded.OvercurrentLimitA = fVal
-			}
-		case "119":
-			if bVal, ok := val.(bool); ok {
-				cur.Reading.Decoded.AutoRecloseEnabled = bVal
-			}
-		case "118":
-			if fVal, ok := toFloat(val); ok {
-				cur.Reading.Decoded.AutoRecloseDelayS = fVal
-			}
-		case "133":
-			if fVal, ok := toFloat(val); ok {
-				cur.Reading.Decoded.AutoRecloseAttempts = fVal
-			}
-		}
-
+		applyDecodedDP(&cur, dp, val)
 		s.sm.UpdateBreaker(cur)
 		return nil
 	}
@@ -321,30 +319,56 @@ func (s *CentralSyncer) SetBreakerDP(dp string, val interface{}) error {
 	return fmt.Errorf("breaker portal returned status %d", resp.StatusCode)
 }
 
-func (s *CentralSyncer) SetBreakerToggle(targetState bool) error {
-	portalURL := s.getActivePortalURL()
-	endpoint := fmt.Sprintf("%s/api/toggle", strings.TrimRight(portalURL, "/"))
-	payload := map[string]interface{}{
-		"state": targetState,
-	}
-
-	b, _ := json.Marshal(payload)
-	resp, err := s.httpClient.Post(endpoint, "application/json", bytes.NewReader(b))
-	if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		_ = resp.Body.Close()
-		cur := s.sm.GetBreaker()
-		cur.Reading.Decoded.SwitchState = targetState
-		if cur.Reading.DPS != nil {
-			cur.Reading.DPS["108"] = targetState
+func applyDecodedDP(cur *state.BreakerData, dp string, val interface{}) {
+	switch dp {
+	case "108":
+		if bVal, ok := val.(bool); ok {
+			cur.Reading.Decoded.SwitchState = bVal
 		}
-		s.sm.UpdateBreaker(cur)
-		return nil
+	case "40":
+		if bVal, ok := val.(bool); ok {
+			cur.Reading.Decoded.ChildLock = bVal
+		}
+	case "38":
+		if sVal, ok := val.(string); ok {
+			cur.Reading.Decoded.PowerOnBehavior = sVal
+		}
+	case "115":
+		if fVal, ok := toFloat(val); ok {
+			cur.Reading.Decoded.HighTempThresholdC = fVal
+		}
+	case "121":
+		if fVal, ok := toFloat(val); ok {
+			cur.Reading.Decoded.OvervoltageThreshold = fVal
+		}
+	case "132":
+		if fVal, ok := toFloat(val); ok {
+			cur.Reading.Decoded.LeakageThresholdMA = fVal
+		}
+	case "127":
+		if bVal, ok := val.(bool); ok {
+			cur.Reading.Decoded.LeakageMasterEnabled = bVal
+		}
+	case "130":
+		if fVal, ok := toFloat(val); ok {
+			cur.Reading.Decoded.OvercurrentLimitA = fVal
+		}
+	case "119":
+		if bVal, ok := val.(bool); ok {
+			cur.Reading.Decoded.AutoRecloseEnabled = bVal
+		}
+	case "118":
+		if fVal, ok := toFloat(val); ok {
+			cur.Reading.Decoded.AutoRecloseDelayS = fVal
+		}
+	case "133":
+		if fVal, ok := toFloat(val); ok {
+			cur.Reading.Decoded.AutoRecloseAttempts = fVal
+		}
 	}
-	if resp != nil {
-		_ = resp.Body.Close()
-	}
+}
 
-	// Fallback to SetBreakerDP 108
+func (s *CentralSyncer) SetBreakerToggle(targetState bool) error {
 	return s.SetBreakerDP("108", targetState)
 }
 
@@ -353,49 +377,74 @@ func (s *CentralSyncer) SetBreakerSwitch(state bool) error {
 }
 
 func (s *CentralSyncer) RefreshBreaker() error {
-	portalURL := s.getActivePortalURL()
-	endpoint := fmt.Sprintf("%s/api/refresh", strings.TrimRight(portalURL, "/"))
-	resp, err := s.httpClient.Post(endpoint, "application/json", nil)
-	if err == nil && resp != nil {
-		_ = resp.Body.Close()
-	}
 	s.pollBreaker()
 	return nil
 }
 
 func (s *CentralSyncer) TestBreakerSocket(payload map[string]interface{}) (map[string]interface{}, error) {
-	portalURL := s.getActivePortalURL()
-	endpoint := fmt.Sprintf("%s/api/test-connection", strings.TrimRight(portalURL, "/"))
-	b, _ := json.Marshal(payload)
-	resp, err := s.httpClient.Post(endpoint, "application/json", bytes.NewReader(b))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	testIP := s.cfg.Breaker.DirectIP
+	testID := s.cfg.Breaker.DeviceID
+	testKey := s.cfg.Breaker.LocalKey
 
-	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
+	if ip, ok := payload["ip"].(string); ok && ip != "" {
+		testIP = ip
 	}
-	return result, nil
+	if id, ok := payload["device_id"].(string); ok && id != "" {
+		testID = id
+	} else if id, ok := payload["id"].(string); ok && id != "" {
+		testID = id
+	}
+	if key, ok := payload["local_key"].(string); ok && key != "" {
+		testKey = key
+	}
+
+	if testIP == "" || testID == "" || testKey == "" {
+		return map[string]interface{}{
+			"online": false,
+			"error":  "Missing IP, Device ID, or Local Key for Tuya direct socket test",
+		}, nil
+	}
+
+	testClient := tuya.NewClient(testIP, testID, testKey)
+	defer testClient.Close()
+
+	res, err := testClient.TestConnection()
+	if err != nil {
+		return map[string]interface{}{
+			"online": false,
+			"error":  err.Error(),
+		}, nil
+	}
+	return res, nil
 }
 
 func (s *CentralSyncer) SaveBreakerConfig(payload map[string]interface{}) (map[string]interface{}, error) {
-	portalURL := s.getActivePortalURL()
-	endpoint := fmt.Sprintf("%s/api/config", strings.TrimRight(portalURL, "/"))
-	b, _ := json.Marshal(payload)
-	resp, err := s.httpClient.Post(endpoint, "application/json", bytes.NewReader(b))
-	if err != nil {
-		return nil, err
+	s.mu.Lock()
+	if ip, ok := payload["ip"].(string); ok && ip != "" {
+		s.cfg.Breaker.DirectIP = ip
 	}
-	defer resp.Body.Close()
+	if id, ok := payload["device_id"].(string); ok && id != "" {
+		s.cfg.Breaker.DeviceID = id
+	} else if id, ok := payload["id"].(string); ok && id != "" {
+		s.cfg.Breaker.DeviceID = id
+	}
+	if key, ok := payload["local_key"].(string); ok && key != "" {
+		s.cfg.Breaker.LocalKey = key
+	}
 
-	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
+	if s.tuyaClient != nil {
+		s.tuyaClient.UpdateConfig(s.cfg.Breaker.DirectIP, s.cfg.Breaker.DeviceID, s.cfg.Breaker.LocalKey)
+	} else if s.cfg.Breaker.DirectIP != "" && s.cfg.Breaker.DeviceID != "" && s.cfg.Breaker.LocalKey != "" {
+		s.tuyaClient = tuya.NewClient(s.cfg.Breaker.DirectIP, s.cfg.Breaker.DeviceID, s.cfg.Breaker.LocalKey)
 	}
-	s.pollBreaker()
-	return result, nil
+	s.mu.Unlock()
+
+	go s.pollBreaker()
+
+	return map[string]interface{}{
+		"success": true,
+		"message": "Direct Tuya breaker config updated successfully",
+	}, nil
 }
 
 func toFloat(v interface{}) (float64, bool) {

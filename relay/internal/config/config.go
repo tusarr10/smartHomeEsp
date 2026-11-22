@@ -51,6 +51,8 @@ type BreakerConfig struct {
 	Enabled             bool   `json:"enabled"`
 	PortalURL           string `json:"portal_url"`
 	DirectIP            string `json:"direct_ip"`
+	DeviceID            string `json:"device_id"`
+	LocalKey            string `json:"local_key"`
 	PollIntervalSeconds int    `json:"poll_interval_seconds"`
 	NodeID              string `json:"node_id"`
 }
@@ -88,6 +90,8 @@ func DefaultConfig() *Config {
 			Enabled:             true,
 			PortalURL:           "http://192.168.1.10:8085",
 			DirectIP:            "192.168.1.25",
+			DeviceID:            "d705ffaccaf4d0f1b1addg",
+			LocalKey:            "gp->j2_X[Bx=.ovC",
 			PollIntervalSeconds: 3,
 			NodeID:              "NODE-30487DE85D5C",
 		},

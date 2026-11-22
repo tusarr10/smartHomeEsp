@@ -1,6 +1,6 @@
 {
   "server": {
-    "tcp_listen": "0.0.0.0:2001",
+    "tcp_listen": "0.0.0.0:2000",
     "http_listen": "0.0.0.0:9200",
     "metrics_listen": "127.0.0.1:9201"
   },
@@ -30,6 +30,8 @@
     "enabled": true,
     "portal_url": "http://192.168.1.10:8085",
     "direct_ip": "192.168.1.25",
+    "device_id": "d705ffaccaf4d0f1b1addg",
+    "local_key": "gp->j2_X[Bx=.ovC",
     "poll_interval_seconds": 3,
     "node_id": "NODE-30487DE85D5C"
   }
