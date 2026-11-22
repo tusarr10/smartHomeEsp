@@ -8,6 +8,7 @@ const { WebSocketServer } = require('ws');
 const FleetDatabase = require('./src/database');
 const NodeManager = require('./src/nodeManager');
 const TcpTelemetryServer = require('./src/tcpServer');
+const TuyaBreakerBridge = require('./src/tuyaBridge');
 const createV1Router = require('./src/routes/v1Router');
 const createLegacyRouter = require('./src/routes/legacyRouter');
 
@@ -35,10 +36,12 @@ if (fs.existsSync(configPath)) {
   }
 }
 
-// 2. Initialize Database & Node Manager
+// 2. Initialize Database, Node Manager & Tuya Breaker Bridge
 const dbPath = path.join(__dirname, 'data', 'fleet.db');
 const db = new FleetDatabase(dbPath);
 const nodeManager = new NodeManager(db, config);
+const tuyaBridge = new TuyaBreakerBridge(nodeManager, db, config);
+tuyaBridge.start();
 
 // 3. Initialize Express App & HTTP Server
 const app = express();
@@ -117,6 +120,7 @@ server.listen(httpPort, host, () => {
   console.log(` [TCP Telemetry]  Listening on ${host}:${config.tcp_port || 2000}`);
   console.log(` [HTTP Dashboard] http://localhost:${httpPort} (Listening on ${host}:${httpPort})`);
   console.log(` [WebSocket Live] ws://localhost:${httpPort}/api/v1/ws`);
+  console.log(` [Tuya Breaker]  Integrated on LAN (${tuyaBridge.macAddress} / ${tuyaBridge.defaultIp})`);
   console.log(` [Offline Watch]  Timeout set to ${config.offline_timeout_sec || 30}s`);
   console.log('='.repeat(70));
   console.log(' >> Ready for ESP8266 fleet telemetry & control.\n');
@@ -125,6 +129,7 @@ server.listen(httpPort, host, () => {
 // Graceful Shutdown
 function shutdown() {
   console.log('\n[Server] Graceful shutdown initiated...');
+  tuyaBridge.stop();
   nodeManager.stopOfflineWatcher();
   tcpServer.stop();
   server.close(() => {

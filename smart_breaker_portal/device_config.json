@@ -1,0 +1,12 @@
+{
+  "device_name": "Wi-Fi Smart Circuit Breaker (Main)",
+  "device_id": "d705ffaccaf4d0f1b1addg",
+  "local_key": "gp->j2_X[Bx=.ovC",
+  "ip_address": "192.168.1.25",
+  "protocol_version": 3.5,
+  "product_name": "WiFi\u591a\u529f\u80fd\u8fc7\u6b20\u538b\u4fdd\u62a4\u5668-A1H\u9ed8\u8ba4PID (B-B1-M)",
+  "mac_address": "30:48:7d:e8:5d:5c",
+  "model_sn": "B-B1-M",
+  "poll_interval_sec": 3,
+  "simulation_mode": false
+}

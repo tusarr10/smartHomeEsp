@@ -174,6 +174,13 @@ class NodeManager {
     const ip = node.ip || node.ip_address;
     const nodeId = node.node_id;
 
+    if (nodeId === 'NODE-30487DE85D5C' || (node?.hardware_type && node.hardware_type.includes('Tuya'))) {
+      if (this.tuyaBridge) {
+        await this.tuyaBridge.poll();
+      }
+      return { success: true };
+    }
+
     const user = node.auth_username || this.config.node_auth?.username || 'admin';
     const pass = node.auth_password || this.config.node_auth?.password || 'admin';
     const headers = { 'Accept': 'application/json' };
@@ -485,6 +492,59 @@ class NodeManager {
         'RESTART',
         { nodeId, ip }
       );
+    }
+
+    // Check if target is Tuya Smart Breaker
+    const isTuyaBreaker = nodeId === 'NODE-30487DE85D5C' || (node?.hardware_type && node.hardware_type.includes('Tuya'));
+    if (isTuyaBreaker && this.tuyaBridge) {
+      let targetState = true;
+      if (action === 'setState') {
+        targetState = Boolean(command.state);
+      } else if (action === 'toggle') {
+        const curr = this.db.getRelay(nodeId, channelId);
+        targetState = curr ? !curr.current_state : false;
+      }
+
+      const res = await this.tuyaBridge.toggleSwitch(targetState);
+      if (res && res.success) {
+        this.db.updateRelayState(nodeId, channelId, targetState);
+        this.db.logRelayEvent(nodeId, channelId, !targetState, targetState, 'TUYA_LAN_CMD');
+        const stateStr = targetState ? 'ON' : 'OFF';
+        this.db.logAudit(targetState ? 'PIN_ON' : 'PIN_OFF', nodeId, `Main Breaker switched ${stateStr} via Central Server`);
+        this.broadcastNotification(
+          `Breaker Switched ${stateStr}`,
+          `Main Circuit Breaker on '${node.name}' turned ${stateStr}.`,
+          targetState ? 'SUCCESS' : 'WARNING',
+          'PIN',
+          { nodeId, channelId, state: targetState }
+        );
+        this.broadcast('relay_state_confirmed', {
+          node_id: nodeId,
+          channel_id: channelId,
+          new_state: targetState
+        });
+        this.db.markCommandAcknowledged(commandUuid, {
+          success: true,
+          delivery: 'tuya_lan',
+          message: `Breaker switched ${stateStr} via Tuya LAN`
+        });
+        this.broadcast('command_executed', {
+          command_uuid: commandUuid,
+          node_id: nodeId,
+          nodeId: nodeId,
+          channel_id: channelId,
+          command,
+          delivery: 'tuya_lan'
+        });
+        return {
+          success: true,
+          command_uuid: commandUuid,
+          delivery: 'tuya_lan',
+          message: `Breaker switched ${stateStr} via Tuya LAN`
+        };
+      } else {
+        return { success: false, error: res?.error || 'Tuya LAN command failed' };
+      }
     }
 
     let directOk = false;
@@ -1026,7 +1086,7 @@ class NodeManager {
         off: stats.totalChannels - stats.activeChannels
       },
       sensors: {
-        total: 0
+        total: (this.db.getSensors ? this.db.getSensors().length : 0)
       },
       alerts: {
         unread

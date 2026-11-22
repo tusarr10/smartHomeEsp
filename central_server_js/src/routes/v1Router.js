@@ -1803,6 +1803,149 @@ function createV1Router(nodeManager, db) {
     });
   });
 
+  // ==========================================
+  // === SMART CIRCUIT BREAKER (TUYA LAN) ===
+  // ==========================================
+
+  router.get('/breaker/status', authenticateUser(db), (req, res) => {
+    if (!nodeManager.tuyaBridge) {
+      return res.status(503).json({ success: false, error: 'Tuya Breaker Bridge not active' });
+    }
+    const status = nodeManager.tuyaBridge.getStatus();
+    res.json({ success: true, ...status });
+  });
+
+  router.post('/breaker/toggle', requirePermission(db, 'devices:control'), async (req, res) => {
+    if (!nodeManager.tuyaBridge) {
+      return res.status(503).json({ success: false, error: 'Tuya Breaker Bridge not active' });
+    }
+    const { state } = req.body;
+    const result = await nodeManager.tuyaBridge.toggleSwitch(state);
+    res.json(result);
+  });
+
+  router.post('/breaker/control', requirePermission(db, 'devices:control'), async (req, res) => {
+    if (!nodeManager.tuyaBridge) {
+      return res.status(503).json({ success: false, error: 'Tuya Breaker Bridge not active' });
+    }
+    const { dp, value } = req.body;
+    if (dp === undefined || value === undefined) {
+      return res.status(400).json({ success: false, error: 'Missing dp or value' });
+    }
+    const result = await nodeManager.tuyaBridge.setDp(dp, value);
+    res.json(result);
+  });
+
+  router.post('/breaker/refresh', authenticateUser(db), async (req, res) => {
+    if (!nodeManager.tuyaBridge) {
+      return res.status(503).json({ success: false, error: 'Tuya Breaker Bridge not active' });
+    }
+    const result = await nodeManager.tuyaBridge.refresh();
+    res.json(result);
+  });
+
+  router.get('/breaker/history', authenticateUser(db), async (req, res) => {
+    if (!nodeManager.tuyaBridge) {
+      return res.status(503).json({ success: false, error: 'Tuya Breaker Bridge not active' });
+    }
+    const result = await nodeManager.tuyaBridge.getHistory();
+    res.json(result);
+  });
+
+  router.get('/breaker/serial-logs', authenticateUser(db), (req, res) => {
+    if (!nodeManager.tuyaBridge) {
+      return res.status(503).json({ success: false, error: 'Tuya Breaker Bridge not active' });
+    }
+    const limit = Number(req.query.limit) || 150;
+    res.json({ success: true, logs: nodeManager.tuyaBridge.getSerialLogs(limit) });
+  });
+
+  router.post('/breaker/serial-command', requirePermission(db, 'devices:control'), async (req, res) => {
+    if (!nodeManager.tuyaBridge) {
+      return res.status(503).json({ success: false, error: 'Tuya Breaker Bridge not active' });
+    }
+    const { command } = req.body;
+    if (!command) return res.status(400).json({ success: false, error: 'Missing command' });
+    const result = await nodeManager.tuyaBridge.executeSerialCommand(command);
+    res.json(result);
+  });
+
+  router.post('/breaker/serial-clear', requirePermission(db, 'devices:control'), (req, res) => {
+    if (!nodeManager.tuyaBridge) {
+      return res.status(503).json({ success: false, error: 'Tuya Breaker Bridge not active' });
+    }
+    res.json(nodeManager.tuyaBridge.clearSerialLogs());
+  });
+
+  // --- MULTI-DEVICE & NETWORK CONFIGURATION ENDPOINTS ---
+  router.get('/breaker/devices', authenticateUser(db), (req, res) => {
+    if (!nodeManager.tuyaBridge) return res.status(503).json({ success: false, error: 'Bridge inactive' });
+    res.json({ success: true, ...nodeManager.tuyaBridge.getDevices() });
+  });
+
+  router.post('/breaker/devices', requirePermission(db, 'devices:control'), async (req, res) => {
+    if (!nodeManager.tuyaBridge) return res.status(503).json({ success: false, error: 'Bridge inactive' });
+    try {
+      const result = await nodeManager.tuyaBridge.saveDevice(req.body);
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  router.post('/breaker/devices/select', requirePermission(db, 'devices:control'), async (req, res) => {
+    if (!nodeManager.tuyaBridge) return res.status(503).json({ success: false, error: 'Bridge inactive' });
+    const { id } = req.body;
+    if (!id) return res.status(400).json({ success: false, error: 'Missing device id' });
+    try {
+      const result = await nodeManager.tuyaBridge.setActiveDevice(id);
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  router.delete('/breaker/devices/:id', requirePermission(db, 'devices:control'), async (req, res) => {
+    if (!nodeManager.tuyaBridge) return res.status(503).json({ success: false, error: 'Bridge inactive' });
+    try {
+      const result = await nodeManager.tuyaBridge.deleteDevice(req.params.id);
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
+  router.post('/breaker/devices/test', authenticateUser(db), async (req, res) => {
+    if (!nodeManager.tuyaBridge) return res.status(503).json({ success: false, error: 'Bridge inactive' });
+    const result = await nodeManager.tuyaBridge.testConnection(req.body);
+    res.json(result);
+  });
+
+  router.post('/breaker/devices/scan', authenticateUser(db), async (req, res) => {
+    if (!nodeManager.tuyaBridge) return res.status(503).json({ success: false, error: 'Bridge inactive' });
+    const result = await nodeManager.tuyaBridge.scanLan();
+    res.json(result);
+  });
+
+  router.post('/breaker/config', requirePermission(db, 'devices:control'), async (req, res) => {
+    if (!nodeManager.tuyaBridge) return res.status(503).json({ success: false, error: 'Bridge inactive' });
+    try {
+      const active = nodeManager.tuyaBridge.db.getActiveTuyaDevice() || {};
+      const updated = {
+        id: req.body.device_id || req.body.id || active.id || 'd705ffaccaf4d0f1b1addg',
+        name: req.body.device_name || req.body.name || active.name || 'Wi-Fi Smart Circuit Breaker',
+        ip: req.body.ip_address || req.body.ip || active.ip || '192.168.1.25',
+        local_key: req.body.local_key || active.local_key || 'gp->j2_X[Bx=.ovC',
+        protocol_version: req.body.protocol_version !== undefined ? Number(req.body.protocol_version) : (active.protocol_version || 3.5),
+        is_active: 1
+      };
+      const result = await nodeManager.tuyaBridge.saveDevice(updated);
+      res.json({ success: true, config: result.device });
+    } catch (err) {
+      res.status(400).json({ success: false, error: err.message });
+    }
+  });
+
   return router;
 }
 

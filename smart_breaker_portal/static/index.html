@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Smart Circuit Breaker - Local Test Portal</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="container">
+    
+    <!-- Top Header -->
+    <header class="header-bar">
+      <div class="header-left">
+        <div class="device-avatar">⚡</div>
+        <div class="device-info">
+          <h1 id="device-title">Wi-Fi Smart Circuit Breaker <span id="model-badge" class="badge badge-ref">KB-A1H-A</span></h1>
+          <div class="device-sub">
+            <span id="device-ip-label">IP: 192.168.1.164</span> &bull; 
+            <span id="device-id-label">ID: d7298b9bb3bcdd3d26wfpj</span> &bull; 
+            <span id="device-mac-label">MAC: 30:48:7d:e8:5d:5c</span> &bull; 
+            <span>Protocol: v3.5 (Local LAN)</span>
+          </div>
+        </div>
+      </div>
+      <div class="header-actions">
+        <div id="conn-badge" class="badge badge-ref">
+          <span class="pulse-dot"></span>
+          <span id="conn-status-text">Reference Data</span>
+        </div>
+        <button id="refresh-btn" class="btn" title="Poll Device Locally">🔄 Refresh Now</button>
+        <button id="settings-btn" class="btn" title="Device Connection Settings">⚙️ Settings</button>
+      </div>
+    </header>
+
+    <!-- Notification Banner -->
+    <div id="banner-notice" class="banner banner-info">
+      <div id="banner-text">
+        ℹ️ <strong>Local Autonomous Mode:</strong> Running 100% locally with zero cloud dependencies. Real-time metrics and protection thresholds are mapped from your device's raw datapoints.
+      </div>
+      <div style="display: flex; gap: 8px;">
+        <button id="dismiss-banner" class="btn" style="padding: 4px 10px; font-size: 0.75rem;">Dismiss</button>
+      </div>
+    </div>
+
+    <!-- Master Switch Hero Card -->
+    <section class="hero-card">
+      <div class="switch-section">
+        <div class="switch-label-state" id="switch-state-text">CIRCUIT CLOSED (ON)</div>
+        <div class="breaker-switch-container">
+          <button id="breaker-toggle-btn" class="breaker-power-btn state-on" title="Click to Switch Circuit">
+            ⏻
+          </button>
+        </div>
+        <div class="switch-status-desc" id="switch-desc">
+          Main contacts are closed. Mains electricity is flowing safely through the breaker.
+        </div>
+      </div>
+
+      <div class="quick-controls">
+        <div class="control-row">
+          <div class="control-info">
+            <h4>Maintenance Lock (Child Lock)</h4>
+            <p>Forces breaker OFF and prohibits remote closing during repairs</p>
+          </div>
+          <div>
+            <button id="lock-toggle-btn" class="btn">🔓 Unlocked</button>
+          </div>
+        </div>
+
+        <div class="control-row">
+          <div class="control-info">
+            <h4>Power-On Behavior</h4>
+            <p>State restored when AC mains power returns after an outage</p>
+          </div>
+          <div>
+            <select id="power-on-select" style="width: auto;">
+              <option value="memory">Remember Last State (Memory)</option>
+              <option value="0">Always Power OFF</option>
+              <option value="1">Always Power ON</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="control-row">
+          <div class="control-info">
+            <h4>Countdown Auto-Trip / Close</h4>
+            <p>Timer to automatically change breaker state</p>
+          </div>
+          <div style="display: flex; gap: 6px; align-items: center;">
+            <input type="number" id="countdown-val" placeholder="Seconds" style="width: 90px;" min="0" max="86400">
+            <button id="countdown-set-btn" class="btn btn-primary">Start</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Navigation Tabs -->
+    <nav class="tabs-nav">
+      <button class="tab-btn active" data-tab="tab-telemetry">📊 Live Telemetry</button>
+      <button class="tab-btn" data-tab="tab-protection">🛡️ Protection & Thresholds</button>
+      <button class="tab-btn" data-tab="tab-alarms">🚨 Alarms & Faults</button>
+      <button class="tab-btn" data-tab="tab-dps">🔍 Raw DP Inspector</button>
+      <button class="tab-btn" data-tab="tab-reference">📖 Reference & Device ID</button>
+    </nav>
+
+    <!-- TAB 1: Live Telemetry -->
+    <div id="tab-telemetry" class="tab-content active">
+      <div class="section-title">
+        <span>⚡ Real-Time Electrical Telemetry</span>
+        <span style="font-size: 0.8rem; font-weight: normal; color: var(--text-muted);">(Sampled at <span id="telemetry-time">—</span>)</span>
+      </div>
+
+      <div class="metrics-grid">
+        <!-- Voltage -->
+        <div class="metric-card volt">
+          <div class="metric-header">
+            <span class="metric-title">Voltage</span>
+            <span class="metric-icon">🔌</span>
+          </div>
+          <div class="metric-value-row">
+            <span id="metric-voltage" class="metric-val">231.4</span>
+            <span class="metric-unit">V</span>
+          </div>
+          <div class="metric-footer">
+            <span>Nominal: 230V</span>
+            <span id="voltage-range-tag">Normal</span>
+          </div>
+        </div>
+
+        <!-- Current -->
+        <div class="metric-card curr">
+          <div class="metric-header">
+            <span class="metric-title">Current</span>
+            <span class="metric-icon">⚡</span>
+          </div>
+          <div class="metric-value-row">
+            <span id="metric-current" class="metric-val">1.845</span>
+            <span class="metric-unit">A</span>
+          </div>
+          <div class="metric-footer">
+            <span>Rated Limit: 63A</span>
+            <span>Load active</span>
+          </div>
+        </div>
+
+        <!-- Residual Leakage Current -->
+        <div class="metric-card leakage">
+          <div class="metric-header">
+            <span class="metric-title">Leakage Current</span>
+            <span class="metric-icon">⚠️</span>
+          </div>
+          <div class="metric-value-row">
+            <span id="metric-leakage" class="metric-val">0</span>
+            <span class="metric-unit">mA</span>
+          </div>
+          <div class="metric-footer">
+            <span>DP 126 Residual Earth</span>
+            <span id="leakage-status-tag" style="color: #34d399;">Safe (&lt; <span id="leakage-limit-tag">30</span>mA)</span>
+          </div>
+        </div>
+
+        <!-- Active Power -->
+        <div class="metric-card pwr">
+          <div class="metric-header">
+            <span class="metric-title">Active Power</span>
+            <span class="metric-icon">💡</span>
+          </div>
+          <div class="metric-value-row">
+            <span id="metric-power-kw" class="metric-val">0.426</span>
+            <span class="metric-unit">kW</span>
+          </div>
+          <div class="metric-footer">
+            <span id="metric-power-w">426 W</span>
+            <span>Real load</span>
+          </div>
+        </div>
+
+        <!-- Total Energy -->
+        <div class="metric-card energy">
+          <div class="metric-header">
+            <span class="metric-title">Total Energy</span>
+            <span class="metric-icon">🔋</span>
+          </div>
+          <div class="metric-value-row">
+            <span id="metric-energy" class="metric-val">51.43</span>
+            <span class="metric-unit">kWh</span>
+          </div>
+          <div class="metric-footer">
+            <span>DP 101 forward meter</span>
+            <span>Accumulated</span>
+          </div>
+        </div>
+
+        <!-- Frequency -->
+        <div class="metric-card freq">
+          <div class="metric-header">
+            <span class="metric-title">Grid Frequency</span>
+            <span class="metric-icon">〰️</span>
+          </div>
+          <div class="metric-value-row">
+            <span id="metric-frequency" class="metric-val">50.0</span>
+            <span class="metric-unit">Hz</span>
+          </div>
+          <div class="metric-footer">
+            <span>DP 112</span>
+            <span>Grid stable</span>
+          </div>
+        </div>
+
+        <!-- Temperature -->
+        <div class="metric-card temp">
+          <div class="metric-header">
+            <span class="metric-title">Internal Temp</span>
+            <span class="metric-icon">🌡️</span>
+          </div>
+          <div class="metric-value-row">
+            <span id="metric-temp" class="metric-val">36</span>
+            <span class="metric-unit">°C</span>
+          </div>
+          <div class="metric-footer">
+            <span>DP 114 internal probe</span>
+            <span style="color: #34d399;">Safe level</span>
+          </div>
+        </div>
+
+        <!-- Power Factor -->
+        <div class="metric-card pf">
+          <div class="metric-header">
+            <span class="metric-title">Power Factor</span>
+            <span class="metric-icon">📐</span>
+          </div>
+          <div class="metric-value-row">
+            <span id="metric-pf" class="metric-val">0.980</span>
+            <span class="metric-unit">PF</span>
+          </div>
+          <div class="metric-footer">
+            <span>cos φ</span>
+            <span>High efficiency</span>
+          </div>
+        </div>
+
+        <!-- Apparent Power -->
+        <div class="metric-card va">
+          <div class="metric-header">
+            <span class="metric-title">Apparent Power</span>
+            <span class="metric-icon">📈</span>
+          </div>
+          <div class="metric-value-row">
+            <span id="metric-va" class="metric-val">427.0</span>
+            <span class="metric-unit">VA</span>
+          </div>
+          <div class="metric-footer">
+            <span>S = V &times; I</span>
+            <span>Total draw</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 2: Protection & Thresholds -->
+    <div id="tab-protection" class="tab-content">
+      <div class="section-title">🛡️ Hardware Protection Thresholds (Alarm Sets 1 & 2)</div>
+      
+      <div class="settings-grid">
+        <!-- Over-Voltage -->
+        <div class="setting-card">
+          <h4>Over-Voltage Protection</h4>
+          <p>Trips circuit breaker when grid voltage exceeds limit</p>
+          <div class="input-group">
+            <input type="number" id="th-overvolt" value="265" min="230" max="300">
+            <span style="color: var(--text-muted); font-size: 0.9rem;">Volts (V)</span>
+          </div>
+          <div class="input-group">
+            <input type="number" id="th-overvolt-delay" value="3" min="1" max="60" placeholder="Trip Delay">
+            <span style="color: var(--text-muted); font-size: 0.8rem;">Trip Delay (s)</span>
+          </div>
+        </div>
+
+        <!-- Under-Voltage -->
+        <div class="setting-card">
+          <h4>Under-Voltage Protection</h4>
+          <p>Trips breaker when voltage drops below safe threshold</p>
+          <div class="input-group">
+            <input type="number" id="th-undervolt" value="175" min="90" max="210">
+            <span style="color: var(--text-muted); font-size: 0.9rem;">Volts (V)</span>
+          </div>
+          <div class="input-group">
+            <input type="number" id="th-undervolt-delay" value="3" min="1" max="60" placeholder="Trip Delay">
+            <span style="color: var(--text-muted); font-size: 0.8rem;">Trip Delay (s)</span>
+          </div>
+        </div>
+
+        <!-- Over-Current -->
+        <div class="setting-card">
+          <h4>Over-Current Protection</h4>
+          <p>Trips breaker when continuous current exceeds rating</p>
+          <div class="input-group">
+            <input type="number" id="th-overcurrent" value="40" min="1" max="63">
+            <span style="color: var(--text-muted); font-size: 0.9rem;">Amperes (A)</span>
+          </div>
+          <div class="input-group">
+            <input type="number" id="th-overcurrent-delay" value="2" min="1" max="60" placeholder="Trip Delay">
+            <span style="color: var(--text-muted); font-size: 0.8rem;">Trip Delay (s)</span>
+          </div>
+        </div>
+
+        <!-- Residual / Leakage Current -->
+        <div class="setting-card">
+          <h4>Residual Leakage Protection</h4>
+          <p>Earth leakage safety trip (RCD / ELCB function)</p>
+          <div class="input-group">
+            <input type="number" id="th-leakage" value="30" min="10" max="300">
+            <span style="color: var(--text-muted); font-size: 0.9rem;">milliAmps (mA)</span>
+          </div>
+          <div class="input-group">
+            <input type="number" id="th-leakage-delay" value="1" min="1" max="10" placeholder="Trip Delay">
+            <span style="color: var(--text-muted); font-size: 0.8rem;">Trip Delay (s)</span>
+          </div>
+        </div>
+
+        <!-- High Temperature -->
+        <div class="setting-card">
+          <h4>Over-Temperature Protection</h4>
+          <p>Trips breaker when internal heat exceeds safe limits</p>
+          <div class="input-group">
+            <input type="number" id="th-temp" value="70" min="40" max="100">
+            <span style="color: var(--text-muted); font-size: 0.9rem;">°Celsius (°C)</span>
+          </div>
+          <div class="input-group">
+            <input type="number" id="th-temp-delay" value="5" min="1" max="60">
+            <span style="color: var(--text-muted); font-size: 0.8rem;">Trip Delay (s)</span>
+          </div>
+        </div>
+
+        <!-- Auto Reclose Settings -->
+        <div class="setting-card">
+          <h4>Auto-Reclosing Protection</h4>
+          <p>Automatic restoration attempts after temporary fault clears</p>
+          <div class="input-group">
+            <input type="number" id="th-reclose-times" value="3" min="0" max="10">
+            <span style="color: var(--text-muted); font-size: 0.85rem;">Max Reclose Count</span>
+          </div>
+          <div class="input-group">
+            <input type="number" id="th-reclose-delay" value="30" min="5" max="300">
+            <span style="color: var(--text-muted); font-size: 0.85rem;">Recovery Delay (s)</span>
+          </div>
+        </div>
+      </div>
+
+      <div style="text-align: right; margin-top: 10px;">
+        <button id="apply-thresholds-btn" class="btn btn-primary" style="padding: 10px 24px; font-size: 0.95rem;">
+          💾 Save & Apply Thresholds Locally
+        </button>
+      </div>
+    </div>
+
+    <!-- TAB 3: Alarms & Faults -->
+    <div id="tab-alarms" class="tab-content">
+      <div class="alarm-panel">
+        <div class="section-title">
+          <span>🚨 Live Fault Register & Protection Diagnostics (DP 26)</span>
+          <span id="fault-raw-label" style="font-size: 0.85rem; font-weight: normal; color: var(--text-muted);">Raw Register: 0x0000 (0)</span>
+        </div>
+        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 16px;">
+          The circuit breaker continuously runs internal diagnostics. Any active trip or safety fault will highlight in red below:
+        </p>
+
+        <div class="alarms-grid">
+          <div id="alarm-short-circuit" class="alarm-item">
+            <span class="alarm-indicator"></span>
+            <span>Short Circuit</span>
+          </div>
+          <div id="alarm-surge" class="alarm-item">
+            <span class="alarm-indicator"></span>
+            <span>Surge / Lightning</span>
+          </div>
+          <div id="alarm-overload" class="alarm-item">
+            <span class="alarm-indicator"></span>
+            <span>Overload Trip</span>
+          </div>
+          <div id="alarm-leakage" class="alarm-item">
+            <span class="alarm-indicator"></span>
+            <span>Leakage Current</span>
+          </div>
+          <div id="alarm-high-temp" class="alarm-item">
+            <span class="alarm-indicator"></span>
+            <span>High Temperature</span>
+          </div>
+          <div id="alarm-overcurrent" class="alarm-item">
+            <span class="alarm-indicator"></span>
+            <span>Over-Current</span>
+          </div>
+          <div id="alarm-overvoltage" class="alarm-item">
+            <span class="alarm-indicator"></span>
+            <span>Over-Voltage</span>
+          </div>
+          <div id="alarm-undervoltage" class="alarm-item">
+            <span class="alarm-indicator"></span>
+            <span>Under-Voltage</span>
+          </div>
+          <div id="alarm-phase-loss" class="alarm-item">
+            <span class="alarm-indicator"></span>
+            <span>Phase Loss</span>
+          </div>
+          <div id="alarm-unbalance" class="alarm-item">
+            <span class="alarm-indicator"></span>
+            <span>Unbalance Alarm</span>
+          </div>
+          <div id="alarm-outage" class="alarm-item">
+            <span class="alarm-indicator"></span>
+            <span>Power Outage</span>
+          </div>
+          <div id="alarm-relay-fault" class="alarm-item">
+            <span class="alarm-indicator"></span>
+            <span>Relay Contact Failure</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 4: Raw DP Inspector -->
+    <div id="tab-dps" class="tab-content">
+      <div class="section-title">🔍 Complete Datapoint (DP) Inspector</div>
+      <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 14px;">
+        Exhaustive list of all datapoints extracted from the Smart Life data files, their decoded states, and functions:
+      </p>
+
+      <div class="dp-table-container">
+        <table class="dp-table">
+          <thead>
+            <tr>
+              <th>DP ID</th>
+              <th>Function / Code</th>
+              <th>Type</th>
+              <th>Current Value</th>
+              <th>Unit / Values</th>
+              <th>Description</th>
+            </tr>
+          </thead>
+          <tbody id="dp-table-body">
+            <!-- Rendered dynamically -->
+          </tbody>
+        </table>
+      </div>
+
+      <div style="margin-top: 20px; background: var(--bg-card); padding: 16px; border-radius: 10px; border: 1px solid var(--border-color);">
+        <h4>Send Custom Test DP Command</h4>
+        <div style="display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap;">
+          <input type="text" id="custom-dp-id" placeholder="DP ID (e.g. 103)" style="max-width: 150px;">
+          <input type="text" id="custom-dp-val" placeholder="Value (e.g. true, false, 30)" style="max-width: 250px;">
+          <button id="send-custom-dp-btn" class="btn btn-primary">Send Local Command</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 5: Reference & Device ID -->
+    <div id="tab-reference" class="tab-content">
+      <div class="section-title">📖 Reference: How to Find Device ID & Local Key</div>
+      
+      <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--card-radius); padding: 24px; margin-bottom: 20px; box-shadow: var(--shadow);">
+        <h4 style="font-size: 1.05rem; margin-bottom: 14px; color: var(--accent-blue);">
+          Tuya Developer Platform Device Discovery
+        </h4>
+        <ol style="padding-left: 20px; line-height: 1.9; font-size: 0.95rem; color: var(--text-main);">
+          <li>
+            Log in to the 
+            <a href="https://ind.platform.tuya.com/cloud/basic?id=p17925218823829tpe7p&toptab=related&authorizeTab=3&thridType=source&region=IN&deviceTab=all" target="_blank" style="color: var(--accent-blue); font-weight: 600; text-decoration: underline;">
+              Tuya Developer Platform (Project Direct Link)
+            </a>.
+          </li>
+          <li>
+            Go to <strong>Cloud &rarr; Devices &rarr; All Devices</strong>.
+          </li>
+          <li>
+            Your devices will appear with their <strong>Device ID</strong> and device details. See documentation: 
+            <a href="https://github.com/make-all/tuya-local/blob/main/DEVICE_DETAILS.md" target="_blank" style="color: var(--accent-blue); text-decoration: underline;">
+              Tuya-Local Device Details Guide (GitHub)
+            </a>.
+          </li>
+          <li>
+            <strong>Region Selection:</strong> If devices don’t show, ensure the correct server region is selected (Region: <code>IN</code> / India).
+          </li>
+          <li>
+            <strong>Find Local Key:</strong> In Tuya Developer Console, navigate to <strong>Cloud &rarr; API Explorer &rarr; Smart Home Device System &rarr; Device Control &rarr; Get Device Details</strong>, enter your Device ID, and submit to reveal the 16-character <code>local_key</code>.
+          </li>
+        </ol>
+
+        <div style="margin-top: 20px; padding: 16px; background: rgba(11, 15, 25, 0.6); border-radius: 8px; border: 1px solid var(--border-color); display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;">
+          <div>
+            <span style="color: var(--text-muted); font-size: 0.85rem;">Scanned Active LAN Device ID for this breaker:</span>
+            <div style="font-family: monospace; font-size: 1.05rem; color: #34d399; font-weight: 700; margin-top: 2px;">d705ffaccaf4d0f1b1addg</div>
+          </div>
+          <button class="btn btn-primary" onclick="navigator.clipboard.writeText('d705ffaccaf4d0f1b1addg'); alert('Copied Device ID to clipboard: d705ffaccaf4d0f1b1addg');">
+            📋 Copy Scanned Device ID
+          </button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Safety Confirmation Modal -->
+  <div id="safety-modal" class="modal-overlay">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="safety-modal-title">⚠️ Circuit Breaker Switching Warning</h3>
+        <button class="modal-close" onclick="closeSafetyModal()">&times;</button>
+      </div>
+      <div style="margin-bottom: 20px;">
+        <p id="safety-modal-msg" style="color: var(--text-main); font-size: 0.95rem; line-height: 1.6;">
+          Please confirm that no one is currently repairing electrical appliances or touching open wiring before turning the circuit breaker ON!
+        </p>
+      </div>
+      <div style="display: flex; justify-content: flex-end; gap: 12px;">
+        <button class="btn" onclick="closeSafetyModal()">Cancel</button>
+        <button id="safety-modal-confirm-btn" class="btn btn-danger">Confirm & Switch Now</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings Modal -->
+  <div id="settings-modal" class="modal-overlay">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>⚙️ Local Device Connection Settings</h3>
+        <button class="modal-close" onclick="closeSettingsModal()">&times;</button>
+      </div>
+
+      <!-- Reference Quick-Link Box -->
+      <div style="background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.25); border-radius: 8px; padding: 12px 14px; margin-bottom: 16px; font-size: 0.82rem; color: #bae6fd; line-height: 1.6;">
+        <strong>📖 Need Device ID or Local Key?</strong><br>
+        1. Open the <a href="https://ind.platform.tuya.com/cloud/basic?id=p17925218823829tpe7p&toptab=related&authorizeTab=3&thridType=source&region=IN&deviceTab=all" target="_blank" style="color: #38bdf8; text-decoration: underline; font-weight: 600;">Tuya Developer Platform Console</a>.<br>
+        2. Go to <strong>Cloud &rarr; Devices &rarr; All Devices</strong> (Select Region <code>IN</code>).<br>
+        3. See: <a href="https://github.com/make-all/tuya-local/blob/main/DEVICE_DETAILS.md" target="_blank" style="color: #38bdf8; text-decoration: underline;">Tuya-Local Device Details (GitHub)</a>.
+      </div>
+
+      <form id="settings-form">
+        <div style="margin-bottom: 14px;">
+          <label style="font-size: 0.85rem; color: var(--text-muted);">Device IP Address on LAN</label>
+          <input type="text" id="cfg-ip" required placeholder="192.168.1.164">
+        </div>
+        <div style="margin-bottom: 14px;">
+          <label style="font-size: 0.85rem; color: var(--text-muted);">Tuya Local Device ID</label>
+          <input type="text" id="cfg-id" required placeholder="d7298b9bb3bcdd3d26wfpj">
+        </div>
+        <div style="margin-bottom: 14px;">
+          <label style="font-size: 0.85rem; color: var(--text-muted);">Local Key (16-char AES key)</label>
+          <input type="text" id="cfg-key" required placeholder=">U>Si=K$<|1[J$')">
+        </div>
+        <div style="margin-bottom: 14px;">
+          <label style="font-size: 0.85rem; color: var(--text-muted);">Protocol Version</label>
+          <select id="cfg-ver">
+            <option value="3.5">v3.5 (Standard for this breaker)</option>
+            <option value="3.4">v3.4</option>
+            <option value="3.3">v3.3</option>
+          </select>
+        </div>
+        <div style="margin-bottom: 18px;">
+          <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 0.9rem;">
+            <input type="checkbox" id="cfg-sim">
+            <span>Force Local Reference Simulation Mode</span>
+          </label>
+          <small style="color: var(--text-muted); display: block; margin-top: 4px;">
+            Allows testing all UI features, toggles, and thresholds using cached device data even when device is turned off.
+          </small>
+        </div>
+        <div style="display: flex; justify-content: flex-end; gap: 10px;">
+          <button type="button" class="btn" onclick="closeSettingsModal()">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save Settings</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

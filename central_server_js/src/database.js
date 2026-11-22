@@ -516,6 +516,23 @@ class FleetDatabase {
       )
     `);
 
+    // 34. Tuya Devices Table (Multi-Device Tuya Breakers & Plugs)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS tuya_devices (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        ip TEXT NOT NULL,
+        local_key TEXT NOT NULL,
+        protocol_version REAL DEFAULT 3.5,
+        category TEXT DEFAULT 'breaker',
+        model TEXT DEFAULT 'KB-A1H-A',
+        mac TEXT,
+        is_active INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now'))
+      )
+    `);
+
     // Schema Migrations (backward-compatibility safe)
     try { this.db.exec(`ALTER TABLE automations ADD COLUMN description TEXT DEFAULT ''`); } catch {}
     try { this.db.exec(`ALTER TABLE automations ADD COLUMN trigger_type TEXT DEFAULT 'GPIO State Change'`); } catch {}
@@ -1382,7 +1399,48 @@ class FleetDatabase {
   // === SENSORS ===
 
   getSensors() {
-    return this.db.prepare('SELECT * FROM sensors ORDER BY id DESC').all();
+    try {
+      return this.db.prepare(`
+        SELECT 
+          id, 
+          node_id, 
+          sensor_type, 
+          name, 
+          room, 
+          COALESCE(value, 0) AS current_value, 
+          COALESCE(value, 0) AS value, 
+          unit, 
+          last_read_at 
+        FROM sensors 
+        ORDER BY id DESC
+      `).all();
+    } catch (e) {
+      return this.db.prepare('SELECT * FROM sensors ORDER BY id DESC').all();
+    }
+  }
+
+  upsertSensor({ nodeId, sensorType, name, room = 'General', value = 0, unit = '' }) {
+    if (!nodeId || !sensorType) return false;
+    const nowStr = new Date().toISOString();
+    try {
+      const existing = this.db.prepare('SELECT id FROM sensors WHERE node_id = ? AND sensor_type = ?').get(nodeId, sensorType);
+      if (existing) {
+        this.db.prepare(`
+          UPDATE sensors 
+          SET value = ?, unit = ?, name = COALESCE(?, name), room = COALESCE(?, room), last_read_at = ? 
+          WHERE id = ?
+        `).run(Number(value) || 0, unit || '', name, room, nowStr, existing.id);
+      } else {
+        this.db.prepare(`
+          INSERT INTO sensors (node_id, sensor_type, name, room, value, unit, last_read_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(nodeId, sensorType, name || sensorType, room, Number(value) || 0, unit || '', nowStr);
+      }
+      return true;
+    } catch (err) {
+      console.warn(`[Database] Error in upsertSensor: ${err.message}`);
+      return false;
+    }
   }
 
   // === TELEMETRY & AUDIT LOGS ===
@@ -2916,6 +2974,78 @@ class FleetDatabase {
   removeDevicePermission(nodeId, userId) {
     this.db.prepare('DELETE FROM device_permissions WHERE device_id = ? AND user_id = ?').run(nodeId, Number(userId));
     return true;
+  }
+
+  // --- TUYA MULTI-DEVICE MANAGEMENT ---
+
+  getTuyaDevices() {
+    return this.db.prepare(`SELECT * FROM tuya_devices ORDER BY is_active DESC, name ASC`).all();
+  }
+
+  getTuyaDevice(id) {
+    return this.db.prepare(`SELECT * FROM tuya_devices WHERE id = ?`).get(id);
+  }
+
+  getActiveTuyaDevice() {
+    return this.db.prepare(`SELECT * FROM tuya_devices WHERE is_active = 1`).get();
+  }
+
+  upsertTuyaDevice(dev) {
+    const existing = this.getTuyaDevice(dev.id);
+    const count = this.db.prepare(`SELECT count(*) as count FROM tuya_devices`).get().count;
+    const isActive = dev.is_active !== undefined ? (dev.is_active ? 1 : 0) : (count === 0 ? 1 : 0);
+
+    if (existing) {
+      this.db.prepare(`
+        UPDATE tuya_devices 
+        SET name = ?, ip = ?, local_key = ?, protocol_version = ?, category = ?, model = ?, mac = ?, is_active = ?, updated_at = datetime('now')
+        WHERE id = ?
+      `).run(
+        dev.name || existing.name,
+        dev.ip || existing.ip,
+        dev.local_key || existing.local_key,
+        dev.protocol_version || existing.protocol_version || 3.5,
+        dev.category || existing.category || 'breaker',
+        dev.model || existing.model || 'KB-A1H-A',
+        dev.mac || existing.mac || '',
+        isActive,
+        dev.id
+      );
+    } else {
+      this.db.prepare(`
+        INSERT INTO tuya_devices (id, name, ip, local_key, protocol_version, category, model, mac, is_active)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        dev.id,
+        dev.name || 'Smart Circuit Breaker',
+        dev.ip,
+        dev.local_key,
+        dev.protocol_version || 3.5,
+        dev.category || 'breaker',
+        dev.model || 'KB-A1H-A',
+        dev.mac || '',
+        isActive
+      );
+    }
+    return this.getTuyaDevice(dev.id);
+  }
+
+  setActiveTuyaDevice(id) {
+    this.db.prepare(`UPDATE tuya_devices SET is_active = 0`).run();
+    this.db.prepare(`UPDATE tuya_devices SET is_active = 1, updated_at = datetime('now') WHERE id = ?`).run(id);
+    return this.getTuyaDevice(id);
+  }
+
+  deleteTuyaDevice(id) {
+    this.db.prepare(`DELETE FROM tuya_devices WHERE id = ?`).run(id);
+    const active = this.getActiveTuyaDevice();
+    if (!active) {
+      const first = this.db.prepare(`SELECT id FROM tuya_devices LIMIT 1`).get();
+      if (first) {
+        this.setActiveTuyaDevice(first.id);
+      }
+    }
+    return { success: true };
   }
 }
 
