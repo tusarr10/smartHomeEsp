@@ -1,0 +1,27 @@
+{
+  "server_name": "SmartHome Relay Gateway",
+  "bind_host": "0.0.0.0",
+  "http_port": 9200,
+  "tcp_port": 2000,
+  "auth_token": "",
+  "node_timeout_sec": 35,
+  "central_server": {
+    "enabled": true,
+    "url": "http://127.0.0.1:9100",
+    "health_check_endpoint": "/api/nodes",
+    "telemetry_endpoint": "/api/telemetry",
+    "timeout_ms": 2500,
+    "health_check_interval_sec": 5
+  },
+  "breaker": {
+    "enabled": true,
+    "portal_url": "http://127.0.0.1:8085",
+    "direct_ip": "192.168.1.164",
+    "poll_interval_ms": 3000,
+    "node_id": "NODE-30487DE85D5C",
+    "device_name": "Wi-Fi Smart Circuit Breaker"
+  },
+  "storage": {
+    "data_dir": "./data"
+  }
+}

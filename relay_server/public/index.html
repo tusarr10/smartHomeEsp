@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <title>SmartHome Edge Relay & User Dashboard</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <!-- TOPBAR -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="logo-badge">⚡</div>
+      <div>
+        <h1 class="brand-title">SmartHome <span class="brand-sub">Relay Gateway</span></h1>
+        <div class="device-tag">MTK Edge Edition</div>
+      </div>
+    </div>
+
+    <div class="topbar-right">
+      <!-- Central Server Proxy Link Status -->
+      <div id="central-status-pill" class="status-pill status-offline" title="Central Server Connection Status">
+        <span class="status-dot"></span>
+        <span id="central-status-text">Central: Checking...</span>
+      </div>
+
+      <div id="ram-usage-pill" class="status-pill status-info" title="Gateway Memory Usage">
+        <span>💾</span> <span id="ram-usage-text">-- MB</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- NAVIGATION TABS -->
+  <nav class="nav-tabs">
+    <button class="nav-tab active" data-tab="switches">
+      <span class="tab-icon">🔌</span>
+      <span>Switches</span>
+      <span class="badge" id="switch-count-badge">0</span>
+    </button>
+    <button class="nav-tab" data-tab="breaker">
+      <span class="tab-icon">⚡</span>
+      <span>Circuit Breaker</span>
+      <span class="badge badge-accent" id="breaker-status-badge">LIVE</span>
+    </button>
+    <button class="nav-tab" data-tab="sensors">
+      <span class="tab-icon">🌡️</span>
+      <span>Sensors</span>
+    </button>
+    <button class="nav-tab" data-tab="automations">
+      <span class="tab-icon">⚙️</span>
+      <span>Automations</span>
+    </button>
+    <button class="nav-tab" data-tab="system">
+      <span class="tab-icon">🖧</span>
+      <span>Gateway Info</span>
+    </button>
+  </nav>
+
+  <!-- MAIN CONTAINER -->
+  <main class="main-content">
+
+    <!-- 1. SWITCHES VIEW -->
+    <section id="view-switches" class="tab-view active">
+      <div class="section-header">
+        <div>
+          <h2>Device Switches & Relays</h2>
+          <p class="section-desc">Instant real-time control for all ESP nodes and breaker switches</p>
+        </div>
+        <button class="btn btn-secondary" onclick="loadAllData()">
+          <span>🔄</span> Refresh
+        </button>
+      </div>
+
+      <div id="switches-grid" class="cards-grid">
+        <div class="empty-state">
+          <div class="empty-icon">⏳</div>
+          <p>Listening for ESP8266 node telemetry...</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 2. EXACT CIRCUIT BREAKER VIEW -->
+    <section id="view-breaker" class="tab-view">
+      <div class="section-header">
+        <div>
+          <h2>Wi-Fi Smart Circuit Breaker</h2>
+          <p class="section-desc">High-precision AC power monitoring, leakage protection & main contact breaker</p>
+        </div>
+        <div class="header-actions">
+          <span id="breaker-online-badge" class="badge badge-success">ONLINE</span>
+          <button class="btn btn-secondary" onclick="refreshBreaker()">
+            <span>🔄</span> Poll Now
+          </button>
+        </div>
+      </div>
+
+      <!-- MAIN BREAKER TRIP CARD -->
+      <div class="breaker-main-card">
+        <div class="breaker-main-left">
+          <div class="breaker-icon-wrap" id="breaker-contact-icon">⚡</div>
+          <div>
+            <div class="breaker-card-title">Main Contact Switch (DP 108)</div>
+            <div class="breaker-card-sub" id="breaker-device-name">Wi-Fi Smart Circuit Breaker</div>
+            <div class="breaker-device-meta">
+              <span id="breaker-ip-meta">IP: 192.168.1.164</span> &bull; 
+              <span id="breaker-mac-meta">MAC: 30:48:7D:E8:5D:5C</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="breaker-main-right">
+          <div class="breaker-status-display" id="breaker-status-text">CLOSED (ON)</div>
+          <button id="breaker-toggle-btn" class="btn btn-breaker-on" onclick="toggleBreakerSwitch()">
+            Trip / Toggle Contact
+          </button>
+        </div>
+      </div>
+
+      <!-- METERS & GAUGES GRID -->
+      <div class="metrics-grid">
+        <div class="metric-card metric-voltage">
+          <div class="metric-header">
+            <span class="metric-icon">⚡</span>
+            <span class="metric-label">Mains Voltage</span>
+          </div>
+          <div class="metric-value" id="val-voltage">230.0 <span class="metric-unit">V</span></div>
+          <div class="metric-footer">Nominal Range: 220V - 240V</div>
+        </div>
+
+        <div class="metric-card metric-current">
+          <div class="metric-header">
+            <span class="metric-icon">🔌</span>
+            <span class="metric-label">Load Current</span>
+          </div>
+          <div class="metric-value" id="val-current">0.00 <span class="metric-unit">A</span></div>
+          <div class="metric-footer">Overcurrent Limit: <span id="limit-current">32</span>A</div>
+        </div>
+
+        <div class="metric-card metric-power">
+          <div class="metric-header">
+            <span class="metric-icon">💡</span>
+            <span class="metric-label">Active Power</span>
+          </div>
+          <div class="metric-value" id="val-power">0.0 <span class="metric-unit">W</span></div>
+          <div class="metric-footer">Power Factor: <span id="val-pf">0.99</span></div>
+        </div>
+
+        <div class="metric-card metric-energy">
+          <div class="metric-header">
+            <span class="metric-icon">📈</span>
+            <span class="metric-label">Total Forward Energy</span>
+          </div>
+          <div class="metric-value" id="val-energy">0.00 <span class="metric-unit">kWh</span></div>
+          <div class="metric-footer">Cumulative Meter</div>
+        </div>
+
+        <div class="metric-card metric-freq">
+          <div class="metric-header">
+            <span class="metric-icon">〰️</span>
+            <span class="metric-label">Grid Frequency</span>
+          </div>
+          <div class="metric-value" id="val-freq">50.0 <span class="metric-unit">Hz</span></div>
+          <div class="metric-footer">Standard AC Frequency</div>
+        </div>
+
+        <div class="metric-card metric-temp">
+          <div class="metric-header">
+            <span class="metric-icon">🌡️</span>
+            <span class="metric-label">Internal Temperature</span>
+          </div>
+          <div class="metric-value" id="val-temp">32.0 <span class="metric-unit">°C</span></div>
+          <div class="metric-footer">Cutoff Limit: <span id="limit-temp">90</span>°C</div>
+        </div>
+
+        <div class="metric-card metric-leakage">
+          <div class="metric-header">
+            <span class="metric-icon">🛡️</span>
+            <span class="metric-label">Earth Leakage Current</span>
+          </div>
+          <div class="metric-value" id="val-leakage">0.0 <span class="metric-unit">mA</span></div>
+          <div class="metric-footer">Trip Threshold: <span id="limit-leakage">30</span>mA</div>
+        </div>
+
+        <div class="metric-card metric-safety">
+          <div class="metric-header">
+            <span class="metric-icon">🔒</span>
+            <span class="metric-label">Safety & Child Lock</span>
+          </div>
+          <div class="metric-value" id="val-childlock">UNLOCKED</div>
+          <div class="metric-footer">Protection registers active</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 3. SENSORS VIEW -->
+    <section id="view-sensors" class="tab-view">
+      <div class="section-header">
+        <div>
+          <h2>Environment & Node Sensors</h2>
+          <p class="section-desc">Live readings reported by fleet nodes and breaker monitors</p>
+        </div>
+        <button class="btn btn-secondary" onclick="loadAllData()">
+          <span>🔄</span> Refresh
+        </button>
+      </div>
+
+      <div id="sensors-grid" class="cards-grid">
+        <div class="empty-state">
+          <p>No external sensors registered yet.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 4. AUTOMATIONS VIEW -->
+    <section id="view-automations" class="tab-view">
+      <div class="section-header">
+        <div>
+          <h2>Local Automations</h2>
+          <p class="section-desc">Edge rules that run 100% locally even when Central Server is offline</p>
+        </div>
+        <button class="btn btn-primary" onclick="openNewRuleModal()">
+          <span>➕</span> New Rule
+        </button>
+      </div>
+
+      <div id="automations-list" class="automations-container">
+        <!-- Rendered dynamically -->
+      </div>
+    </section>
+
+    <!-- 5. GATEWAY INFO VIEW -->
+    <section id="view-system" class="tab-view">
+      <div class="section-header">
+        <div>
+          <h2>Relay Gateway Diagnostics</h2>
+          <p class="section-desc">Hardware resource footprint and Central Server synchronization</p>
+        </div>
+      </div>
+
+      <div class="system-cards-grid">
+        <div class="system-card">
+          <div class="sys-title">Device Specification</div>
+          <div class="sys-item"><span>Target Platform:</span> <b>MediaTek MTK 830 / Embedded Linux</b></div>
+          <div class="sys-item"><span>RAM Capacity:</span> <b>512 MB (Low-Memory Optimized)</b></div>
+          <div class="sys-item"><span>Architecture:</span> <b>Edge Ingestion, Proxy & Standalone Fallback</b></div>
+        </div>
+
+        <div class="system-card">
+          <div class="sys-title">Memory Footprint</div>
+          <div class="sys-item"><span>Process RSS:</span> <b id="diag-rss">-- MB</b></div>
+          <div class="sys-item"><span>Heap Used:</span> <b id="diag-heap">-- MB</b></div>
+          <div class="sys-item"><span>Uptime:</span> <b id="diag-uptime">-- sec</b></div>
+        </div>
+
+        <div class="system-card">
+          <div class="sys-title">Central Server Link</div>
+          <div class="sys-item"><span>Configured URL:</span> <b id="diag-central-url">--</b></div>
+          <div class="sys-item"><span>Status:</span> <b id="diag-central-status">--</b></div>
+          <div class="sys-item"><span>Failover State:</span> <b id="diag-fallback-mode">Active / Proxy</b></div>
+        </div>
+
+        <div class="system-card">
+          <div class="sys-title">Fleet Summary</div>
+          <div class="sys-item"><span>Total Registered Nodes:</span> <b id="diag-nodes-total">0</b></div>
+          <div class="sys-item"><span>Active Online Nodes:</span> <b id="diag-nodes-online">0</b></div>
+          <div class="sys-item"><span>TCP Telemetry Port:</span> <b>2000</b></div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ADD AUTOMATION MODAL -->
+  <div id="rule-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>Create Local Automation Rule</h3>
+        <button class="modal-close-btn" onclick="closeRuleModal()">✕</button>
+      </div>
+
+      <form id="rule-form" onsubmit="handleRuleSubmit(event)">
+        <div class="form-group">
+          <label>Rule Name</label>
+          <input type="text" id="rule-name" class="form-input" placeholder="e.g. Turn OFF Breaker on High Temp" required>
+        </div>
+
+        <div class="form-group">
+          <label>Trigger Type</label>
+          <select id="rule-trigger-type" class="form-input" onchange="updateRuleFormFields()">
+            <option value="SENSOR_THRESHOLD">Sensor Threshold (Temp, Power, Voltage)</option>
+            <option value="TIME_SCHEDULE">Time Schedule (Daily HH:MM)</option>
+          </select>
+        </div>
+
+        <div id="trigger-fields-sensor">
+          <div class="form-row">
+            <div class="form-group" style="flex:1;">
+              <label>Sensor</label>
+              <select id="rule-sensor-type" class="form-input">
+                <option value="TEMPERATURE">Temperature (°C)</option>
+                <option value="POWER">Active Power (W)</option>
+                <option value="VOLTAGE">Voltage (V)</option>
+                <option value="CURRENT">Current (A)</option>
+                <option value="LEAKAGE_CURRENT">Leakage Current (mA)</option>
+              </select>
+            </div>
+            <div class="form-group" style="width: 90px;">
+              <label>Operator</label>
+              <select id="rule-operator" class="form-input">
+                <option value=">">&gt;</option>
+                <option value="<">&lt;</option>
+                <option value=">=">&gt;=</option>
+              </select>
+            </div>
+            <div class="form-group" style="flex:1;">
+              <label>Threshold Value</label>
+              <input type="number" id="rule-threshold" class="form-input" placeholder="e.g. 75" step="0.1">
+            </div>
+          </div>
+        </div>
+
+        <div id="trigger-fields-time" style="display: none;">
+          <div class="form-group">
+            <label>Time (24h format HH:MM)</label>
+            <input type="time" id="rule-time" class="form-input">
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Action Target</label>
+          <select id="rule-action-type" class="form-input">
+            <option value="SET_BREAKER">Wi-Fi Smart Circuit Breaker</option>
+            <option value="SET_CHANNEL">ESP Relay Channel</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label>Set State</label>
+          <select id="rule-action-val" class="form-input">
+            <option value="0">Turn OFF (0 / Trip)</option>
+            <option value="1">Turn ON (1 / Close)</option>
+          </select>
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" onclick="closeRuleModal()">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save Automation</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- TOAST CONTAINER -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
