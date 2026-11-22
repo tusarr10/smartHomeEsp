@@ -86,8 +86,8 @@ func DefaultConfig() *Config {
 		},
 		Breaker: BreakerConfig{
 			Enabled:             true,
-			PortalURL:           "http://127.0.0.1:8085",
-			DirectIP:            "192.168.1.164",
+			PortalURL:           "http://192.168.1.10:8085",
+			DirectIP:            "192.168.1.25",
 			PollIntervalSeconds: 3,
 			NodeID:              "NODE-30487DE85D5C",
 		},

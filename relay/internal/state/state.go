@@ -54,27 +54,66 @@ type Command struct {
 	ExpiresAt   int64  `json:"expiresAt,omitempty"`
 }
 
-type BreakerTelemetry struct {
-	Online     bool      `json:"online"`
-	DeviceID   string    `json:"deviceId"`
-	DeviceName string    `json:"deviceName"`
-	IP         string    `json:"ip"`
-	Timestamp  time.Time `json:"timestamp"`
-	Decoded    struct {
-		SwitchState         bool    `json:"switch_state"`
-		VoltageV            float64 `json:"voltage_v"`
-		CurrentA            float64 `json:"current_a"`
-		PowerW              float64 `json:"power_w"`
-		FrequencyHz         float64 `json:"frequency_hz"`
-		TemperatureC        float64 `json:"temperature_c"`
-		LeakageCurrentMA    float64 `json:"leakage_current_ma"`
-		TotalEnergyKWh      float64 `json:"total_energy_kwh"`
-		ChildLock           bool    `json:"child_lock"`
-		PowerFactor         float64 `json:"power_factor"`
-		OvercurrentLimitA   float64 `json:"overcurrent_limit_a"`
-		HighTempThresholdC  float64 `json:"high_temp_threshold_c"`
-		LeakageThresholdMA float64 `json:"leakage_threshold_ma"`
-	} `json:"decoded"`
+type BreakerConfigInfo struct {
+	DeviceName      string  `json:"device_name"`
+	DeviceID        string  `json:"device_id"`
+	LocalKey        string  `json:"local_key,omitempty"`
+	IPAddress       string  `json:"ip_address"`
+	ProtocolVersion float64 `json:"protocol_version"`
+	ProductName     string  `json:"product_name,omitempty"`
+	MacAddress      string  `json:"mac_address"`
+	ModelSN         string  `json:"model_sn"`
+	PollIntervalSec int     `json:"poll_interval_sec,omitempty"`
+	SimulationMode  bool    `json:"simulation_mode,omitempty"`
+}
+
+type BreakerDecoded struct {
+	SwitchState          bool            `json:"switch_state"`
+	VoltageV             float64         `json:"voltage_v"`
+	CurrentA             float64         `json:"current_a"`
+	PowerW               float64         `json:"power_w"`
+	PowerKW              float64         `json:"power_kw"`
+	PowerFactor          float64         `json:"power_factor"`
+	FrequencyHz          float64         `json:"frequency_hz"`
+	TemperatureC         float64         `json:"temperature_c"`
+	TotalEnergyKWh       float64         `json:"total_energy_kwh"`
+	LeakageCurrentMA     float64         `json:"leakage_current_ma"`
+	LeakageThresholdMA   float64         `json:"leakage_threshold_ma"`
+	LeakageMasterEnabled bool            `json:"leakage_master_enabled"`
+	LeakageDelayS        float64         `json:"leakage_delay_s"`
+	HighTempThresholdC   float64         `json:"high_temp_threshold_c"`
+	OvercurrentLimitA    float64         `json:"overcurrent_limit_a"`
+	OvercurrentDelayS    float64         `json:"overcurrent_delay_s"`
+	ProtectionDelayS     float64         `json:"protection_delay_s"`
+	AutoRecloseDelayS    float64         `json:"auto_reclose_delay_s"`
+	AutoRecloseEnabled   bool            `json:"auto_reclose_enabled"`
+	AutoRecloseAttempts  float64         `json:"auto_reclose_attempts"`
+	OvervoltageThreshold float64         `json:"overvoltage_threshold"`
+	OvervoltageDelayS    float64         `json:"overvoltage_delay_s"`
+	BalanceThreshold     float64         `json:"balance_threshold"`
+	ChildLock            bool            `json:"child_lock"`
+	PowerOnBehavior      string          `json:"power_on_behavior"`
+	ModelStr             string          `json:"model_str"`
+	FaultRaw             int64           `json:"fault_raw"`
+	Faults               map[string]bool `json:"faults"`
+	HasAlarm             bool            `json:"has_alarm"`
+	ApparentPowerVA      float64         `json:"apparent_power_va"`
+	RawDP102Base64       string          `json:"raw_dp102_base64,omitempty"`
+	RawDP102Hex          string          `json:"raw_dp102_hex,omitempty"`
+}
+
+type BreakerReading struct {
+	Online    bool                   `json:"online"`
+	Source    string                 `json:"source"`
+	Timestamp string                 `json:"timestamp"`
+	DPS       map[string]interface{} `json:"dps"`
+	Decoded   BreakerDecoded         `json:"decoded"`
+	Errors    []string               `json:"errors,omitempty"`
+}
+
+type BreakerData struct {
+	Config  BreakerConfigInfo `json:"config"`
+	Reading BreakerReading    `json:"reading"`
 }
 
 type EventListener func(eventType string, data interface{})
@@ -83,7 +122,7 @@ type StateManager struct {
 	mu           sync.RWMutex
 	nodes        map[string]*Node
 	commandQueue map[string][]*Command
-	breaker      BreakerTelemetry
+	breaker      BreakerData
 	listeners    []EventListener
 }
 
@@ -93,12 +132,23 @@ func NewStateManager() *StateManager {
 		commandQueue: make(map[string][]*Command),
 	}
 	// Initial default breaker reading
-	sm.breaker.Online = false
-	sm.breaker.DeviceID = "NODE-30487DE85D5C"
-	sm.breaker.DeviceName = "Wi-Fi Smart Circuit Breaker"
-	sm.breaker.Decoded.VoltageV = 230.0
-	sm.breaker.Decoded.FrequencyHz = 50.0
-	sm.breaker.Decoded.SwitchState = true
+	sm.breaker.Config = BreakerConfigInfo{
+		DeviceName:      "Wi-Fi Smart Circuit Breaker (Main)",
+		DeviceID:        "d705ffaccaf4d0f1b1addg",
+		LocalKey:        "gp->j2_X[Bx=.ovC",
+		IPAddress:       "192.168.1.25",
+		ProtocolVersion: 3.5,
+		MacAddress:      "30:48:7d:e8:5d:5c",
+		ModelSN:         "B-B1-M",
+	}
+	sm.breaker.Reading.Online = false
+	sm.breaker.Reading.Source = "edge_broker"
+	sm.breaker.Reading.Timestamp = time.Now().Format("2006-01-02 15:04:05")
+	sm.breaker.Reading.DPS = make(map[string]interface{})
+	sm.breaker.Reading.Decoded.VoltageV = 230.0
+	sm.breaker.Reading.Decoded.FrequencyHz = 50.0
+	sm.breaker.Reading.Decoded.SwitchState = true
+	sm.breaker.Reading.Decoded.Faults = make(map[string]bool)
 	return sm
 }
 
@@ -381,14 +431,14 @@ func (sm *StateManager) SetChannelState(nodeID string, channelID int, state bool
 	return cmd, nil
 }
 
-func (sm *StateManager) UpdateBreaker(b BreakerTelemetry) {
+func (sm *StateManager) UpdateBreaker(b BreakerData) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.breaker = b
 	sm.emit("breaker_update", b)
 }
 
-func (sm *StateManager) GetBreaker() BreakerTelemetry {
+func (sm *StateManager) GetBreaker() BreakerData {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return sm.breaker

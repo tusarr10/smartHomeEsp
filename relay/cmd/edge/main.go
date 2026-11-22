@@ -65,7 +65,8 @@ func main() {
 	}
 
 	// 4. Start HTTP & WebSocket Server (Port 9200)
-	webDir, _ := filepath.Abs("./web")
+	webDir := findWebDir(*configPath)
+	log.Printf("[Web UI] Serving static files from: %s", webDir)
 	httpRouter := httpapi.NewRouter(cfg, stateMgr, authenticator, wsHub, centralSyncer, spool, webDir)
 
 	httpServer := &http.Server{
@@ -112,4 +113,42 @@ func stringsRepeat(s string, n int) string {
 		res += s
 	}
 	return res
+}
+
+func findWebDir(configPath string) string {
+	var candidates []string
+
+	// Check if config file has a sibling or parent web dir
+	if configPath != "" {
+		confDir := filepath.Dir(configPath)
+		candidates = append(candidates, filepath.Join(confDir, "web"))
+		candidates = append(candidates, filepath.Join(confDir, "..", "web"))
+	}
+
+	// Check executable directory
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		candidates = append(candidates, filepath.Join(exeDir, "web"))
+		candidates = append(candidates, filepath.Join(exeDir, "..", "web"))
+	}
+
+	candidates = append(candidates,
+		"./web",
+		"./relay/web",
+		"/usr/share/smarthome-edge/web",
+		"/etc/smarthome-edge/web",
+		"/www/smarthome-edge",
+	)
+
+	for _, p := range candidates {
+		if fi, err := os.Stat(p); err == nil && fi.IsDir() {
+			if _, errIndex := os.Stat(filepath.Join(p, "index.html")); errIndex == nil {
+				abs, _ := filepath.Abs(p)
+				return abs
+			}
+		}
+	}
+
+	abs, _ := filepath.Abs("./web")
+	return abs
 }

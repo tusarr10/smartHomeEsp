@@ -151,12 +151,37 @@ func (rt *Router) handleAPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 4. Circuit Breaker Telemetry & Control
-	if path == "/api/v1/breaker" && r.Method == http.MethodGet {
+	if (path == "/api/v1/breaker" || path == "/api/v1/breaker/status" || path == "/api/breaker/status") && r.Method == http.MethodGet {
 		b := rt.sm.GetBreaker()
 		sendJSON(w, http.StatusOK, map[string]interface{}{
-			"reading":       b,
+			"success":       true,
+			"config":        b.Config,
+			"reading":       b.Reading,
 			"centralOnline": rt.syncer.IsCentralOnline(),
 		})
+		return
+	}
+
+	if (path == "/api/v1/breaker/toggle" || path == "/api/breaker/toggle") && r.Method == http.MethodPost {
+		var req struct {
+			State bool `json:"state"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			sendJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
+			return
+		}
+
+		err := rt.syncer.SetBreakerToggle(req.State)
+		if err != nil {
+			sendJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+
+		_, _ = rt.spool.Push("BREAKER_TOGGLE", rt.cfg.Breaker.NodeID, map[string]interface{}{
+			"state": req.State,
+		})
+
+		sendJSON(w, http.StatusOK, map[string]interface{}{"success": true, "switch_state": req.State})
 		return
 	}
 
@@ -175,11 +200,110 @@ func (rt *Router) handleAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		_ , _ = rt.spool.Push("BREAKER_TRIP", rt.cfg.Breaker.NodeID, map[string]interface{}{
+		_, _ = rt.spool.Push("BREAKER_TRIP", rt.cfg.Breaker.NodeID, map[string]interface{}{
 			"state": req.State,
 		})
 
 		sendJSON(w, http.StatusOK, map[string]interface{}{"success": true, "switch_state": req.State})
+		return
+	}
+
+	if (path == "/api/v1/breaker/control" || path == "/api/breaker/control") && r.Method == http.MethodPost {
+		var req struct {
+			DP    interface{} `json:"dp"`
+			Value interface{} `json:"value"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			sendJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
+			return
+		}
+
+		dpStr := fmt.Sprintf("%v", req.DP)
+		err := rt.syncer.SetBreakerDP(dpStr, req.Value)
+		if err != nil {
+			sendJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+
+		_, _ = rt.spool.Push("BREAKER_DP_WRITE", rt.cfg.Breaker.NodeID, map[string]interface{}{
+			"dp":    dpStr,
+			"value": req.Value,
+		})
+
+		sendJSON(w, http.StatusOK, map[string]interface{}{"success": true, "dp": dpStr, "value": req.Value})
+		return
+	}
+
+	if (path == "/api/v1/breaker/refresh" || path == "/api/breaker/refresh") && r.Method == http.MethodPost {
+		_ = rt.syncer.RefreshBreaker()
+		sendJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+		return
+	}
+
+	if (path == "/api/v1/breaker/devices" || path == "/api/breaker/devices") && r.Method == http.MethodGet {
+		b := rt.sm.GetBreaker()
+		cfg := b.Config
+		ip := cfg.IPAddress
+		if ip == "" {
+			ip = "192.168.1.25"
+		}
+		devList := []map[string]interface{}{
+			{
+				"id":               cfg.DeviceID,
+				"name":             cfg.DeviceName,
+				"ip":               ip,
+				"local_key":        cfg.LocalKey,
+				"protocol_version": cfg.ProtocolVersion,
+				"category":         "breaker",
+				"is_active":        1,
+			},
+		}
+		sendJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"devices": devList,
+			"activeDevice": map[string]interface{}{
+				"id":   cfg.DeviceID,
+				"name": cfg.DeviceName,
+				"ip":   ip,
+			},
+		})
+		return
+	}
+
+	if (path == "/api/v1/breaker/devices/test" || path == "/api/breaker/devices/test") && r.Method == http.MethodPost {
+		var req map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		res, err := rt.syncer.TestBreakerSocket(req)
+		if err != nil {
+			sendJSON(w, http.StatusOK, map[string]interface{}{"online": false, "error": err.Error()})
+			return
+		}
+		sendJSON(w, http.StatusOK, res)
+		return
+	}
+
+	if (path == "/api/v1/breaker/devices" || path == "/api/breaker/devices") && r.Method == http.MethodPost {
+		var req map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		res, err := rt.syncer.SaveBreakerConfig(req)
+		if err != nil {
+			sendJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		sendJSON(w, http.StatusOK, res)
+		return
+	}
+
+	if (path == "/api/v1/breaker/devices/select" || path == "/api/breaker/devices/select") && r.Method == http.MethodPost {
+		b := rt.sm.GetBreaker()
+		sendJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"activeDevice": map[string]interface{}{
+				"id":   b.Config.DeviceID,
+				"name": b.Config.DeviceName,
+				"ip":   b.Config.IPAddress,
+			},
+		})
 		return
 	}
 

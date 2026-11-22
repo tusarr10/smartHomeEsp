@@ -28,8 +28,8 @@
   },
   "breaker": {
     "enabled": true,
-    "portal_url": "http://127.0.0.1:8085",
-    "direct_ip": "192.168.1.164",
+    "portal_url": "http://192.168.1.10:8085",
+    "direct_ip": "192.168.1.25",
     "poll_interval_seconds": 3,
     "node_id": "NODE-30487DE85D5C"
   }

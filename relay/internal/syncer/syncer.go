@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,22 +16,40 @@ import (
 )
 
 type CentralSyncer struct {
-	mu             sync.RWMutex
-	cfg            *config.Config
-	sm             *state.StateManager
-	httpClient     *http.Client
-	isCentralAlive bool
-	lastPingEpoch  int64
+	mu              sync.RWMutex
+	cfg             *config.Config
+	sm              *state.StateManager
+	httpClient      *http.Client
+	isCentralAlive  bool
+	lastPingEpoch   int64
+	activePortalURL string
 }
 
 func NewCentralSyncer(cfg *config.Config, sm *state.StateManager) *CentralSyncer {
+	portalURL := cfg.Breaker.PortalURL
+	if portalURL == "" {
+		portalURL = "http://192.168.1.10:8085"
+	}
 	return &CentralSyncer{
 		cfg: cfg,
 		sm:  sm,
 		httpClient: &http.Client{
 			Timeout: time.Duration(cfg.Central.TimeoutMS) * time.Millisecond,
 		},
+		activePortalURL: portalURL,
 	}
+}
+
+func (s *CentralSyncer) getActivePortalURL() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.activePortalURL
+}
+
+func (s *CentralSyncer) setActivePortalURL(url string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.activePortalURL = url
 }
 
 func (s *CentralSyncer) Start() {
@@ -146,88 +166,246 @@ func (s *CentralSyncer) breakerPollLoop() {
 }
 
 func (s *CentralSyncer) pollBreaker() {
-	endpoint := fmt.Sprintf("%s/api/status", s.cfg.Breaker.PortalURL)
-	resp, err := s.httpClient.Get(endpoint)
-	if err != nil {
+	currentPortal := s.getActivePortalURL()
+	candidates := []string{
+		currentPortal,
+		s.cfg.Breaker.PortalURL,
+		"http://192.168.1.10:8085",
+		"http://127.0.0.1:8085",
+		"http://192.168.1.2:8085",
+	}
+
+	var rawData []byte
+	var successfulURL string
+
+	for _, cand := range candidates {
+		if cand == "" {
+			continue
+		}
+		endpoint := fmt.Sprintf("%s/api/status", strings.TrimRight(cand, "/"))
+		resp, err := s.httpClient.Get(endpoint)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			body, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if readErr == nil && len(body) > 0 {
+				rawData = body
+				successfulURL = cand
+				break
+			}
+		}
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+	}
+
+	if rawData == nil {
+		// Also try Central Server if online
+		if s.cfg.Central.Enabled && s.IsCentralOnline() {
+			endpoint := fmt.Sprintf("%s/api/v1/breaker/status", strings.TrimRight(s.cfg.Central.URL, "/"))
+			resp, err := s.httpClient.Get(endpoint)
+			if err == nil && resp.StatusCode == http.StatusOK {
+				body, readErr := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if readErr == nil && len(body) > 0 {
+					rawData = body
+				}
+			}
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+		}
+	}
+
+	if rawData == nil {
 		return
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if successfulURL != "" && successfulURL != currentPortal {
+		s.setActivePortalURL(successfulURL)
+		log.Printf("[Central Syncer] Connected to Circuit Breaker Portal at %s", successfulURL)
+	}
+
+	var bd state.BreakerData
+	if err := json.Unmarshal(rawData, &bd); err != nil {
 		return
 	}
 
-	var portalData struct {
-		Config struct {
-			DeviceID   string `json:"device_id"`
-			DeviceName string `json:"device_name"`
-			IPAddress  string `json:"ip_address"`
-		} `json:"config"`
-		Reading struct {
-			Online  bool `json:"online"`
-			Decoded struct {
-				SwitchState        bool    `json:"switch_state"`
-				VoltageV           float64 `json:"voltage_v"`
-				CurrentA           float64 `json:"current_a"`
-				PowerW             float64 `json:"power_w"`
-				FrequencyHz        float64 `json:"frequency_hz"`
-				TemperatureC       float64 `json:"temperature_c"`
-				LeakageCurrentMA   float64 `json:"leakage_current_ma"`
-				TotalEnergyKWh     float64 `json:"total_energy_kwh"`
-				ChildLock          bool    `json:"child_lock"`
-				PowerFactor        float64 `json:"power_factor"`
-				OvercurrentLimitA  float64 `json:"overcurrent_limit_a"`
-				HighTempThresholdC float64 `json:"high_temp_threshold_c"`
-				LeakageThresholdMA float64 `json:"leakage_threshold_ma"`
-			} `json:"decoded"`
-		} `json:"reading"`
+	if bd.Config.DeviceID == "" {
+		bd.Config.DeviceID = s.cfg.Breaker.NodeID
+	}
+	if bd.Config.DeviceName == "" {
+		bd.Config.DeviceName = "Wi-Fi Smart Circuit Breaker"
+	}
+	if bd.Config.IPAddress == "" {
+		bd.Config.IPAddress = s.cfg.Breaker.DirectIP
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&portalData); err != nil {
-		return
-	}
-
-	bt := state.BreakerTelemetry{
-		Online:     portalData.Reading.Online,
-		DeviceID:   portalData.Config.DeviceID,
-		DeviceName: portalData.Config.DeviceName,
-		IP:         portalData.Config.IPAddress,
-		Timestamp:  time.Now(),
-		Decoded:    portalData.Reading.Decoded,
-	}
-
-	if bt.DeviceID == "" {
-		bt.DeviceID = s.cfg.Breaker.NodeID
-	}
-	if bt.DeviceName == "" {
-		bt.DeviceName = "Wi-Fi Smart Circuit Breaker"
-	}
-
-	s.sm.UpdateBreaker(bt)
+	s.sm.UpdateBreaker(bd)
 }
 
-func (s *CentralSyncer) SetBreakerSwitch(state bool) error {
-	endpoint := fmt.Sprintf("%s/api/control", s.cfg.Breaker.PortalURL)
+func (s *CentralSyncer) SetBreakerDP(dp string, val interface{}) error {
+	portalURL := s.getActivePortalURL()
+	endpoint := fmt.Sprintf("%s/api/control", strings.TrimRight(portalURL, "/"))
+
 	payload := map[string]interface{}{
-		"switch": state,
-		"dp":     108,
-		"value":  state,
+		"dp":    dp,
+		"value": val,
 	}
 
 	b, _ := json.Marshal(payload)
 	resp, err := s.httpClient.Post(endpoint, "application/json", bytes.NewReader(b))
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to reach breaker portal at %s: %w", portalURL, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		// Update optimistic state
+		// Optimistic update of local state
 		cur := s.sm.GetBreaker()
-		cur.Decoded.SwitchState = state
+		if cur.Reading.DPS == nil {
+			cur.Reading.DPS = make(map[string]interface{})
+		}
+		cur.Reading.DPS[dp] = val
+
+		switch dp {
+		case "108":
+			if bVal, ok := val.(bool); ok {
+				cur.Reading.Decoded.SwitchState = bVal
+			}
+		case "40":
+			if bVal, ok := val.(bool); ok {
+				cur.Reading.Decoded.ChildLock = bVal
+			}
+		case "38":
+			if sVal, ok := val.(string); ok {
+				cur.Reading.Decoded.PowerOnBehavior = sVal
+			}
+		case "115":
+			if fVal, ok := toFloat(val); ok {
+				cur.Reading.Decoded.HighTempThresholdC = fVal
+			}
+		case "121":
+			if fVal, ok := toFloat(val); ok {
+				cur.Reading.Decoded.OvervoltageThreshold = fVal
+			}
+		case "132":
+			if fVal, ok := toFloat(val); ok {
+				cur.Reading.Decoded.LeakageThresholdMA = fVal
+			}
+		case "127":
+			if bVal, ok := val.(bool); ok {
+				cur.Reading.Decoded.LeakageMasterEnabled = bVal
+			}
+		case "130":
+			if fVal, ok := toFloat(val); ok {
+				cur.Reading.Decoded.OvercurrentLimitA = fVal
+			}
+		case "119":
+			if bVal, ok := val.(bool); ok {
+				cur.Reading.Decoded.AutoRecloseEnabled = bVal
+			}
+		case "118":
+			if fVal, ok := toFloat(val); ok {
+				cur.Reading.Decoded.AutoRecloseDelayS = fVal
+			}
+		case "133":
+			if fVal, ok := toFloat(val); ok {
+				cur.Reading.Decoded.AutoRecloseAttempts = fVal
+			}
+		}
+
 		s.sm.UpdateBreaker(cur)
 		return nil
 	}
 
-	return fmt.Errorf("breaker control returned status %d", resp.StatusCode)
+	return fmt.Errorf("breaker portal returned status %d", resp.StatusCode)
+}
+
+func (s *CentralSyncer) SetBreakerToggle(targetState bool) error {
+	portalURL := s.getActivePortalURL()
+	endpoint := fmt.Sprintf("%s/api/toggle", strings.TrimRight(portalURL, "/"))
+	payload := map[string]interface{}{
+		"state": targetState,
+	}
+
+	b, _ := json.Marshal(payload)
+	resp, err := s.httpClient.Post(endpoint, "application/json", bytes.NewReader(b))
+	if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		_ = resp.Body.Close()
+		cur := s.sm.GetBreaker()
+		cur.Reading.Decoded.SwitchState = targetState
+		if cur.Reading.DPS != nil {
+			cur.Reading.DPS["108"] = targetState
+		}
+		s.sm.UpdateBreaker(cur)
+		return nil
+	}
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+
+	// Fallback to SetBreakerDP 108
+	return s.SetBreakerDP("108", targetState)
+}
+
+func (s *CentralSyncer) SetBreakerSwitch(state bool) error {
+	return s.SetBreakerToggle(state)
+}
+
+func (s *CentralSyncer) RefreshBreaker() error {
+	portalURL := s.getActivePortalURL()
+	endpoint := fmt.Sprintf("%s/api/refresh", strings.TrimRight(portalURL, "/"))
+	resp, err := s.httpClient.Post(endpoint, "application/json", nil)
+	if err == nil && resp != nil {
+		_ = resp.Body.Close()
+	}
+	s.pollBreaker()
+	return nil
+}
+
+func (s *CentralSyncer) TestBreakerSocket(payload map[string]interface{}) (map[string]interface{}, error) {
+	portalURL := s.getActivePortalURL()
+	endpoint := fmt.Sprintf("%s/api/test-connection", strings.TrimRight(portalURL, "/"))
+	b, _ := json.Marshal(payload)
+	resp, err := s.httpClient.Post(endpoint, "application/json", bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (s *CentralSyncer) SaveBreakerConfig(payload map[string]interface{}) (map[string]interface{}, error) {
+	portalURL := s.getActivePortalURL()
+	endpoint := fmt.Sprintf("%s/api/config", strings.TrimRight(portalURL, "/"))
+	b, _ := json.Marshal(payload)
+	resp, err := s.httpClient.Post(endpoint, "application/json", bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	s.pollBreaker()
+	return result, nil
+}
+
+func toFloat(v interface{}) (float64, bool) {
+	switch val := v.(type) {
+	case float64:
+		return val, true
+	case int:
+		return float64(val), true
+	case int64:
+		return float64(val), true
+	}
+	return 0, false
 }

@@ -51,53 +51,10 @@
 
     <!-- 2. CIRCUIT BREAKER VIEW -->
     <section id="view-breaker" class="view">
-      <div class="view-header">
-        <h2>Wi-Fi Smart Circuit Breaker</h2>
-        <button class="btn" onclick="fetchBreaker()">🔄 Refresh</button>
-      </div>
-
-      <div class="breaker-card">
-        <div class="breaker-info">
-          <div class="breaker-icon">⚡</div>
-          <div>
-            <div class="breaker-name" id="breaker-name">Smart Circuit Breaker</div>
-            <div class="breaker-sub" id="breaker-ip">IP: 192.168.1.164 &bull; DP 108 Contact Switch</div>
-          </div>
-        </div>
-        <div class="breaker-ctrl">
-          <span class="breaker-state" id="breaker-state-text">CLOSED (ON)</span>
-          <button id="breaker-trip-btn" class="btn btn-trip" onclick="toggleBreaker()">Trip Breaker</button>
-        </div>
-      </div>
-
-      <div class="metrics-grid">
-        <div class="metric">
-          <div class="m-label">Mains Voltage</div>
-          <div class="m-val" id="val-v">-- <small>V</small></div>
-        </div>
-        <div class="metric">
-          <div class="m-label">Load Current</div>
-          <div class="m-val" id="val-i">-- <small>A</small></div>
-        </div>
-        <div class="metric">
-          <div class="m-label">Active Power</div>
-          <div class="m-val" id="val-p">-- <small>W</small></div>
-        </div>
-        <div class="metric">
-          <div class="m-label">Total Energy</div>
-          <div class="m-val" id="val-e">-- <small>kWh</small></div>
-        </div>
-        <div class="metric">
-          <div class="m-label">Grid Frequency</div>
-          <div class="m-val" id="val-f">-- <small>Hz</small></div>
-        </div>
-        <div class="metric">
-          <div class="m-label">Internal Temp</div>
-          <div class="m-val" id="val-t">-- <small>°C</small></div>
-        </div>
-        <div class="metric">
-          <div class="m-label">Earth Leakage</div>
-          <div class="m-val" id="val-l">-- <small>mA</small></div>
+      <div id="breaker-container">
+        <div style="padding: 40px; text-align: center; color: var(--text-secondary);">
+          <div style="font-size: 32px; margin-bottom: 12px;">⚡</div>
+          <div>Loading Smart Circuit Breaker Telemetry...</div>
         </div>
       </div>
     </section>
@@ -130,6 +87,8 @@
 
   </main>
 
+  <div id="toast-container" class="toast-container"></div>
+  <div id="global-modal-overlay" class="modal-overlay"></div>
   <div id="toast" class="toast"></div>
 
   <script src="/app.js"></script>
