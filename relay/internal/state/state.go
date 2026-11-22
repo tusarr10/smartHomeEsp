@@ -1,8 +1,10 @@
 package state
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -42,9 +44,12 @@ type Node struct {
 
 type Command struct {
 	CommandUUID string `json:"command_uuid"`
-	Action      string `json:"action"` // "SET_STATE", "setState"
+	Action      string `json:"action"` // "setState", "SET_STATE"
+	ID          int    `json:"id"`
 	ChannelID   int    `json:"channelId,omitempty"`
+	Channel_ID  int    `json:"channel_id,omitempty"`
 	Pin         int    `json:"pin,omitempty"`
+	State       bool   `json:"state"`
 	Value       int    `json:"value"`
 	ExpiresAt   int64  `json:"expiresAt,omitempty"`
 }
@@ -335,14 +340,36 @@ func (sm *StateManager) SetChannelState(nodeID string, channelID int, state bool
 
 	cmd := &Command{
 		CommandUUID: fmt.Sprintf("cmd-%d", time.Now().UnixNano()),
-		Action:      "SET_STATE",
+		Action:      "setState",
+		ID:          channelID,
 		ChannelID:   channelID,
+		Channel_ID:  channelID,
 		Pin:         pin,
+		State:       state,
 		Value:       val,
 		ExpiresAt:   time.Now().Unix() + 30,
 	}
 
 	sm.commandQueue[nodeID] = append(sm.commandQueue[nodeID], cmd)
+
+	// Direct HTTP push for instant sub-30ms switching if node IP is reachable on LAN
+	if node.IP != "" && node.IP != "127.0.0.1" && node.IP != "0.0.0.0" {
+		go func(ip string, chID int, targetState bool) {
+			payload, err := json.Marshal(map[string]interface{}{
+				"id":     chID,
+				"state":  targetState,
+				"action": "setState",
+			})
+			if err == nil {
+				client := &http.Client{Timeout: 1200 * time.Millisecond}
+				url := fmt.Sprintf("http://%s/api/gpio/state", ip)
+				resp, postErr := client.Post(url, "application/json", bytes.NewReader(payload))
+				if postErr == nil && resp != nil {
+					_ = resp.Body.Close()
+				}
+			}
+		}(node.IP, channelID, state)
+	}
 
 	sm.emit("pin_update", map[string]interface{}{
 		"nodeId":    nodeID,

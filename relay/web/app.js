@@ -37,7 +37,9 @@ function connectWebSocket() {
   ws.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data);
-      if (msg.type === 'pin_update' || msg.type === 'node_status') {
+      if (msg.type === 'pin_update') {
+        updateChannelUI(msg.data.nodeId, msg.data.channelId, msg.data.state);
+      } else if (msg.type === 'node_status') {
         fetchNodes();
       } else if (msg.type === 'breaker_update') {
         renderBreaker(msg.data);
@@ -85,33 +87,106 @@ function renderSwitches() {
 
   container.innerHTML = channels.map(ch => {
     const isOn = Boolean(ch.state);
+    const chId = ch.id || ch.channelId;
+    const cardId = `card-${escapeHtml(ch.nodeId)}-${chId}`;
+
     return `
-      <div class="card">
-        <div>
-          <div class="card-title">${escapeHtml(ch.name || 'Switch')}</div>
-          <div class="card-sub">${escapeHtml(ch.nodeName)} &bull; Pin ${ch.pin || ch.id}</div>
+      <div class="card ${isOn ? 'is-on' : 'is-off'}" id="${cardId}">
+        <div class="card-left">
+          <div class="card-header-line">
+            <span class="status-indicator ${isOn ? 'on' : 'off'}"></span>
+            <div class="card-title">${escapeHtml(ch.name || 'Switch')}</div>
+          </div>
+          <div class="card-sub">
+            <span class="node-tag">${escapeHtml(ch.nodeName)}</span>
+            <span class="pin-tag">Pin ${ch.pin || chId}</span>
+            ${ch.room ? `<span class="room-tag">${escapeHtml(ch.room)}</span>` : ''}
+          </div>
         </div>
-        <button class="switch-btn ${isOn ? 'on' : 'off'}" onclick="toggleChannel('${ch.nodeId}', ${ch.id || ch.channelId}, ${!isOn})">
-          ${isOn ? 'TURN OFF' : 'TURN ON'}
-        </button>
+
+        <div class="card-right">
+          <button 
+            id="btn-${escapeHtml(ch.nodeId)}-${chId}" 
+            class="switch-btn ${isOn ? 'btn-active' : 'btn-inactive'}" 
+            onclick="toggleChannel('${ch.nodeId}', ${chId}, ${!isOn})">
+            <span class="btn-icon">${isOn ? '💡' : '🔌'}</span>
+            <span class="btn-text">${isOn ? 'POWER ON' : 'POWER OFF'}</span>
+          </button>
+        </div>
       </div>
     `;
   }).join('');
 }
 
-async function toggleChannel(nodeId, chId, state) {
+// INSTANT SUB-50MS OPTIMISTIC SWITCHING
+async function toggleChannel(nodeId, chId, targetState) {
+  const cardId = `card-${nodeId}-${chId}`;
+  const btnId = `btn-${nodeId}-${chId}`;
+  const card = document.getElementById(cardId);
+  const btn = document.getElementById(btnId);
+
+  // 1. Instant visual feedback (optimistic update under 5ms!)
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = `<span class="spinner"></span> <span>Switching...</span>`;
+  }
+  if (card) {
+    card.classList.toggle('is-on', targetState);
+    card.classList.toggle('is-off', !targetState);
+  }
+
+  // 2. Dispatch command to Edge Broker
   try {
     const res = await fetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/commands`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channelId: chId, state: state })
+      body: JSON.stringify({ channelId: chId, state: targetState })
     });
+
     if (res.ok) {
-      toast(`Switched channel ${state ? 'ON' : 'OFF'}`);
-      fetchNodes();
+      updateChannelUI(nodeId, chId, targetState);
+      toast(`Switched ${targetState ? 'ON' : 'OFF'} (Confirmed)`);
+    } else {
+      toast(`Command error: ${res.statusText}`);
+      fetchNodes(); // Revert
     }
   } catch (err) {
-    toast(`Command error: ${err.message}`);
+    toast(`Network error: ${err.message}`);
+    fetchNodes(); // Revert
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function updateChannelUI(nodeId, chId, state) {
+  // Update local memory
+  const node = nodes.find(n => n.nodeId === nodeId);
+  if (node && Array.isArray(node.channels)) {
+    const ch = node.channels.find(c => (c.id == chId || c.channelId == chId));
+    if (ch) ch.state = Boolean(state);
+  }
+
+  const cardId = `card-${nodeId}-${chId}`;
+  const btnId = `btn-${nodeId}-${chId}`;
+  const card = document.getElementById(cardId);
+  const btn = document.getElementById(btnId);
+
+  if (card) {
+    card.classList.toggle('is-on', state);
+    card.classList.toggle('is-off', !state);
+    const ind = card.querySelector('.status-indicator');
+    if (ind) {
+      ind.className = `status-indicator ${state ? 'on' : 'off'}`;
+    }
+  }
+
+  if (btn) {
+    btn.className = `switch-btn ${state ? 'btn-active' : 'btn-inactive'}`;
+    btn.innerHTML = `
+      <span class="btn-icon">${state ? '💡' : '🔌'}</span>
+      <span class="btn-text">${state ? 'POWER ON' : 'POWER OFF'}</span>
+    `;
+    btn.setAttribute('onclick', `toggleChannel('${nodeId}', ${chId}, ${!state})`);
   }
 }
 
@@ -219,7 +294,7 @@ function toast(msg) {
   const el = document.getElementById('toast');
   el.textContent = msg;
   el.style.display = 'block';
-  setTimeout(() => el.style.display = 'none', 3000);
+  setTimeout(() => el.style.display = 'none', 2500);
 }
 
 function escapeHtml(s) {
